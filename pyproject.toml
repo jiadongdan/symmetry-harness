@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "symmetry-harness"
+version = "0.1.0"
+description = "Cross-agent harness for interactive few-shot symmetry analysis"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.23",
+    "Pillow>=9.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/jiadongdan/symmetry-harness"
+Repository = "https://github.com/jiadongdan/symmetry-harness.git"
+Issues = "https://github.com/jiadongdan/symmetry-harness/issues"
+
+[project.optional-dependencies]
+ui = ["gradio>=5"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+symmetry = "symmetry_harness.cli:main"
+symmetry-harness = "symmetry_harness.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+

@@ -1,0 +1,46 @@
+{
+  "schema_version": "symmetry-harness-config-v1",
+  "project_root": ".",
+  "output_root": "symmetry-runs",
+  "provider": {
+    "name": "symmetry-learn",
+    "distribution": "symmetry-learn",
+    "module": "symmlearn.provider.worker",
+    "minimum_version": "0.1.0",
+    "source_root": null,
+    "install_hint": "\"{python}\" -m pip install \"symmetry-learn[provider] @ git+https://github.com/jiadongdan/symmetry-learn.git@main\"",
+    "timeout_seconds": 3600
+  },
+  "model": {
+    "identifier": "cnn_8ch_pg17",
+    "python_executable": "auto",
+    "checkpoint_path": null,
+    "checkpoint_sha256": null,
+    "device": "auto",
+    "input_channels": 8,
+    "pretrained_classes": 17,
+    "classifier_patch_size": 64
+  },
+  "features": {
+    "n_max": 20,
+    "symmetry_patch_size": 51,
+    "rotation_folds": [2, 3, 4, 6],
+    "reflection_p": 2,
+    "normalize_rotation_maps": false,
+    "input_normalization": "minmax_0_1"
+  },
+  "fine_tuning": {
+    "minimum_shots_per_class": 3,
+    "recommended_shots_per_class": 5,
+    "maximum_shots_per_class": 50,
+    "adapter_bottleneck": 16,
+    "epochs": 150,
+    "learning_rate": 0.0005,
+    "weight_decay": 0.0,
+    "seed": 42
+  },
+  "prediction": {
+    "stride": 4,
+    "batch_size": 512
+  }
+}
