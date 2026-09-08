@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 from pathlib import Path
 import re
@@ -55,7 +56,17 @@ CJK_PATTERN = re.compile(
     r"\u31a0-\u31bf\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
     r"\uff00-\uffef\U00020000-\U0002fa1f]"
 )
-TEXT_SUFFIXES = {".json", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
+TEXT_SUFFIXES = {
+    ".json",
+    ".md",
+    ".ps1",
+    ".py",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
 TEXT_FILENAMES = {".gitattributes", ".gitignore", "LICENSE"}
 
 
@@ -177,11 +188,50 @@ def test_repository_contains_no_cjk_text() -> None:
 def test_repository_does_not_vendor_models_or_private_paths() -> None:
     assert (REPOSITORY_ROOT / "SKILL.md").is_file()
     assert (REPOSITORY_ROOT / "pyproject.toml").is_file()
-    assert not list(REPOSITORY_ROOT.rglob("*.pt"))
-    assert not list(REPOSITORY_ROOT.rglob("*.pth"))
+    tracked_weights = subprocess.run(
+        ["git", "ls-files", "*.pt", "*.pth"],
+        cwd=REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.splitlines()
+    assert tracked_weights == []
     skill = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
     assert "D:\\" not in skill
     assert "C:\\" not in skill
+
+
+def test_installer_persists_runtime_and_copies_skill_resources(tmp_path) -> None:
+    script_path = REPOSITORY_ROOT / "scripts" / "install.py"
+    specification = importlib.util.spec_from_file_location(
+        "symmetry_harness_install_script", script_path
+    )
+    assert specification is not None
+    assert specification.loader is not None
+    installer = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(installer)
+
+    config_path = tmp_path / "source" / "symmetry-harness.json"
+    config_path.parent.mkdir()
+    config_path.write_text("{}\n", encoding="utf-8")
+    state_directory = tmp_path / "state"
+    runtime_path = installer.write_runtime_state(
+        state_directory,
+        harness_python=Path(sys.executable),
+        config_path=config_path,
+    )
+    runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+    assert runtime["schema_version"] == "symmetry-harness-runtime-v1"
+    assert Path(runtime["harness_python"]) == Path(sys.executable).resolve()
+    assert Path(runtime["config_path"]) == config_path.resolve()
+
+    skill_path = installer.install_codex_skill(
+        REPOSITORY_ROOT, tmp_path / "codex"
+    )
+    assert (skill_path / "SKILL.md").is_file()
+    assert (skill_path / "agents" / "openai.yaml").is_file()
+    assert (skill_path / "scripts" / "launch.ps1").is_file()
+    assert (skill_path / "scripts" / "launch.sh").is_file()
 
 
 def test_example_configuration_is_portable_and_valid() -> None:

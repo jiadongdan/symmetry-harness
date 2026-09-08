@@ -1,4 +1,4 @@
 interface:
   display_name: "Symmetry Harness"
-  short_description: "Run interactive few-shot microscopy symmetry analysis"
-  default_prompt: "Use $symmetry-harness to launch the local interface, let me choose a model, weight, and image, collect a few labeled support points, and save a reproducible symmetry map."
+  short_description: "Launch interactive few-shot symmetry analysis"
+  default_prompt: "Use $symmetry-harness to launch the interactive interface and return the first ready URL immediately."

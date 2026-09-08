@@ -63,6 +63,37 @@ and trains only the adapters and local head on the clicked support patches.
   Provider runtime; its environment owns PyTorch and all numerical execution
 - Gradio for the local annotation interface
 
+## One-time Codex Installation
+
+Clone `symmetry-harness` and `symmetry-learn` as sibling directories. Run the
+installer with the Python runtime that should own both packages:
+
+```bash
+python scripts/install.py
+```
+
+The installer performs the editable package installation, creates and validates
+the default Harness configuration, records the exact Python and configuration
+paths under `~/.symmetry-harness`, and installs the maintained Skill resources
+under `~/.codex/skills/symmetry-harness`. It does not require `conda` or the
+`symmetry` entry point to be available on PATH after installation.
+
+To use an existing package installation without reinstalling dependencies:
+
+```bash
+python scripts/install.py --skip-package-install
+```
+
+After installation, start a new Codex task and invoke:
+
+```text
+$symmetry-harness launch
+```
+
+The Skill runs its bundled launcher once and returns the first ready URL. The
+launcher uses the recorded absolute Python executable and configuration path, so
+the command works from any project directory.
+
 Install the Harness from a cloned checkout:
 
 ```bash
