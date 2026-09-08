@@ -481,6 +481,11 @@ def test_doctor_blocks_a_missing_registered_weight_with_install_guidance(
         "_invoke_provider_json",
         lambda *args, **kwargs: capabilities,
     )
+    monkeypatch.setattr(
+        provider_module,
+        "find_spec",
+        lambda name: object() if name == "gradio" else None,
+    )
 
     report = provider_module.doctor(config)
 
