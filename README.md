@@ -69,16 +69,20 @@ Install the Harness from a cloned checkout:
 python -m pip install -e ".[ui,dev]"
 ```
 
-Install the external numerical Provider in the Python runtime that will execute
-the model:
+The Provider is not currently published on PyPI. Clone its repository, then
+install its model package and main library in the Python runtime that will
+execute the model:
 
 ```bash
-python -m pip install "symmetry-learn @ git+https://github.com/jiadongdan/symmetry-learn.git@main"
+git clone https://github.com/jiadongdan/symmetry-learn.git
+python -m pip install -e ./symmetry-learn/model_packages/symmetry_learn_default_model
+python -m pip install -e "./symmetry-learn[provider]"
 ```
 
-The default model-weight package is installed with `symmetry-learn`. Optional
-registered weight packages can be installed later from the Gradio catalog.
-PyTorch belongs to the Provider environment, not the Harness package.
+The default model-weight package comes from the same source checkout. Optional
+registered weight packages can be installed later from the Gradio catalog when
+their distribution channels are available. PyTorch belongs to the Provider
+environment, not the Harness package.
 
 ## Initialize
 
