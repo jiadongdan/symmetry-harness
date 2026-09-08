@@ -20,18 +20,21 @@ Host general agent
         v
 symmetry-harness Skill + JSON CLI + local UI
         |
-        +-- annotation session and reproducible run record
+        +-- model and weight selection
+        +-- image selection and point annotation
+        +-- reproducible run record
         |
         v
-symmetry-learn Provider: feature maps + checkpoint-compatible CNN
+symmetry-learn Provider: model registry + numerical workflows
         |
         v
-user-managed trusted pretrained checkpoint
+bundled, optional, or user-supplied model weight
 ```
 
 The repository contains no model weights, training datasets, or private image
-data. It does not silently install software, download checkpoints, or upload
-images.
+data. The default runnable weight is distributed by `symmetry-learn`, while
+additional registered weights require an explicit user installation action.
+The Harness never silently installs software or uploads images.
 
 ## Scientific Workflow
 
@@ -59,7 +62,6 @@ and trains only the adapters and local head on the clicked support patches.
 - [symmetry-learn](https://github.com/jiadongdan/symmetry-learn) with its
   Provider runtime; its environment owns PyTorch and all numerical execution
 - Gradio for the local annotation interface
-- A trusted, user-supplied eight-channel 17-class checkpoint
 
 Install the Harness from a cloned checkout:
 
@@ -71,65 +73,101 @@ Install the external numerical Provider in the Python runtime that will execute
 the model:
 
 ```bash
-python -m pip install "symmetry-learn[provider] @ git+https://github.com/jiadongdan/symmetry-learn.git@main"
+python -m pip install "symmetry-learn @ git+https://github.com/jiadongdan/symmetry-learn.git@main"
 ```
 
-PyTorch installation depends on the required CPU or CUDA platform and belongs
-to the Provider environment, not the Harness package.
+The default model-weight package is installed with `symmetry-learn`. Optional
+registered weight packages can be installed later from the Gradio catalog.
+PyTorch belongs to the Provider environment, not the Harness package.
 
 ## Initialize
 
-Create a portable configuration and register a trusted checkpoint:
+Create a portable configuration using the Provider default model and weight:
 
 ```bash
-symmetry init --provider-python /path/to/python --checkpoint /path/to/best_model.pth
+symmetry init --provider-python /path/to/python
 symmetry doctor
 ```
 
 The initialization command discovers the Provider, records its version and
-Python executable, and records the checkpoint path and SHA-256 without copying
-or modifying the checkpoint. For a development checkout, add
+Python executable, and selects the sole available model plus its default weight.
+When the Provider exposes multiple models, select one explicitly:
+
+```bash
+symmetry init --model cnn_8ch_pg17 --weight pg17-symmetry-v1
+```
+
+A trusted custom checkpoint remains supported. The Harness records its path and
+SHA-256 without copying or modifying it:
+
+```bash
+symmetry init --model cnn_8ch_pg17 --checkpoint /path/to/best_model.pth
+```
+
+For a development checkout, add
 `--provider-source-root /path/to/symmetry-learn`.
 
 ## Interactive Use
 
-Launch the local interface:
+Start the local interface without choosing an image on the command line:
 
 ```bash
-symmetry ui
+symmetry launch --config symmetry-harness.json --server-port 0 --no-inbrowser
+```
+
+The command performs the UI-aware readiness check, records the model contract,
+selects an available local port, and emits one ready JSON object before it blocks
+for interaction. The ready payload reports `awaiting_user_selection`; choose or
+drag an image into Gradio after opening the URL.
+
+An input path remains an optional preload shortcut:
+
+```bash
+symmetry launch --config symmetry-harness.json --input image.npy --server-port 0
 ```
 
 Then:
 
-1. load a single-channel image;
-2. enter comma-separated local class names;
-3. choose the active class and click support points;
-4. review the patch outlines and support counts;
-5. select at least three points per class, with five recommended;
-6. run fine-tuning and dense prediction;
-7. inspect the overlay, confidence, entropy, and saved run directory.
+1. choose a model and registered weight, or select a trusted custom checkpoint;
+2. explicitly install a selected optional weight if its status is not installed;
+3. choose or drag in a single-channel image;
+4. review its shape, dtype, normalization, and checksum status;
+5. enter comma-separated local class names;
+6. choose the active class and click support points;
+7. review the patch outlines and support counts;
+8. select at least three points per class, with five recommended;
+9. run fine-tuning and dense prediction;
+10. inspect the overlay, confidence, entropy, and saved run directory.
 
 Clicks too close to the border are rejected because a complete classifier patch
-cannot be extracted. The pretrained checkpoint is never overwritten.
+cannot be extracted. Choosing another image clears support points and prediction
+state while retaining class names and colors. Registered and custom pretrained
+weights are always read-only.
+
+The `symmetry ui` compatibility command launches the same browser-first workflow.
 
 ## Agent-Friendly CLI
 
 ```text
 symmetry init        discover the Provider and create configuration
-symmetry doctor      validate Provider, model, device, and checkpoint
-symmetry models      report the configured model and scientific contract
+symmetry doctor      validate Provider, model, selected weight, and device
+symmetry models      report the complete model and weight catalog
 symmetry inspect     inspect and normalize an input without running the model
+symmetry launch      preflight the runtime and launch the local UI
 symmetry run         execute a saved annotation session
 symmetry reproduce   repeat a prior completed run
 symmetry ui          launch the local point-annotation interface
 ```
 
-All non-UI commands emit JSON. Errors use nonzero exit codes.
+All non-UI commands emit JSON. `launch` emits ready JSON before blocking and exits
+with code 2 when its preflight is blocked. Errors use nonzero exit codes.
 
 Examples:
 
 ```bash
 symmetry inspect --input image.tif
+symmetry launch --config symmetry-harness.json --server-port 0
+symmetry launch --config symmetry-harness.json --input image.tif --server-port 0
 symmetry run --input image.tif --annotations annotation_session.json
 symmetry reproduce --record symmetry-runs/<run-id>/run_record.json
 ```
@@ -159,13 +197,15 @@ report.md
 ```
 
 The Provider record preserves its numerical runtime and contract identity. The
-Harness run record preserves image and checkpoint checksums, exact click
+Harness run record preserves image and resolved weight checksums, exact click
 coordinates, local class mapping, feature parameters, fine-tuning options,
 device details, software versions, and artifact paths. Each run-local
 annotation session points to the bundled normalized `input.npy`, so a run does
 not depend on a temporary UI upload after it completes. Reproduction prefers
 that checksum-verified bundled input and remains compatible with records that
-refer to the original source file.
+refer to the original source file. Registered-weight reproduction asks the
+Provider to resolve the selected weight and verifies its checksum; custom
+checkpoint reproduction applies the same checksum rule.
 
 Adapter and local-head initialization is seeded before model construction.
 Repeating a run on the same recorded runtime is therefore deterministic;

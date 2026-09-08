@@ -174,12 +174,13 @@ def valid_center_bounds(
 ) -> tuple[int, int, int, int]:
     """Return inclusive valid center bounds as min_x, max_x, min_y, max_y."""
     height, width = image_shape
-    if patch_size <= 0 or patch_size % 2 != 0:
-        raise ValueError("The v1 classifier patch size must be a positive even number.")
-    half = patch_size // 2
+    if patch_size <= 0:
+        raise ValueError("The classifier patch size must be positive.")
+    before = patch_size // 2
+    after = patch_size - before
     if height < patch_size or width < patch_size:
         raise ValueError("The image is smaller than the classifier patch.")
-    return half, width - half, half, height - half
+    return before, width - after, before, height - after
 
 
 def validate_annotation_session(
@@ -222,4 +223,3 @@ def validate_annotation_session(
             if (x, y) in seen:
                 raise ValueError(f"Point ({x}, {y}) is assigned to multiple classes.")
             seen.add((x, y))
-

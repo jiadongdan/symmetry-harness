@@ -13,6 +13,7 @@ from uuid import uuid4
 import numpy as np
 from PIL import Image
 
+from .catalog import model_capability
 from .analysis import (
     dense_prediction_from_arrays,
     render_prediction_overlay,
@@ -24,10 +25,15 @@ from .annotations import (
     save_annotation_session,
     validate_annotation_session,
 )
-from .config import HarnessConfig, config_snapshot
+from .config import HarnessConfig, config_for_model_selection, config_snapshot
 from .contracts import HARNESS_CONTRACT_VERSION, RunOptions
 from .image_io import file_sha256, inspect_input, save_preview
-from .provider import doctor, run_provider_analysis
+from .provider import (
+    doctor,
+    probe_model,
+    provider_capabilities,
+    run_provider_analysis,
+)
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -97,16 +103,20 @@ def _validate_run_options(options: RunOptions) -> RunOptions:
     """Validate every option that can affect execution or support selection."""
     if options.n_max <= 0:
         raise ValueError("n_max must be positive.")
-    if options.rotation_folds != (2, 3, 4, 6):
-        raise ValueError("The v1 channel contract requires rotation_folds (2, 3, 4, 6).")
+    if (
+        not options.rotation_folds
+        or any(value <= 0 for value in options.rotation_folds)
+        or len(set(options.rotation_folds)) != len(options.rotation_folds)
+    ):
+        raise ValueError("rotation_folds must contain unique positive integers.")
     if options.reflection_p <= 0:
         raise ValueError("reflection_p must be positive.")
     if not isinstance(options.normalize_rotation_maps, bool):
         raise ValueError("normalize_rotation_maps must be boolean.")
     if options.input_normalization not in {"minmax_0_1", "already_0_1", "dtype_unit"}:
         raise ValueError("The recorded input normalization policy is unsupported.")
-    if options.classifier_patch_size != 64:
-        raise ValueError("The v1 model contract requires a 64-pixel classifier patch.")
+    if options.classifier_patch_size <= 0:
+        raise ValueError("classifier_patch_size must be positive.")
     if options.minimum_shots_per_class <= 0:
         raise ValueError("minimum_shots_per_class must be positive.")
     if options.maximum_shots_per_class < options.minimum_shots_per_class:
@@ -307,10 +317,14 @@ def run_analysis(
     )
     arrays = provider_result.arrays
     features = np.asarray(arrays.get("features"), dtype=np.float32)
-    if features.shape != (8, image.shape[0], image.shape[1]):
-        raise RuntimeError("Provider features do not satisfy the eight-channel contract.")
+    if features.shape != (
+        config.model.input_channels,
+        image.shape[0],
+        image.shape[1],
+    ):
+        raise RuntimeError("Provider features do not satisfy the selected model contract.")
     channel_names = np.asarray(arrays.get("channel_names"))
-    if channel_names.shape != (8,):
+    if channel_names.shape != (config.model.input_channels,):
         raise RuntimeError("Provider feature channel names are incomplete.")
     support_patches = np.asarray(arrays.get("support_patches"), dtype=np.float32)
     returned_labels = np.asarray(arrays.get("support_labels"), dtype=np.int64)
@@ -329,7 +343,7 @@ def run_analysis(
         raise RuntimeError("Provider changed the annotation coordinate order.")
     if support_patches.shape != (
         len(support_coordinates),
-        8,
+        config.model.input_channels,
         options.classifier_patch_size,
         options.classifier_patch_size,
     ):
@@ -456,13 +470,45 @@ def reproduce_analysis(
         raise ValueError("Unsupported run record contract version.")
     if record.get("status") != "completed":
         raise ValueError("Only completed run records can be reproduced.")
-    if record.get("model", {}).get("identifier") != config.model.identifier:
-        raise RuntimeError("The configured model identifier does not match the run record.")
-    recorded_sha = record["model"]["checkpoint"]["sha256"]
-    if config.model.checkpoint_path is None:
-        raise RuntimeError("No checkpoint is configured for reproduction.")
-    if file_sha256(config.model.checkpoint_path) != recorded_sha:
-        raise RuntimeError("The configured checkpoint does not match the recorded run.")
+    recorded_checkpoint = dict(record["model"]["checkpoint"])
+    recorded_sha = recorded_checkpoint["sha256"]
+    recorded_model_identifier = str(record["model"]["identifier"])
+    capabilities = provider_capabilities(config)
+    capability = model_capability(capabilities, recorded_model_identifier)
+    recorded_source = recorded_checkpoint.get("source")
+    uses_custom_checkpoint = recorded_source == "explicit" or (
+        recorded_source is None and config.model.checkpoint_path is not None
+    )
+    if uses_custom_checkpoint:
+        recorded_configuration = dict(record.get("configuration", {}).get("model", {}))
+        candidate = config.model.checkpoint_path
+        if candidate is None and recorded_configuration.get("checkpoint_path"):
+            candidate = Path(recorded_configuration["checkpoint_path"])
+        if candidate is None or not Path(candidate).expanduser().resolve().is_file():
+            raise RuntimeError(
+                "The recorded custom checkpoint is unavailable. Configure a local "
+                "checkpoint with the recorded SHA-256."
+            )
+        config = config_for_model_selection(
+            config,
+            capability,
+            weight_identifier=None,
+            checkpoint_path=candidate,
+            checkpoint_sha256=recorded_sha,
+        )
+    else:
+        recorded_weight = recorded_checkpoint.get("weight_identifier")
+        if recorded_weight in {None, "custom"}:
+            recorded_weight = config.model.weight_identifier
+        config = config_for_model_selection(
+            config,
+            capability,
+            weight_identifier=recorded_weight,
+        )
+    current_probe = probe_model(config)
+    current_checkpoint = dict(current_probe.get("details", {}).get("checkpoint", {}))
+    if current_checkpoint.get("sha256") != recorded_sha:
+        raise RuntimeError("The selected model weight does not match the recorded run.")
     annotation_path = Path(record["annotations"]["path"]).expanduser().resolve()
     session = load_annotation_session(annotation_path)
     candidate_paths = [

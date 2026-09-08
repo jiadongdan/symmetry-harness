@@ -7,9 +7,11 @@ import json
 import os
 from pathlib import Path
 import sys
+from time import perf_counter
 from typing import Any
 
 from . import __version__
+from .catalog import model_catalog_report
 from .config import load_harness_config
 from .image_io import inspect_input
 from .initialization import initialize_config
@@ -75,16 +77,18 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     initialize = commands.add_parser(
-        "init", help="Create a configuration from an explicit trusted checkpoint."
+        "init", help="Discover models and create a portable Harness configuration."
     )
     initialize.add_argument("--output", type=Path, default=Path(DEFAULT_CONFIG_NAME))
+    initialize.add_argument("--model")
+    initialize.add_argument("--weight")
     initialize.add_argument("--checkpoint", type=Path)
     initialize.add_argument("--provider-python", default=sys.executable)
     initialize.add_argument("--provider-source-root", type=Path)
     initialize.add_argument("--force", action="store_true")
 
     doctor_parser = commands.add_parser(
-        "doctor", help="Check dependencies, device, and checkpoint identity."
+        "doctor", help="Check dependencies, device, and selected model weight."
     )
     _add_config_argument(doctor_parser)
     doctor_parser.add_argument("--require-ui", action="store_true")
@@ -101,6 +105,25 @@ def _parser() -> argparse.ArgumentParser:
     _add_config_argument(inspect)
     inspect.add_argument("--input", type=Path, required=True)
     inspect.add_argument("--normalization")
+
+    launch = commands.add_parser(
+        "launch",
+        help="Preflight the runtime and launch the local annotation UI.",
+    )
+    _add_config_argument(launch)
+    launch.add_argument(
+        "--input", type=Path, help="Optional image to preload before the UI opens."
+    )
+    launch.add_argument("--server-name", default="127.0.0.1")
+    launch.add_argument(
+        "--server-port",
+        type=int,
+        default=0,
+        help="Local port. Use 0 (the default) to choose an available port.",
+    )
+    launch.add_argument(
+        "--inbrowser", action=argparse.BooleanOptionalAction, default=True
+    )
 
     run = commands.add_parser(
         "run", help="Run a saved annotation session and persist all artifacts."
@@ -134,15 +157,18 @@ def _missing_config_report(path: Path) -> dict[str, Any]:
         "config_path": str(path),
         "issues": ["The symmetry-harness configuration does not exist."],
         "recommendations": [
-            f'symmetry init --output "{path}" --checkpoint "<trusted-checkpoint-path>"',
+            f'symmetry init --output "{path}"',
             "If symmetry-learn is missing, install its Provider: "
             + default_provider_install_command("python"),
         ],
     }
 
 
-def _model_report(config, *, probe: bool) -> dict[str, Any]:
-    readiness = doctor(config)
+def _model_report(
+    config, *, probe: bool, readiness: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    if readiness is None:
+        readiness = doctor(config)
     capabilities = readiness.get("environment", {}).get("capabilities", {})
     capability = next(
         (
@@ -154,8 +180,19 @@ def _model_report(config, *, probe: bool) -> dict[str, Any]:
     )
     report: dict[str, Any] = {
         "status": readiness["status"],
+        "catalog": model_catalog_report(
+            capabilities,
+            selected_model=config.model.identifier,
+            selected_weight=readiness.get("model", {}).get("weight_identifier")
+            or config.model.weight_identifier,
+            uses_custom_checkpoint=config.model.checkpoint_path is not None,
+        ),
         "model": {
             "identifier": config.model.identifier,
+            "weight_identifier": readiness.get("model", {}).get(
+                "weight_identifier"
+            )
+            or config.model.weight_identifier,
             "input_channels": config.model.input_channels,
             "pretrained_classes": config.model.pretrained_classes,
             "classifier_patch_size": config.model.classifier_patch_size,
@@ -172,6 +209,7 @@ def _model_report(config, *, probe: bool) -> dict[str, Any]:
             "strategy": capability.get("fine_tuning_strategy"),
             "minimum_shots_per_class": config.fine_tuning.minimum_shots_per_class,
             "recommended_shots_per_class": config.fine_tuning.recommended_shots_per_class,
+            "maximum_shots_per_class": config.fine_tuning.maximum_shots_per_class,
             "support_metrics_are_generalization_metrics": False,
         },
         "readiness": readiness,
@@ -190,12 +228,23 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             checkpoint=arguments.checkpoint,
             provider_python=arguments.provider_python,
             provider_source_root=arguments.provider_source_root,
+            model_identifier=arguments.model,
+            weight_identifier=arguments.weight,
             force=bool(arguments.force),
         )
+    launch_started = perf_counter() if arguments.command == "launch" else None
     config_path = _config_path(arguments.config)
-    if arguments.command == "doctor" and not config_path.is_file():
-        return _missing_config_report(config_path)
+    if arguments.command in {"doctor", "launch"} and not config_path.is_file():
+        report = _missing_config_report(config_path)
+        if arguments.command == "launch":
+            report["phase"] = "config"
+            report["timings_seconds"] = {
+                "total": round(perf_counter() - launch_started, 6)
+            }
+        return report
+    config_started = perf_counter()
     config = load_harness_config(config_path)
+    config_seconds = round(perf_counter() - config_started, 6)
     if arguments.command == "doctor":
         return doctor(config, require_ui=bool(arguments.require_ui))
     if arguments.command == "models":
@@ -204,6 +253,76 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
         normalization = arguments.normalization or config.features.input_normalization
         _, record = inspect_input(arguments.input, normalization)
         return {"status": "ok", "input": record}
+    if arguments.command == "launch":
+        timings = {"config_load": config_seconds}
+        doctor_started = perf_counter()
+        readiness = doctor(config, require_ui=True)
+        timings["doctor"] = round(perf_counter() - doctor_started, 6)
+        if readiness["status"] != "ready":
+            timings["total"] = round(perf_counter() - launch_started, 6)
+            return {
+                "status": "blocked",
+                "phase": "doctor",
+                "config_path": str(config_path),
+                "readiness": readiness,
+                "timings_seconds": timings,
+            }
+
+        model_started = perf_counter()
+        model_report = _model_report(config, probe=False, readiness=readiness)
+        capabilities = readiness["environment"]["capabilities"]
+        timings["model_contract"] = round(perf_counter() - model_started, 6)
+
+        prepared_input = None
+        input_record = None
+        if arguments.input is not None:
+            inspect_started = perf_counter()
+            image, input_record = inspect_input(
+                arguments.input, config.features.input_normalization
+            )
+            prepared_input = (image, input_record)
+            timings["input_inspection"] = round(
+                perf_counter() - inspect_started, 6
+            )
+
+        from .ui import launch_ui
+
+        ui_started = perf_counter()
+
+        def emit_ready(local_url: str) -> None:
+            timings["ui_startup"] = round(perf_counter() - ui_started, 6)
+            timings["total"] = round(perf_counter() - launch_started, 6)
+            payload = {
+                "status": "ready",
+                "url": local_url,
+                "config_path": str(config_path),
+                "output_root": str(config.output_root),
+                "input": input_record,
+                "input_status": (
+                    "preloaded"
+                    if input_record is not None
+                    else "awaiting_user_selection"
+                ),
+                "model": model_report["model"],
+                "feature_channels": model_report["feature_channels"],
+                "fine_tuning": model_report["fine_tuning"],
+                "readiness_timings_seconds": readiness.get(
+                    "timings_seconds", {}
+                ),
+                "timings_seconds": timings,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+
+        launch_ui(
+            config,
+            server_name=arguments.server_name,
+            server_port=arguments.server_port,
+            inbrowser=bool(arguments.inbrowser),
+            prepared_input=prepared_input,
+            capabilities=capabilities,
+            on_ready=emit_ready,
+        )
+        return None
     if arguments.command == "run":
         from .workflow import run_analysis
 
@@ -232,6 +351,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
         server_name=arguments.server_name,
         server_port=arguments.server_port,
         inbrowser=bool(arguments.inbrowser),
+        capabilities=readiness["environment"]["capabilities"],
     )
     return None
 
@@ -256,6 +376,8 @@ def main() -> None:
         raise SystemExit(1) from error
     if result is not None:
         print(json.dumps(result, indent=2, sort_keys=True))
+        if arguments.command == "launch" and result.get("status") == "blocked":
+            raise SystemExit(2)
 
 
 if __name__ == "__main__":

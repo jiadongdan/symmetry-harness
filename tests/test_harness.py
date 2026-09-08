@@ -14,6 +14,8 @@ import warnings
 import numpy as np
 import pytest
 
+from symmetry_harness import cli
+from symmetry_harness.catalog import choose_model, weight_capability
 from symmetry_harness.analysis import (
     dense_prediction_from_arrays,
     render_prediction_overlay,
@@ -27,14 +29,23 @@ from symmetry_harness.annotations import (
     validate_annotation_session,
 )
 from symmetry_harness.config import load_harness_config
-from symmetry_harness.image_io import normalize_image
+from symmetry_harness.image_io import file_sha256, normalize_image
 from symmetry_harness.initialization import initialize_config
 from symmetry_harness.provider import (
     PROVIDER_CONTRACT_VERSION,
     default_provider_install_command,
     validate_provider_capabilities,
 )
-from symmetry_harness.ui import build_app, parse_class_names
+import symmetry_harness.provider as provider_module
+import symmetry_harness.ui as ui_module
+import symmetry_harness.workflow as workflow_module
+from symmetry_harness.ui import (
+    _loaded_image_outputs,
+    _protect_localhost_from_proxies,
+    _resolve_server_port,
+    build_app,
+    parse_class_names,
+)
 from symmetry_harness.workflow import build_run_options, recorded_run_options
 
 
@@ -79,10 +90,19 @@ def _capabilities() -> dict:
         "models": [
             {
                 "identifier": "cnn_8ch_pg17",
+                "display_name": "Eight-channel CNN (PG17)",
                 "available": True,
+                "checkpoint_required": False,
                 "input_channels": 8,
                 "pretrained_classes": 17,
                 "classifier_patch_size": 64,
+                "feature_pipeline": "eight_channel_v1",
+                "fine_tuning_strategy": (
+                    "frozen pretrained network with residual adapters and a new local head"
+                ),
+                "minimum_shots_per_class": 3,
+                "recommended_shots_per_class": 5,
+                "maximum_shots_per_class": 50,
                 "feature_channels": [
                     "image",
                     "reflection_strength",
@@ -111,6 +131,32 @@ def _capabilities() -> dict:
                     "batch_size": 512,
                     "device": "auto",
                 },
+                "default_weight": {
+                    "identifier": "pg17-symmetry-v1",
+                    "distribution": "symmetry-learn-default-model",
+                    "version": "1.0.0",
+                    "sha256": "c" * 64,
+                    "size_bytes": 1024,
+                    "installed_size_bytes": 1024,
+                    "installed_path": "/models/pg17-symmetry-v1.pth",
+                    "status": "installed",
+                    "default": True,
+                    "bundled": True,
+                },
+                "weights": [
+                    {
+                        "identifier": "pg17-symmetry-v1",
+                        "distribution": "symmetry-learn-default-model",
+                        "version": "1.0.0",
+                        "sha256": "c" * 64,
+                        "size_bytes": 1024,
+                        "installed_size_bytes": 1024,
+                        "installed_path": "/models/pg17-symmetry-v1.pth",
+                        "status": "installed",
+                        "default": True,
+                        "bundled": True,
+                    }
+                ],
             }
         ],
     }
@@ -141,6 +187,8 @@ def test_repository_does_not_vendor_models_or_private_paths() -> None:
 def test_example_configuration_is_portable_and_valid() -> None:
     config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
     assert config.model.identifier == "cnn_8ch_pg17"
+    assert config.model.weight_identifier == "pg17-symmetry-v1"
+    assert config.model.checkpoint_path is None
     assert config.model.input_channels == 8
     assert config.model.pretrained_classes == 17
     assert config.model.classifier_patch_size == 64
@@ -162,6 +210,74 @@ def test_recorded_options_restore_all_execution_parameters() -> None:
     assert restored.minimum_shots_per_class == 3
 
 
+def test_reproduction_matches_a_registered_weight_by_checksum(monkeypatch) -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        image_path = directory / "input.npy"
+        np.save(image_path, np.linspace(0.0, 1.0, 128 * 128).reshape(128, 128))
+        session = create_annotation_session(
+            image_path=str(image_path),
+            image_sha256=file_sha256(image_path),
+            image_shape=(128, 128),
+            classifier_patch_size=64,
+            class_names=["Phase A", "Phase B"],
+            points_by_class=[
+                [(40, 40), (41, 40), (42, 40)],
+                [(70, 70), (71, 70), (72, 70)],
+            ],
+        )
+        annotation_path = directory / "annotation_session.json"
+        save_annotation_session(annotation_path, session)
+        record_path = directory / "run_record.json"
+        record_path.write_text(
+            json.dumps(
+                {
+                    "contract_version": "symmetry-harness-run-v1",
+                    "status": "completed",
+                    "model": {
+                        "identifier": "cnn_8ch_pg17",
+                        "checkpoint": {"sha256": "c" * 64},
+                    },
+                    "annotations": {"path": str(annotation_path)},
+                    "artifacts": {"input_array": str(image_path)},
+                    "input": {"path": str(image_path)},
+                    "options": build_run_options(config).to_dict(),
+                    "configuration": {
+                        "fine_tuning": {
+                            "minimum_shots_per_class": 3,
+                            "maximum_shots_per_class": 50,
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(
+            workflow_module,
+            "provider_capabilities",
+            lambda current: _capabilities(),
+        )
+        monkeypatch.setattr(
+            workflow_module,
+            "probe_model",
+            lambda current: {"details": {"checkpoint": {"sha256": "c" * 64}}},
+        )
+        monkeypatch.setattr(
+            workflow_module,
+            "run_analysis",
+            lambda current, **kwargs: {
+                "status": "completed",
+                "resolved_options": kwargs["resolved_options"].to_dict(),
+            },
+        )
+        result = workflow_module.reproduce_analysis(config, record_path)
+
+    assert result["status"] == "completed"
+    assert result["resolved_options"]["classifier_patch_size"] == 64
+
+
 def test_initialization_hashes_checkpoint_without_copying_it() -> None:
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
@@ -180,6 +296,54 @@ def test_initialization_hashes_checkpoint_without_copying_it() -> None:
         assert len(payload["model"]["checkpoint_sha256"]) == 64
         assert payload["model"]["checkpoint_path"] == str(checkpoint.resolve())
         assert checkpoint.read_bytes() == b"trusted checkpoint"
+        config = load_harness_config(destination)
+        method = provider_module._method_payload(config)
+        assert method["checkpoint_path"] == str(checkpoint.resolve())
+        assert method["checkpoint_sha256"] == payload["model"]["checkpoint_sha256"]
+        assert "weight_identifier" not in method
+
+
+def test_initialization_selects_the_installed_default_weight() -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        destination = Path(temporary) / "symmetry-harness.json"
+        result = initialize_config(
+            destination,
+            checkpoint=None,
+            provider_python=sys.executable,
+            force=False,
+            capabilities=_capabilities(),
+        )
+        config = load_harness_config(destination)
+
+    assert result["checkpoint_configured"] is False
+    assert result["weight_identifier"] == "pg17-symmetry-v1"
+    assert result["weight_status"] == "installed"
+    assert result["guidance"] == []
+    assert config.model.weight_identifier == "pg17-symmetry-v1"
+    assert config.model.checkpoint_path is None
+
+
+def test_model_catalog_and_provider_payload_support_registered_weights() -> None:
+    capabilities = _capabilities()
+    model = choose_model(capabilities, None)
+    weight = weight_capability(model, None)
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    payload = provider_module._method_payload(config)
+
+    assert model["identifier"] == "cnn_8ch_pg17"
+    assert weight["identifier"] == "pg17-symmetry-v1"
+    assert payload == {
+        "identifier": "cnn_8ch_pg17",
+        "weight_identifier": "pg17-symmetry-v1",
+    }
+
+    multiple = json.loads(json.dumps(capabilities))
+    second = dict(multiple["models"][0])
+    second["identifier"] = "future_model"
+    multiple["models"].append(second)
+    with pytest.raises(ValueError, match="--model"):
+        choose_model(multiple, None)
+    assert choose_model(multiple, "future_model")["identifier"] == "future_model"
 
 
 def test_normalization_contracts() -> None:
@@ -230,6 +394,148 @@ def test_provider_capability_contract_and_install_guidance() -> None:
     )
     command = default_provider_install_command("python")
     assert "symmetry-learn[provider]" in command
+
+
+def test_doctor_reports_stage_timings(monkeypatch) -> None:
+    with tempfile.TemporaryDirectory() as temporary:
+        directory = Path(temporary)
+        checkpoint = directory / "trusted.pth"
+        checkpoint.write_bytes(b"trusted checkpoint")
+        destination = directory / "symmetry-harness.json"
+        initialize_config(
+            destination,
+            checkpoint=checkpoint,
+            provider_python=sys.executable,
+            force=False,
+            capabilities=_capabilities(),
+        )
+        config = load_harness_config(destination)
+        monkeypatch.setattr(
+            provider_module, "_invoke_provider_json", lambda *args, **kwargs: _capabilities()
+        )
+        monkeypatch.setattr(
+            provider_module,
+            "probe_model",
+            lambda current: {"identifier": current.model.identifier},
+        )
+        monkeypatch.setattr(provider_module, "find_spec", lambda name: object())
+        report = provider_module.doctor(config, require_ui=True)
+
+    assert report["status"] == "ready"
+    assert set(report["timings_seconds"]) == {
+        "provider_capabilities",
+        "checkpoint_sha256",
+        "model_probe",
+        "ui_dependency",
+        "total",
+    }
+    assert all(value >= 0 for value in report["timings_seconds"].values())
+
+
+def test_doctor_accepts_an_installed_registered_default_weight(monkeypatch) -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+
+    def fake_invoke(current, action, path=None, *, timeout_seconds):
+        if action == "--capabilities":
+            return _capabilities()
+        assert action == "--probe"
+        return {
+            "provider_contract_version": PROVIDER_CONTRACT_VERSION,
+            "provider": "symmetry-learn",
+            "identifier": "cnn_8ch_pg17",
+            "details": {
+                "checkpoint": {
+                    "path": "/models/pg17-symmetry-v1.pth",
+                    "sha256": "c" * 64,
+                    "strict_load": True,
+                    "weight_identifier": "pg17-symmetry-v1",
+                    "source": "bundled",
+                    "bundled": True,
+                }
+            },
+        }
+
+    monkeypatch.setattr(provider_module, "_invoke_provider_json", fake_invoke)
+    report = provider_module.doctor(config)
+
+    assert report["status"] == "ready"
+    assert report["issues"] == []
+    assert report["model"]["weight_identifier"] == "pg17-symmetry-v1"
+    assert report["checkpoint"]["kind"] == "registered"
+    assert report["checkpoint"]["bundled"] is True
+    assert report["checkpoint"]["strict_load"] is True
+
+
+def test_doctor_blocks_a_missing_registered_weight_with_install_guidance(
+    monkeypatch,
+) -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    capabilities = _capabilities()
+    model = capabilities["models"][0]
+    model["default_weight"]["status"] = "missing"
+    model["default_weight"]["installed_path"] = None
+    model["weights"][0]["status"] = "missing"
+    model["weights"][0]["installed_path"] = None
+    monkeypatch.setattr(
+        provider_module,
+        "_invoke_provider_json",
+        lambda *args, **kwargs: capabilities,
+    )
+
+    report = provider_module.doctor(config)
+
+    assert report["status"] == "blocked"
+    assert "not installed" in report["issues"][0]
+    assert any(
+        "symmetry-learn-default-model==1.0.0" in item
+        for item in report["recommendations"]
+    )
+
+    ui_report = provider_module.doctor(config, require_ui=True)
+    assert ui_report["status"] == "ready"
+    assert ui_report["model"]["status"] == "selection_required"
+    assert ui_report["model"]["probe"] is None
+
+
+def test_registered_weight_installation_is_explicit_and_refreshes_capabilities(
+    monkeypatch,
+) -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    missing = _capabilities()
+    missing_model = missing["models"][0]
+    missing_model["default_weight"]["status"] = "missing"
+    missing_model["weights"][0]["status"] = "missing"
+    installed = _capabilities()
+    discovered = iter((missing, installed))
+    commands = []
+    monkeypatch.setattr(
+        provider_module,
+        "provider_capabilities",
+        lambda current: next(discovered),
+    )
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="installed", stderr="")
+
+    monkeypatch.setattr(provider_module.subprocess, "run", fake_run)
+    result = provider_module.install_registered_weight(
+        config,
+        model_identifier="cnn_8ch_pg17",
+        weight_identifier="pg17-symmetry-v1",
+    )
+
+    assert commands == [
+        [
+            config.model.python_executable,
+            "-m",
+            "pip",
+            "install",
+            "symmetry-learn-default-model==1.0.0",
+        ]
+    ]
+    assert result["status"] == "installed"
+    assert result["weight"]["status"] == "installed"
 
 
 def test_harness_source_has_no_in_process_model_runtime_dependency() -> None:
@@ -322,6 +628,154 @@ def test_gradio_interface_builds_when_ui_extra_is_installed() -> None:
     assert argument_warnings == []
 
 
+def test_loading_a_new_image_starts_an_empty_annotation_state() -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    image = np.linspace(0.0, 1.0, 96 * 96, dtype=np.float32).reshape(96, 96)
+    record = {
+        "path": str(REPOSITORY_ROOT / "replacement.npy"),
+        "sha256": "d" * 64,
+        "shape": [96, 96],
+        "dtype": "float32",
+    }
+    previous = {
+        "class_names": ["Phase A", "Phase B"],
+        "colors": ["#e41a1c", "#377eb8"],
+        "points": [[(40, 40)], [(70, 70)]],
+    }
+    annotated, state, status = _loaded_image_outputs(
+        image, record, config, previous
+    )
+
+    assert annotated.shape == (96, 96, 3)
+    assert state["class_names"] == ["Phase A", "Phase B"]
+    assert state["points"] == [[], []]
+    assert state["image_sha256"] == "d" * 64
+    assert "Class definitions were retained" in status
+
+
+def test_zero_server_port_resolves_to_available_local_port() -> None:
+    port = _resolve_server_port("127.0.0.1", 0)
+    assert isinstance(port, int)
+    assert 0 < port <= 65535
+
+
+def test_gradio_localhost_bypasses_system_proxies(monkeypatch) -> None:
+    monkeypatch.delenv("no_proxy", raising=False)
+    monkeypatch.setenv("NO_PROXY", "example.test")
+    _protect_localhost_from_proxies()
+
+    assert os.environ["NO_PROXY"] == "example.test,127.0.0.1,localhost"
+    assert os.environ["no_proxy"] == "example.test,127.0.0.1,localhost"
+
+
+def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> None:
+    config_path = REPOSITORY_ROOT / "configs" / "config.example.json"
+    input_path = REPOSITORY_ROOT / "example.npy"
+    readiness = {
+        "status": "ready",
+        "environment": {"capabilities": _capabilities()},
+        "model": {"identifier": "cnn_8ch_pg17", "probe": {}},
+        "checkpoint": {},
+        "issues": [],
+        "recommendations": [],
+        "timings_seconds": {"total": 0.01},
+    }
+    calls = {"doctor": 0, "inspect": 0, "launch": 0}
+
+    def fake_doctor(config, *, require_ui=False):
+        calls["doctor"] += 1
+        assert require_ui is True
+        return readiness
+
+    image = np.zeros((96, 96), dtype=np.float32)
+    input_record = {
+        "path": str(input_path),
+        "sha256": "b" * 64,
+        "shape": [96, 96],
+        "dtype": "float32",
+        "finite": True,
+        "normalization": {"policy": "minmax_0_1"},
+    }
+
+    def fake_inspect(path, normalization):
+        calls["inspect"] += 1
+        assert Path(path) == input_path
+        assert normalization == "minmax_0_1"
+        return image, input_record
+
+    def fake_launch_ui(config, **kwargs):
+        calls["launch"] += 1
+        assert kwargs["server_port"] == 0
+        prepared_image, prepared_record = kwargs["prepared_input"]
+        assert prepared_image is image
+        assert prepared_record is input_record
+        kwargs["on_ready"]("http://127.0.0.1:54321")
+
+    monkeypatch.setattr(cli, "doctor", fake_doctor)
+    monkeypatch.setattr(cli, "inspect_input", fake_inspect)
+    monkeypatch.setattr(ui_module, "launch_ui", fake_launch_ui)
+    arguments = cli._parser().parse_args(
+        [
+            "launch",
+            "--config",
+            str(config_path),
+            "--input",
+            str(input_path),
+            "--no-inbrowser",
+        ]
+    )
+
+    assert cli._execute(arguments) is None
+    payload = json.loads(capsys.readouterr().out)
+    assert calls == {"doctor": 1, "inspect": 1, "launch": 1}
+    assert payload["status"] == "ready"
+    assert payload["url"] == "http://127.0.0.1:54321"
+    assert payload["input"]["sha256"] == "b" * 64
+    assert payload["timings_seconds"]["total"] >= 0
+
+
+def test_launch_without_input_waits_for_gradio_selection(monkeypatch, capsys) -> None:
+    config_path = REPOSITORY_ROOT / "configs" / "config.example.json"
+    readiness = {
+        "status": "ready",
+        "environment": {"capabilities": _capabilities()},
+        "model": {
+            "identifier": "cnn_8ch_pg17",
+            "weight_identifier": "pg17-symmetry-v1",
+            "probe": {},
+        },
+        "checkpoint": {},
+        "issues": [],
+        "recommendations": [],
+        "timings_seconds": {"total": 0.01},
+    }
+
+    monkeypatch.setattr(
+        cli, "doctor", lambda config, *, require_ui=False: readiness
+    )
+
+    def fake_launch_ui(config, **kwargs):
+        assert kwargs["prepared_input"] is None
+        assert kwargs["capabilities"] == _capabilities()
+        kwargs["on_ready"]("http://127.0.0.1:54322")
+
+    monkeypatch.setattr(ui_module, "launch_ui", fake_launch_ui)
+    arguments = cli._parser().parse_args(
+        [
+            "launch",
+            "--config",
+            str(config_path),
+            "--no-inbrowser",
+        ]
+    )
+
+    assert cli._execute(arguments) is None
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ready"
+    assert payload["input"] is None
+    assert payload["input_status"] == "awaiting_user_selection"
+
+
 def test_cli_exposes_public_workflow_commands() -> None:
     completed = subprocess.run(
         [sys.executable, "-m", "symmetry_harness.cli", "--help"],
@@ -331,7 +785,16 @@ def test_cli_exposes_public_workflow_commands() -> None:
         env=_source_environment(),
     )
     assert completed.returncode == 0
-    for command in ("init", "doctor", "models", "inspect", "run", "reproduce", "ui"):
+    for command in (
+        "init",
+        "doctor",
+        "models",
+        "inspect",
+        "launch",
+        "run",
+        "reproduce",
+        "ui",
+    ):
         assert command in completed.stdout
 
 

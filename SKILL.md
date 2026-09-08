@@ -1,8 +1,8 @@
 ---
 name: symmetry-harness
-description: Run interactive few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to label three to five representative points per class, fine-tune the installed local symmetry model with adapters and a task-specific head, create a dense classification map, inspect confidence or entropy, or reproduce a prior run. Requires the local symmetry-harness CLI, the symmetry-learn Provider runtime, and a user-supplied trusted checkpoint. Do not use for foundation-model training, checkpoint downloads, or unattended label selection.
+description: Run interactive few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to choose an installed local symmetry model, select three to five representative points per class, fine-tune adapters and a task-specific head, create a dense classification map, inspect confidence or entropy, or reproduce a prior run. Requires the local symmetry-harness CLI and symmetry-learn Provider runtime. Do not use for foundation-model training, silent weight installation, or unattended label selection.
 metadata:
-  version: "0.1.0"
+  version: "0.2.0"
   product: "symmetry-harness"
 ---
 
@@ -16,33 +16,59 @@ execution remain local. The Harness owns interaction and orchestration;
 symmetry-learn owns feature extraction, checkpoint loading, fine-tuning, and
 inference through its versioned Provider contract.
 
+## Warm Start
+
+Prefer one deterministic browser-first invocation:
+
+```bash
+symmetry launch --config <path> --server-port 0 --no-inbrowser
+```
+
+`launch` performs the required UI-aware doctor check, reports the configured model
+and weight contract, chooses an available local port, and emits one ready JSON
+object before blocking. Open or report its URL immediately. The user then chooses
+the image in Gradio. When the input is already known, `--input <path>` remains an
+optional preload shortcut.
+
+Do not separately repeat environment discovery, README or source inspection,
+`doctor`, `models`, `inspect`, or port probing after `launch` reports `ready`. If
+`launch` reports `blocked`, report its phase, issues, and recommendations and stop.
+If the installed Harness does not expose `launch`, use the compatible cold-start
+and interactive workflow below. When the host can choose task reasoning effort,
+prefer low or medium effort for this deterministic warm-start orchestration.
+
 ## Cold Start
 
 1. Run `symmetry doctor`. If the command is missing, explain that the Harness
    package must be installed from this repository. Do not install software
    without permission.
-2. If the configuration is missing, run `symmetry init --checkpoint <path>`
-   using a checkpoint path supplied by the user.
+2. If the configuration is missing, run `symmetry init`. It selects the sole
+   Provider model and bundled default weight. When several models exist, ask the
+   user to select one and pass `--model` and optionally `--weight`.
 3. If `doctor` reports a missing or incompatible symmetry-learn Provider,
-   Provider dependency, Gradio installation, or checkpoint, present its
-   recommendations and stop when the status is `blocked`. Never search for or
-   download model weights.
-4. Run `symmetry models` and use only the reported model, device, feature, and
-   fine-tuning contracts.
+   Provider dependency, Gradio installation, or selected weight, present its
+   recommendations and stop when the status is `blocked`. Install an optional
+   weight only after the user explicitly clicks the UI installation action or
+   explicitly asks for the reported installation command.
+4. Run `symmetry models` and use only the reported model, weight, device,
+   feature, and fine-tuning contracts.
 
 ## Interactive Workflow
 
-1. Run `symmetry inspect --input <path>` before analysis.
-2. Launch `symmetry ui`. Ask the user to define the local classes and select at
-   least three, preferably five, representative support points per class.
-3. Do not choose points on the user's behalf. The interface rejects points
+1. Launch `symmetry launch` or the compatible `symmetry ui` command without
+   requiring an input path.
+2. Let the user choose the model, weight, and local image in Gradio. Do not
+   upload the image to a remote service.
+3. Ask the user to define the local classes and select at least three,
+   preferably five, representative support points per class.
+4. Do not choose points on the user's behalf. The interface rejects points
    whose full classifier patch would cross the image boundary.
-4. Ask the user to review class names, colors, counts, patch outlines, and patch
+5. Ask the user to review class names, colors, counts, patch outlines, and patch
    previews before starting fine-tuning.
-5. Let the interface run adapter-plus-head fine-tuning and dense prediction.
+6. Let the interface run adapter-plus-head fine-tuning and dense prediction.
    Report the run directory, support counts, configuration, artifacts, and
    warnings.
-6. If the map is not satisfactory, invite the user to add representative
+7. If the map is not satisfactory, invite the user to add representative
    points and create a new run. Never overwrite an earlier run.
 
 ## Headless Reproduction

@@ -1,4 +1,4 @@
-"""Create a portable configuration from explicit user-supplied paths."""
+"""Create a portable configuration from Provider discovery and user choices."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import subprocess
 import sys
 from typing import Any
 
+from .catalog import choose_model, weight_capability, weight_install_requirement
 from .config import CONFIG_SCHEMA_VERSION
 from .image_io import file_sha256
 from .provider import (
@@ -85,12 +86,16 @@ def default_configuration(
     provider_python: Path,
     provider_source_root: Path | None,
     capabilities: dict[str, Any],
+    model_identifier: str | None = None,
+    weight_identifier: str | None = None,
 ) -> dict[str, Any]:
     """Build the v1 configuration from discovered provider capabilities."""
     if capabilities.get("contract_version") != PROVIDER_CONTRACT_VERSION:
         raise RuntimeError("Provider capabilities use an incompatible contract.")
     if capabilities.get("provider") != "symmetry-learn":
         raise RuntimeError("Provider capabilities use an unexpected identity.")
+    if checkpoint is not None and weight_identifier is not None:
+        raise ValueError("Use either --checkpoint or --weight, not both.")
     checkpoint_path = None
     checkpoint_sha256 = None
     if checkpoint is not None:
@@ -99,15 +104,16 @@ def default_configuration(
             raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint}")
         checkpoint_path = str(checkpoint)
         checkpoint_sha256 = file_sha256(checkpoint)
-    models = list(capabilities.get("models", []))
-    capability = next(
-        (item for item in models if item.get("identifier") == "cnn_8ch_pg17"),
-        None,
-    )
-    if capability is None or not bool(capability.get("available", False)):
+    capability = choose_model(capabilities, model_identifier)
+    if not bool(capability.get("available", False)):
         raise RuntimeError(
-            "The symmetry-learn provider does not expose the required cnn_8ch_pg17 model."
+            f"The symmetry-learn Provider reports model {capability.get('identifier')!r} "
+            "as unavailable."
         )
+    selected_weight = None
+    if checkpoint is None:
+        selected_weight = weight_capability(capability, weight_identifier)
+        weight_identifier = str(selected_weight["identifier"])
     defaults = dict(capability.get("defaults", {}))
     provider_version = str(capabilities.get("provider_version", "")).strip()
     if not provider_version:
@@ -130,8 +136,9 @@ def default_configuration(
             "timeout_seconds": 3600,
         },
         "model": {
-            "identifier": "cnn_8ch_pg17",
+            "identifier": str(capability["identifier"]),
             "python_executable": str(provider_python),
+            "weight_identifier": weight_identifier,
             "checkpoint_path": checkpoint_path,
             "checkpoint_sha256": checkpoint_sha256,
             "device": "auto",
@@ -153,11 +160,22 @@ def default_configuration(
         },
         "fine_tuning": {
             "minimum_shots_per_class": int(
-                defaults.get("minimum_shots_per_class", 3)
+                capability.get(
+                    "minimum_shots_per_class",
+                    defaults.get("minimum_shots_per_class", 3),
+                )
             ),
-            "recommended_shots_per_class": 5,
+            "recommended_shots_per_class": int(
+                capability.get(
+                    "recommended_shots_per_class",
+                    defaults.get("recommended_shots_per_class", 5),
+                )
+            ),
             "maximum_shots_per_class": int(
-                defaults.get("maximum_shots_per_class", 50)
+                capability.get(
+                    "maximum_shots_per_class",
+                    defaults.get("maximum_shots_per_class", 50),
+                )
             ),
             "adapter_bottleneck": int(defaults.get("adapter_bottleneck", 16)),
             "epochs": int(defaults.get("epochs", 150)),
@@ -178,6 +196,8 @@ def initialize_config(
     checkpoint: str | Path | None,
     provider_python: str | Path | None = None,
     provider_source_root: str | Path | None = None,
+    model_identifier: str | None = None,
+    weight_identifier: str | None = None,
     force: bool,
     capabilities: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -200,22 +220,37 @@ def initialize_config(
         provider_python=python_path,
         provider_source_root=source_root,
         capabilities=discovered,
+        model_identifier=model_identifier,
+        weight_identifier=weight_identifier,
     )
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     guidance = []
+    configured_weight = payload["model"]["weight_identifier"]
+    selected_weight = None
     if resolved_checkpoint is None:
+        selected_weight = weight_capability(
+            choose_model(discovered, payload["model"]["identifier"]),
+            configured_weight,
+        )
+    if selected_weight is not None and selected_weight.get("status") != "installed":
+        requirement = weight_install_requirement(selected_weight)
         guidance.append(
-            "Register a trusted pretrained checkpoint with "
-            "symmetry init --force --checkpoint <path>."
+            f'Install the selected registered weight with "{python_path}" '
+            f'-m pip install "{requirement}".'
         )
     return {
         "status": "configured",
         "config_path": str(destination),
         "checkpoint_configured": resolved_checkpoint is not None,
         "checkpoint_sha256": payload["model"]["checkpoint_sha256"],
+        "model_identifier": payload["model"]["identifier"],
+        "weight_identifier": configured_weight,
+        "weight_status": (
+            None if selected_weight is None else selected_weight.get("status")
+        ),
         "provider": payload["provider"]["name"],
         "provider_version": payload["provider"]["minimum_version"],
         "guidance": guidance,
