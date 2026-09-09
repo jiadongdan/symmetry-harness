@@ -28,7 +28,14 @@ from .workflow import build_run_options, run_analysis
 REGISTERED_WEIGHT_SOURCE = "Registered weight"
 CUSTOM_CHECKPOINT_SOURCE = "Custom checkpoint"
 ANNOTATION_DISPLAY_MAX_EDGE = 720
-APP_CSS = "#annotation-image {max-width: 760px; margin: 0 auto;}"
+APP_CSS = (
+    "#annotation-image {max-width: 760px; margin: 0 auto;} "
+    "#symmetry-compute-status {min-height: 72px; display: flex; "
+    "align-items: center; padding: 12px 16px; border: 1px solid "
+    "var(--border-color-primary); border-left: 4px solid var(--color-accent); "
+    "border-radius: var(--radius-lg); background: var(--background-fill-secondary);} "
+    "#symmetry-compute-status p {margin: 0; font-weight: 600;}"
+)
 
 
 def parse_class_names(value: str) -> list[str]:
@@ -514,21 +521,24 @@ def _load_cached_features(
     return features, channel_names, record
 
 
+_SIGNED_FEATURE_CHANNELS = {
+    "reflection_sin_2theta",
+    "reflection_cos_2theta",
+}
+
+
+def _feature_display_range(name: str) -> tuple[float, float]:
+    """Return the fixed value range used for a feature-channel preview."""
+    return (-1.0, 1.0) if name in _SIGNED_FEATURE_CHANNELS else (0.0, 1.0)
+
+
 def _feature_preview(channel: np.ndarray, name: str) -> np.ndarray:
-    """Convert one float feature channel into a display-only grayscale image."""
+    """Render a feature channel with its fixed cross-image value range."""
     values = np.asarray(channel, dtype=np.float32)
-    if name == "image":
-        normalized = np.clip(values, 0.0, 1.0)
-    elif name in {"reflection_sin_2theta", "reflection_cos_2theta"}:
-        normalized = (np.clip(values, -1.0, 1.0) + 1.0) / 2.0
-    else:
-        minimum = float(values.min())
-        maximum = float(values.max())
-        normalized = (
-            np.zeros_like(values)
-            if maximum == minimum
-            else (values - minimum) / (maximum - minimum)
-        )
+    minimum, maximum = _feature_display_range(name)
+    normalized = (np.clip(values, minimum, maximum) - minimum) / (
+        maximum - minimum
+    )
     return np.rint(np.clip(normalized, 0.0, 1.0) * 255.0).astype(np.uint8)
 
 
@@ -539,10 +549,8 @@ def feature_gallery(
     items: list[tuple[np.ndarray, str]] = []
     for channel, raw_name in zip(features, channel_names):
         name = str(raw_name)
-        caption = (
-            f"{name}  [min={float(channel.min()):.4g}, "
-            f"max={float(channel.max()):.4g}]"
-        )
+        minimum, maximum = _feature_display_range(name)
+        caption = f"{name}  [color range {minimum:g} to {maximum:g}]"
         items.append((_feature_preview(channel, name), caption))
     return items
 
@@ -724,27 +732,38 @@ def build_app(
             )
 
         gr.Markdown("## Compute 8-channel symmetry maps")
-        with gr.Row():
-            symmetry_patch_size = gr.Number(
-                label="Symmetry patch size",
-                value=config.features.symmetry_patch_size,
-                precision=0,
-                info="Odd local-neighborhood size used to calculate the symmetry maps.",
-            )
-            device = gr.Dropdown(
-                label="Device",
-                choices=["auto", "cuda", "cpu"],
-                value=config.model.device,
-                info="Used for feature extraction, fine-tuning, and prediction.",
-            )
-            compute_features_button = gr.Button(
-                "Compute / update symmetry maps",
-                variant="primary",
-                interactive=prepared_input is not None,
-            )
-        feature_status = gr.Markdown(
-            "Load an image, then compute its eight-channel representation."
-        )
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=2):
+                with gr.Row():
+                    symmetry_patch_size = gr.Number(
+                        label="Symmetry patch size",
+                        value=config.features.symmetry_patch_size,
+                        precision=0,
+                        info=(
+                            "Odd local-neighborhood size used to calculate the "
+                            "symmetry maps."
+                        ),
+                    )
+                    device = gr.Dropdown(
+                        label="Device",
+                        choices=["auto", "cuda", "cpu"],
+                        value=config.model.device,
+                        info="Used for feature extraction, fine-tuning, and prediction.",
+                    )
+            with gr.Column(scale=1, min_width=320):
+                compute_features_button = gr.Button(
+                    "Compute / update symmetry maps",
+                    variant="primary",
+                    interactive=prepared_input is not None,
+                )
+                feature_status = gr.Markdown(
+                    (
+                        "Ready to compute symmetry maps."
+                        if prepared_input is not None
+                        else "Load an image to compute symmetry maps."
+                    ),
+                    elem_id="symmetry-compute-status",
+                )
         feature_maps = gr.Gallery(
             label="Eight-channel representation",
             columns=4,
@@ -1203,6 +1222,11 @@ def build_app(
                 f"{tuple(features.shape)}. Changing only classes or support points "
                 "will reuse these maps."
             )
+            feature_message = (
+                "Symmetry maps are ready (reused cached result)."
+                if cache_hit
+                else "Symmetry maps have been computed."
+            )
             ready = _support_is_ready(current, contract)
             return (
                 gr.update(
@@ -1210,13 +1234,20 @@ def build_app(
                 ),
                 current_features,
                 message,
-                message,
+                feature_message,
                 gr.update(interactive=ready),
                 gr.update(value=None, visible=False),
                 gr.update(value=None, visible=False),
             )
 
-        compute_features_button.click(
+        compute_started = compute_features_button.click(
+            lambda: "Computing symmetry maps...",
+            inputs=[],
+            outputs=[feature_status],
+            queue=False,
+            show_progress="hidden",
+        )
+        compute_finished = compute_started.then(
             on_compute_features,
             inputs=[
                 state,
@@ -1234,6 +1265,13 @@ def build_app(
                 png_download,
                 npy_download,
             ],
+        )
+        compute_finished.failure(
+            lambda: "Symmetry-map computation failed. Review the error message above.",
+            inputs=[],
+            outputs=[feature_status],
+            queue=False,
+            show_progress="hidden",
         )
 
         def on_export_features(current_features, formats):

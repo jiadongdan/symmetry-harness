@@ -44,6 +44,7 @@ import symmetry_harness.workflow as workflow_module
 from symmetry_harness.ui import (
     _annotation_display_shape,
     _display_to_source_point,
+    _feature_preview,
     _feature_request,
     _loaded_image_outputs,
     _protect_localhost_from_proxies,
@@ -721,6 +722,24 @@ def test_feature_cache_key_ignores_support_points_but_tracks_feature_options() -
     assert support_changed_key == first_key
     assert option_changed_key != first_key
     assert first_fingerprint == json.loads(json.dumps(first_fingerprint))
+
+
+def test_feature_previews_use_fixed_color_ranges() -> None:
+    unsigned = np.asarray([[-0.5, 0.0, 0.25, 1.0, 1.5]], dtype=np.float32)
+    signed = np.asarray([[-2.0, -1.0, 0.0, 1.0, 2.0]], dtype=np.float32)
+
+    assert _feature_preview(unsigned, "rotation_4_fold").tolist() == [
+        [0, 0, 64, 255, 255]
+    ]
+    assert _feature_preview(signed, "reflection_sin_2theta").tolist() == [
+        [0, 0, 128, 255, 255]
+    ]
+    gallery = feature_gallery(
+        np.stack((unsigned, signed)),
+        np.asarray(("rotation_4_fold", "reflection_sin_2theta")),
+    )
+    assert gallery[0][1].endswith("[color range 0 to 1]")
+    assert gallery[1][1].endswith("[color range -1 to 1]")
 
 
 def test_feature_gallery_and_exports_preserve_all_eight_channels(

@@ -51,6 +51,12 @@ in this exact order and the Harness validates the returned contract:
 7. four-fold rotational-symmetry map;
 8. six-fold rotational-symmetry map.
 
+The interface and exported PNG previews use fixed value ranges so maps remain
+visually comparable: `-1..1` for the sine and cosine reflection-orientation
+channels, and `0..1` for the other six channels. Values outside those ranges are
+clipped only for visualization; exported NPY arrays retain the original feature
+values.
+
 The pretrained 17-class head is used only to load the learned representation.
 For a new image, the Provider freezes the pretrained network, inserts residual
 bottleneck adapters, replaces the original head with an `N`-class local head,
