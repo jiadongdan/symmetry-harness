@@ -28,6 +28,9 @@ from .workflow import build_run_options, run_analysis
 REGISTERED_WEIGHT_SOURCE = "Registered weight"
 CUSTOM_CHECKPOINT_SOURCE = "Custom checkpoint"
 ANNOTATION_DISPLAY_MAX_EDGE = 720
+INVALID_SUPPORT_POINT_MESSAGE = (
+    "Please select a support point inside the valid region."
+)
 APP_CSS = (
     "#annotation-image {max-width: 760px; margin: 0 auto;} "
     "#symmetry-compute-status {min-height: 72px; display: flex; "
@@ -56,6 +59,38 @@ def _copy_state(state: dict[str, Any]) -> dict[str, Any]:
     copied["colors"] = list(state.get("colors", []))
     copied["points"] = [list(group) for group in state.get("points", [])]
     return copied
+
+
+def _state_classifier_patch_size(
+    state: dict[str, Any], fallback: int
+) -> int:
+    """Return the configured classifier patch size retained by the UI state."""
+    patch_size = int(state.get("classifier_patch_size", fallback))
+    if patch_size <= 0:
+        raise ValueError("The model input patch size must be positive.")
+    return patch_size
+
+
+def _draw_dashed_rectangle(
+    draw: ImageDraw.ImageDraw,
+    bounds: tuple[int, int, int, int],
+    *,
+    fill: str,
+    width: int,
+    dash_length: int,
+    gap_length: int,
+) -> None:
+    """Draw a dashed rectangle with a consistent display-space line width."""
+    left, top, right, bottom = bounds
+    step = dash_length + gap_length
+    for start in range(left, right + 1, step):
+        end = min(start + dash_length, right)
+        draw.line((start, top, end, top), fill=fill, width=width)
+        draw.line((start, bottom, end, bottom), fill=fill, width=width)
+    for start in range(top, bottom + 1, step):
+        end = min(start + dash_length, bottom)
+        draw.line((left, start, left, end), fill=fill, width=width)
+        draw.line((right, start, right, end), fill=fill, width=width)
 
 
 def annotation_rows(state: dict[str, Any]) -> list[list[Any]]:
@@ -104,6 +139,7 @@ def render_annotations(state: dict[str, Any], patch_size: int) -> np.ndarray | N
     image = state.get("image")
     if image is None:
         return None
+    patch_size = _state_classifier_patch_size(state, patch_size)
     gray = unit_to_uint8(np.asarray(image, dtype=np.float32))
     base = Image.fromarray(gray).convert("RGB")
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
@@ -129,6 +165,31 @@ def render_annotations(state: dict[str, Any], patch_size: int) -> np.ndarray | N
     if base.size != (display_width, display_height):
         base = base.resize(
             (display_width, display_height), resample=Image.Resampling.BILINEAR
+        )
+    if state.get("show_valid_region", False):
+        min_x, max_x, min_y, max_y = valid_center_bounds(
+            (height, width), patch_size
+        )
+
+        def display_index(index: int, source_length: int, display_length: int) -> int:
+            if source_length == 1 or display_length == 1:
+                return 0
+            return int(round(index * (display_length - 1) / (source_length - 1)))
+
+        valid_bounds = (
+            display_index(min_x, width, display_width),
+            display_index(min_y, height, display_height),
+            display_index(max_x, width, display_width),
+            display_index(max_y, height, display_height),
+        )
+        line_width = max(4, round(max(display_width, display_height) / 160))
+        _draw_dashed_rectangle(
+            ImageDraw.Draw(base),
+            valid_bounds,
+            fill="white",
+            width=line_width,
+            dash_length=line_width * 3,
+            gap_length=line_width * 2,
         )
     return np.asarray(base)
 
@@ -183,6 +244,8 @@ def _loaded_image_outputs(
         "class_names": class_names,
         "colors": colors,
         "points": [[] for _ in class_names],
+        "classifier_patch_size": config.model.classifier_patch_size,
+        "show_valid_region": False,
     }
     next_step = (
         "Class definitions were retained; select new support points."
@@ -207,7 +270,13 @@ def _load_image(
     return _loaded_image_outputs(image, record, config, previous_state)
 
 
-def _configure_classes(value: str, state: dict[str, Any], config: HarnessConfig):
+def _configure_classes(
+    value: str,
+    state: dict[str, Any],
+    config: HarnessConfig,
+    *,
+    classifier_patch_size: int | None = None,
+):
     import gradio as gr
 
     if state.get("image") is None:
@@ -217,6 +286,16 @@ def _configure_classes(value: str, state: dict[str, Any], config: HarnessConfig)
     updated["class_names"] = names
     updated["colors"] = list(DEFAULT_CLASS_COLORS[: len(names)])
     updated["points"] = [[] for _ in names]
+    patch_size = int(
+        config.model.classifier_patch_size
+        if classifier_patch_size is None
+        else classifier_patch_size
+    )
+    if patch_size <= 0:
+        raise ValueError("The model input patch size must be positive.")
+    valid_center_bounds(tuple(updated["image_shape"]), patch_size)
+    updated["classifier_patch_size"] = patch_size
+    updated["show_valid_region"] = True
     status = (
         f"Configured {len(names)} classes. Select an active class and click at least "
         f"{config.fine_tuning.minimum_shots_per_class} support points per class; "
@@ -225,7 +304,7 @@ def _configure_classes(value: str, state: dict[str, Any], config: HarnessConfig)
     return (
         updated,
         gr.update(choices=names, value=names[0]),
-        render_annotations(updated, config.model.classifier_patch_size),
+        render_annotations(updated, patch_size),
         annotation_rows(updated),
         status,
     )
@@ -239,12 +318,19 @@ def _add_point(
     if active_class not in state["class_names"]:
         raise ValueError("Choose an active class before selecting points.")
     x, y = int(point[0]), int(point[1])
+    patch_size = _state_classifier_patch_size(
+        state, config.model.classifier_patch_size
+    )
     min_x, max_x, min_y, max_y = valid_center_bounds(
-        tuple(state["image_shape"]), config.model.classifier_patch_size
+        tuple(state["image_shape"]), patch_size
     )
     if not min_x <= x <= max_x or not min_y <= y <= max_y:
-        raise ValueError(
-            "This point is too close to the image boundary for a complete classifier patch."
+        return (
+            state,
+            render_annotations(state, patch_size),
+            None,
+            annotation_rows(state),
+            INVALID_SUPPORT_POINT_MESSAGE,
         )
     updated = _copy_state(state)
     class_index = updated["class_names"].index(active_class)
@@ -257,8 +343,8 @@ def _add_point(
     status = f"Added ({x}, {y}) to {active_class}. This class now has {count} support points."
     return (
         updated,
-        render_annotations(updated, config.model.classifier_patch_size),
-        source_patch_preview(updated, (x, y), config.model.classifier_patch_size),
+        render_annotations(updated, patch_size),
+        source_patch_preview(updated, (x, y), patch_size),
         annotation_rows(updated),
         status,
     )
@@ -272,9 +358,12 @@ def _undo_point(state: dict[str, Any], active_class: str | None, config: Harness
     if not updated["points"][class_index]:
         raise ValueError("The active class has no point to undo.")
     removed = updated["points"][class_index].pop()
+    patch_size = _state_classifier_patch_size(
+        updated, config.model.classifier_patch_size
+    )
     return (
         updated,
-        render_annotations(updated, config.model.classifier_patch_size),
+        render_annotations(updated, patch_size),
         annotation_rows(updated),
         f"Removed {removed} from {active_class}.",
     )
@@ -286,9 +375,12 @@ def _clear_class(state: dict[str, Any], active_class: str | None, config: Harnes
     updated = _copy_state(state)
     class_index = updated["class_names"].index(active_class)
     updated["points"][class_index] = []
+    patch_size = _state_classifier_patch_size(
+        updated, config.model.classifier_patch_size
+    )
     return (
         updated,
-        render_annotations(updated, config.model.classifier_patch_size),
+        render_annotations(updated, patch_size),
         annotation_rows(updated),
         f"Cleared all support points for {active_class}.",
     )
@@ -390,6 +482,8 @@ def _reset_annotations_for_model(
 ) -> tuple[dict[str, Any], np.ndarray | None]:
     updated = _copy_state(state)
     updated["points"] = [[] for _ in updated.get("class_names", [])]
+    updated["classifier_patch_size"] = int(patch_size)
+    updated["show_valid_region"] = False
     return updated, render_annotations(updated, patch_size)
 
 
@@ -798,10 +892,22 @@ def build_app(
                 label="Local class names",
                 value="Class A, Class B",
                 info="Enter comma-separated names in the intended local-label order.",
-                scale=3,
+                scale=2,
+            )
+            classifier_patch_size = gr.Number(
+                label="Model input patch size",
+                value=int(
+                    initial_model.get(
+                        "classifier_patch_size", config.model.classifier_patch_size
+                    )
+                ),
+                precision=0,
+                interactive=False,
+                info="Fixed by the selected model.",
+                scale=1,
             )
             configure_button = gr.Button(
-                "Configure classes", variant="secondary", scale=1
+                "Configure classes and patch size", variant="secondary", scale=1
             )
         with gr.Row(equal_height=False):
             with gr.Column(scale=3):
@@ -819,10 +925,6 @@ def build_app(
                     value=initial_annotation,
                     height=720,
                     elem_id="annotation-image",
-                )
-                gr.Markdown(
-                    f"Classifier patch: {config.model.classifier_patch_size} × "
-                    f"{config.model.classifier_patch_size} px — fixed by the selected model."
                 )
             with gr.Column(scale=1, min_width=280):
                 patch_preview = gr.Image(
@@ -930,6 +1032,10 @@ def build_app(
                 gr.update(value=None, visible=False),
                 gr.update(value=None, visible=False),
                 gr.update(interactive=current.get("image") is not None),
+                gr.update(
+                    value=contract.model.classifier_patch_size,
+                    interactive=False,
+                ),
             )
 
         model_selector.change(
@@ -960,6 +1066,7 @@ def build_app(
                 png_download,
                 npy_download,
                 compute_features_button,
+                classifier_patch_size,
             ],
         )
 
@@ -1317,13 +1424,34 @@ def build_app(
                 and Path(str(current_features.get("record_path", ""))).is_file()
             )
 
-        def on_configure_classes(value, current, model_id, current_catalog):
+        def on_configure_classes(
+            value, selected_patch_size, current, model_id, current_catalog
+        ):
             contract = _model_contract_config(config, current_catalog, model_id)
-            return (*_configure_classes(value, current, contract), gr.update(interactive=False))
+            if int(selected_patch_size) != contract.model.classifier_patch_size:
+                raise ValueError(
+                    "The selected model requires a "
+                    f"{contract.model.classifier_patch_size}-pixel input patch."
+                )
+            return (
+                *_configure_classes(
+                    value,
+                    current,
+                    contract,
+                    classifier_patch_size=int(selected_patch_size),
+                ),
+                gr.update(interactive=False),
+            )
 
         configure_button.click(
             on_configure_classes,
-            inputs=[class_names, state, model_selector, catalog_state],
+            inputs=[
+                class_names,
+                classifier_patch_size,
+                state,
+                model_selector,
+                catalog_state,
+            ],
             outputs=[
                 state,
                 active_class,
@@ -1362,6 +1490,20 @@ def build_app(
                 sym_size,
                 run_device,
             )
+            if result[4] == INVALID_SUPPORT_POINT_MESSAGE:
+                gr.Info(
+                    INVALID_SUPPORT_POINT_MESSAGE,
+                    duration=1.5,
+                    title="Valid region",
+                )
+                return (
+                    result[0],
+                    result[1],
+                    gr.update(),
+                    result[3],
+                    gr.update(),
+                    gr.update(interactive=ready),
+                )
             return (*result, gr.update(interactive=ready))
 
         annotation_image.select(
@@ -1480,11 +1622,14 @@ def build_app(
                 runtime_config,
                 model=replace(runtime_config.model, device=str(run_device)),
             )
+            selected_classifier_patch_size = _state_classifier_patch_size(
+                current, runtime_config.model.classifier_patch_size
+            )
             session = create_annotation_session(
                 image_path=current["image_path"],
                 image_sha256=current["image_sha256"],
                 image_shape=tuple(current["image_shape"]),
-                classifier_patch_size=runtime_config.model.classifier_patch_size,
+                classifier_patch_size=selected_classifier_patch_size,
                 class_names=current["class_names"],
                 points_by_class=current["points"],
                 colors=current["colors"],
@@ -1495,6 +1640,7 @@ def build_app(
                 annotation_session=session,
                 overrides={
                     "symmetry_patch_size": int(sym_size),
+                    "classifier_patch_size": selected_classifier_patch_size,
                     "epochs": int(epoch_count),
                     "learning_rate": float(lr),
                     "stride": int(pred_stride),

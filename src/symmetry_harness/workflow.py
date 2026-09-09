@@ -67,6 +67,7 @@ def build_run_options(
     )
     allowed = {
         "symmetry_patch_size",
+        "classifier_patch_size",
         "epochs",
         "learning_rate",
         "weight_decay",
@@ -85,6 +86,7 @@ def build_run_options(
             continue
         if name in {
             "symmetry_patch_size",
+            "classifier_patch_size",
             "epochs",
             "seed",
             "stride",

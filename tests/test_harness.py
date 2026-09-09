@@ -273,6 +273,22 @@ def test_recorded_options_restore_all_execution_parameters() -> None:
     assert restored.minimum_shots_per_class == 3
 
 
+def test_classifier_patch_size_is_an_allowed_integer_run_override() -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+
+    current_model = build_run_options(
+        config, {"classifier_patch_size": 64}
+    )
+    future_model = build_run_options(
+        config, {"classifier_patch_size": "96"}
+    )
+
+    assert current_model.classifier_patch_size == 64
+    assert future_model.classifier_patch_size == 96
+    with pytest.raises(ValueError, match="classifier_patch_size must be positive"):
+        build_run_options(config, {"classifier_patch_size": 0})
+
+
 def test_reproduction_matches_a_registered_weight_by_checksum(monkeypatch) -> None:
     config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
     with tempfile.TemporaryDirectory() as temporary:
@@ -786,6 +802,22 @@ def test_gradio_interface_builds_when_ui_extra_is_installed() -> None:
     ]
     assert type(app).__name__ == "Blocks"
     assert argument_warnings == []
+    components = app.get_config_file()["components"]
+    patch_controls = [
+        component
+        for component in components
+        if component.get("props", {}).get("label") == "Model input patch size"
+    ]
+    assert len(patch_controls) == 1
+    assert patch_controls[0]["props"]["value"] == 64
+    assert patch_controls[0]["props"]["interactive"] is False
+    configure_buttons = [
+        component
+        for component in components
+        if component.get("props", {}).get("value")
+        == "Configure classes and patch size"
+    ]
+    assert len(configure_buttons) == 1
 
 
 def test_loading_a_new_image_starts_an_empty_annotation_state() -> None:
@@ -810,6 +842,8 @@ def test_loading_a_new_image_starts_an_empty_annotation_state() -> None:
     assert state["class_names"] == ["Phase A", "Phase B"]
     assert state["points"] == [[], []]
     assert state["image_sha256"] == "d" * 64
+    assert state["classifier_patch_size"] == 64
+    assert state["show_valid_region"] is False
     assert "Class definitions were retained" in status
 
 
@@ -850,6 +884,43 @@ def test_mapped_display_click_remains_under_rendered_point_marker() -> None:
 
     assert annotated.shape == (720, 720, 3)
     assert red_marker.any()
+
+
+def test_valid_region_and_patch_preview_follow_configured_patch_size() -> None:
+    pytest.importorskip("gradio")
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    state = {
+        "image": np.zeros((430, 430), dtype=np.float32),
+        "image_shape": [430, 430],
+        "class_names": [],
+        "colors": [],
+        "points": [],
+    }
+
+    configured = ui_module._configure_classes(
+        "Phase A, Phase B",
+        state,
+        config,
+        classifier_patch_size=96,
+    )
+    configured_state = configured[0]
+    annotated = configured[2]
+
+    assert configured_state["classifier_patch_size"] == 96
+    assert configured_state["show_valid_region"] is True
+    valid_edge = round(48 * 719 / 429)
+    assert np.all(annotated[valid_edge, valid_edge] >= 250)
+
+    accepted = ui_module._add_point(
+        configured_state, "Phase A", (100, 100), config
+    )
+    assert accepted[2].shape == (96, 96)
+
+    rejected = ui_module._add_point(
+        accepted[0], "Phase A", (47, 100), config
+    )
+    assert rejected[0]["points"] == accepted[0]["points"]
+    assert rejected[4] == ui_module.INVALID_SUPPORT_POINT_MESSAGE
 
 
 def test_zero_server_port_resolves_to_available_local_port() -> None:

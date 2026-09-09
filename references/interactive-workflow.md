@@ -10,8 +10,9 @@ for workflow help, analysis assistance, or result interpretation.
 3. Ask the user to define the local classes and select at least three, preferably
    five, representative support points per class. Changing points reuses the
    current feature cache as long as the input and feature settings are unchanged.
-4. Do not choose support points on the user's behalf. The interface rejects points
-   whose full classifier patch would cross the image boundary.
+4. Do not choose support points on the user's behalf. After class and patch-size
+   configuration, the persistent white dashed frame marks valid patch centers.
+   Clicks outside it are ignored and produce only a brief guidance message.
 5. Ask the user to review class names, colors, counts, patch outlines, and patch
    previews before starting fine-tuning.
 6. Let the interface run adapter-plus-head fine-tuning and dense prediction.
