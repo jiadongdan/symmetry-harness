@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+import zipfile
 
 import numpy as np
 import pytest
@@ -41,11 +42,16 @@ import symmetry_harness.provider as provider_module
 import symmetry_harness.ui as ui_module
 import symmetry_harness.workflow as workflow_module
 from symmetry_harness.ui import (
+    _annotation_display_shape,
+    _display_to_source_point,
+    _feature_request,
     _loaded_image_outputs,
     _protect_localhost_from_proxies,
     _resolve_server_port,
     build_app,
+    feature_gallery,
     parse_class_names,
+    prepare_feature_exports,
 )
 from symmetry_harness.workflow import build_run_options, recorded_run_options
 
@@ -98,6 +104,12 @@ def _capabilities() -> dict:
         "contract_version": PROVIDER_CONTRACT_VERSION,
         "provider": "symmetry-learn",
         "provider_version": "0.1.0",
+        "operations": [
+            "compute_features",
+            "few_shot_analyze",
+            "few_shot_analyze_precomputed_features",
+            "probe_model",
+        ],
         "models": [
             {
                 "identifier": "cnn_8ch_pg17",
@@ -668,6 +680,80 @@ def test_class_name_parser() -> None:
         parse_class_names("Alpha, Alpha")
 
 
+def test_feature_cache_key_ignores_support_points_but_tracks_feature_options() -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    image = np.linspace(0.0, 1.0, 128 * 128, dtype=np.float32).reshape(128, 128)
+    record = {
+        "path": str(REPOSITORY_ROOT / "example.npy"),
+        "sha256": "a" * 64,
+        "shape": [128, 128],
+        "dtype": "float32",
+        "normalization": {"policy": "minmax_0_1"},
+    }
+    _, state, _ = _loaded_image_outputs(image, record, config)
+    _, _, first_fingerprint, first_key = _feature_request(
+        config,
+        _capabilities(),
+        state,
+        model_identifier="cnn_8ch_pg17",
+        symmetry_patch_size=51,
+        device="cpu",
+    )
+    state["class_names"] = ["A", "B"]
+    state["points"] = [[(40, 40)], [(80, 80)]]
+    _, _, _, support_changed_key = _feature_request(
+        config,
+        _capabilities(),
+        state,
+        model_identifier="cnn_8ch_pg17",
+        symmetry_patch_size=51,
+        device="cpu",
+    )
+    _, _, _, option_changed_key = _feature_request(
+        config,
+        _capabilities(),
+        state,
+        model_identifier="cnn_8ch_pg17",
+        symmetry_patch_size=53,
+        device="cpu",
+    )
+
+    assert support_changed_key == first_key
+    assert option_changed_key != first_key
+    assert first_fingerprint == json.loads(json.dumps(first_fingerprint))
+
+
+def test_feature_gallery_and_exports_preserve_all_eight_channels(
+    tmp_path: Path,
+) -> None:
+    names = np.asarray(_capabilities()["models"][0]["feature_channels"])
+    features = np.stack(
+        [np.full((16, 16), index / 7.0, dtype=np.float32) for index in range(8)]
+    )
+    feature_path = tmp_path / "features.npz"
+    record_path = tmp_path / "feature_record.json"
+    np.savez_compressed(feature_path, features=features, channel_names=names)
+    record_path.write_text("{}", encoding="utf-8")
+    state = {
+        "features_path": str(feature_path),
+        "record_path": str(record_path),
+        "feature_shape": list(features.shape),
+    }
+
+    gallery = feature_gallery(features, names)
+    exports, _ = prepare_feature_exports(state, ["PNG", "NPY"])
+
+    assert len(gallery) == 8
+    assert all(item[0].shape == (16, 16) for item in gallery)
+    assert {Path(path).suffix for path in exports} == {".zip", ".npy"}
+    assert np.array_equal(np.load(next(Path(path) for path in exports if path.endswith(".npy"))), features)
+    archive_path = next(Path(path) for path in exports if path.endswith(".zip"))
+    with zipfile.ZipFile(archive_path) as archive:
+        names_in_archive = archive.namelist()
+    assert len(names_in_archive) == 9
+    assert "symmetry_features_montage.png" in names_in_archive
+
+
 def test_gradio_interface_builds_when_ui_extra_is_installed() -> None:
     pytest.importorskip("gradio")
     config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
@@ -701,11 +787,50 @@ def test_loading_a_new_image_starts_an_empty_annotation_state() -> None:
         image, record, config, previous
     )
 
-    assert annotated.shape == (96, 96, 3)
+    assert annotated.shape == (720, 720, 3)
     assert state["class_names"] == ["Phase A", "Phase B"]
     assert state["points"] == [[], []]
     assert state["image_sha256"] == "d" * 64
     assert "Class definitions were retained" in status
+
+
+def test_annotation_display_coordinates_map_back_to_source_pixels() -> None:
+    assert _annotation_display_shape((430, 430)) == (720, 720)
+    assert _display_to_source_point((0, 0), (430, 430)) == (0, 0)
+    assert _display_to_source_point((360, 360), (430, 430)) == (215, 215)
+    assert _display_to_source_point((719, 719), (430, 430)) == (429, 429)
+
+    assert _annotation_display_shape((400, 430)) == (670, 720)
+    assert _display_to_source_point((719, 669), (400, 430)) == (429, 399)
+    with pytest.raises(ValueError, match="outside"):
+        _display_to_source_point((720, 0), (430, 430))
+
+
+def test_mapped_display_click_remains_under_rendered_point_marker() -> None:
+    display_point = (480, 240)
+    source_point = _display_to_source_point(display_point, (430, 430))
+    state = {
+        "image": np.zeros((430, 430), dtype=np.float32),
+        "image_shape": [430, 430],
+        "class_names": ["A"],
+        "colors": ["#e41a1c"],
+        "points": [[source_point]],
+    }
+
+    annotated = ui_module.render_annotations(state, patch_size=64)
+    display_x, display_y = display_point
+    neighborhood = annotated[
+        display_y - 2 : display_y + 3,
+        display_x - 2 : display_x + 3,
+    ]
+    red_marker = (
+        (neighborhood[..., 0] > 180)
+        & (neighborhood[..., 1] < 100)
+        & (neighborhood[..., 2] < 100)
+    )
+
+    assert annotated.shape == (720, 720, 3)
+    assert red_marker.any()
 
 
 def test_zero_server_port_resolves_to_available_local_port() -> None:

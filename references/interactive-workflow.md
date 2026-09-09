@@ -5,16 +5,19 @@ for workflow help, analysis assistance, or result interpretation.
 
 1. Let the user choose the installed model, weight, and local image in the
    interface. Do not upload the image to a remote service.
-2. Ask the user to define the local classes and select at least three, preferably
-   five, representative support points per class.
-3. Do not choose support points on the user's behalf. The interface rejects points
+2. Let the user set the symmetry patch size, compute the eight feature maps, and
+   review or export the two-by-four gallery before fine-tuning.
+3. Ask the user to define the local classes and select at least three, preferably
+   five, representative support points per class. Changing points reuses the
+   current feature cache as long as the input and feature settings are unchanged.
+4. Do not choose support points on the user's behalf. The interface rejects points
    whose full classifier patch would cross the image boundary.
-4. Ask the user to review class names, colors, counts, patch outlines, and patch
+5. Ask the user to review class names, colors, counts, patch outlines, and patch
    previews before starting fine-tuning.
-5. Let the interface run adapter-plus-head fine-tuning and dense prediction.
+6. Let the interface run adapter-plus-head fine-tuning and dense prediction.
    Report the run directory, support counts, configuration, artifacts, and
    warnings.
-6. If the map is not satisfactory, invite the user to add representative points
+7. If the map is not satisfactory, invite the user to add representative points
    and create a new run. Never overwrite an earlier run.
 
 ## Scientific Invariants

@@ -255,6 +255,8 @@ def run_analysis(
     overrides: dict[str, Any] | None = None,
     output_root: str | Path | None = None,
     resolved_options: RunOptions | None = None,
+    features_path: str | Path | None = None,
+    features_record_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Validate user input and delegate the complete numerical run to the provider."""
     readiness = doctor(config)
@@ -314,6 +316,8 @@ def run_analysis(
         labels=np.asarray(support_labels, dtype=np.int64),
         class_names=[entry.name for entry in session.classes],
         options=options.to_dict(),
+        features_path=features_path,
+        features_record_path=features_record_path,
     )
     arrays = provider_result.arrays
     features = np.asarray(arrays.get("features"), dtype=np.float32)

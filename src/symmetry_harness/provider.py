@@ -38,6 +38,15 @@ class ProviderAnalysis:
     record: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class ProviderFeatures:
+    """Reusable feature representation returned by one Provider worker job."""
+
+    features: np.ndarray
+    channel_names: np.ndarray
+    record: dict[str, Any]
+
+
 def default_provider_install_command(python_executable: str) -> str:
     """Return the public installation command for the numerical provider."""
     return f'"{python_executable}" -m pip install "{PROVIDER_INSTALL_REQUIREMENT}"'
@@ -66,6 +75,11 @@ def validate_provider_capabilities(
         issues.append("provider contract version mismatch")
     if capabilities.get("provider") != config.provider.name:
         issues.append("unexpected provider identity")
+    operations = capabilities.get("operations", [])
+    if "compute_features" not in operations:
+        issues.append("provider does not expose reusable feature computation")
+    if "few_shot_analyze_precomputed_features" not in operations:
+        issues.append("provider does not accept reusable precomputed features")
     actual = str(capabilities.get("provider_version", "unknown"))
     minimum = config.provider.minimum_version
     if minimum is not None:
@@ -301,6 +315,73 @@ def probe_model(config: HarnessConfig) -> dict[str, Any]:
     return result
 
 
+def run_provider_features(
+    config: HarnessConfig,
+    image: np.ndarray,
+    *,
+    options: dict[str, Any],
+) -> ProviderFeatures:
+    """Compute a reusable feature representation in the configured Provider."""
+    values = np.asarray(image, dtype=np.float32)
+    if values.ndim != 2 or not np.isfinite(values).all():
+        raise ValueError("Provider input must be a finite two-dimensional image.")
+    provider_options = dict(options)
+    provider_options.pop("input_normalization", None)
+    if isinstance(provider_options.get("rotation_folds"), tuple):
+        provider_options["rotation_folds"] = list(provider_options["rotation_folds"])
+
+    with tempfile.TemporaryDirectory(prefix="symmetry-harness-features-") as temporary:
+        directory = Path(temporary)
+        input_path = directory / "input.npy"
+        output_path = directory / "features.npz"
+        record_path = directory / "feature_record.json"
+        job_path = directory / "job.json"
+        np.save(input_path, values)
+        payload = {
+            "schema_version": WORKER_SCHEMA_VERSION,
+            "input_path": str(input_path),
+            "output_path": str(output_path),
+            "record_path": str(record_path),
+            "options": provider_options,
+            "method": {"identifier": config.model.identifier},
+        }
+        job_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        _invoke_provider_json(
+            config,
+            "--features",
+            job_path,
+            timeout_seconds=config.provider.timeout_seconds,
+        )
+        if not output_path.is_file() or not record_path.is_file():
+            raise RuntimeError("Provider completed without reusable feature artifacts.")
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        if record.get("schema_version") != WORKER_SCHEMA_VERSION:
+            raise RuntimeError("Provider feature worker schema mismatch.")
+        if record.get("provider_contract_version") != PROVIDER_CONTRACT_VERSION:
+            raise RuntimeError("Provider feature contract version mismatch.")
+        if record.get("provider") != config.provider.name:
+            raise RuntimeError("Provider feature identity mismatch.")
+        if record.get("identifier") != config.model.identifier:
+            raise RuntimeError("Provider feature model identity mismatch.")
+        with np.load(output_path, allow_pickle=False) as archive:
+            features = np.asarray(archive["features"], dtype=np.float32).copy()
+            channel_names = np.asarray(archive["channel_names"]).copy()
+    for temporary_key in ("output_path", "record_path"):
+        record.pop(temporary_key, None)
+    record["transport"] = {
+        "kind": "subprocess_json_npy_npz",
+        "python_executable": config.model.python_executable,
+        "module": config.provider.module,
+    }
+    return ProviderFeatures(
+        features=features,
+        channel_names=channel_names,
+        record=record,
+    )
+
+
 def run_provider_analysis(
     config: HarnessConfig,
     image: np.ndarray,
@@ -309,6 +390,8 @@ def run_provider_analysis(
     labels: np.ndarray,
     class_names: list[str],
     options: dict[str, Any],
+    features_path: str | Path | None = None,
+    features_record_path: str | Path | None = None,
 ) -> ProviderAnalysis:
     """Execute the complete numerical workflow in the configured provider."""
     values = np.asarray(image, dtype=np.float32)
@@ -349,6 +432,15 @@ def run_provider_analysis(
             "options": provider_options,
             "method": _method_payload(config),
         }
+        if features_path is not None or features_record_path is not None:
+            if features_path is None or features_record_path is None:
+                raise ValueError(
+                    "Reusable features require both an array and a record path."
+                )
+            payload["features_path"] = str(Path(features_path).resolve())
+            payload["features_record_path"] = str(
+                Path(features_record_path).resolve()
+            )
         job_path.write_text(
             json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )

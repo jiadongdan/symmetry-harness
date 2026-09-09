@@ -1,12 +1,17 @@
 """Local Gradio interface for user-selected few-shot support points."""
 
+from dataclasses import replace
+from hashlib import sha256
+import json
 from pathlib import Path
 import os
 import socket
+import tempfile
 from typing import Any, Callable
+import zipfile
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 
 from .annotations import (
     DEFAULT_CLASS_COLORS,
@@ -16,12 +21,14 @@ from .annotations import (
 from .catalog import model_capability, model_weights, provider_models, weight_capability
 from .config import HarnessConfig, config_for_model_selection
 from .image_io import file_sha256, inspect_input, unit_to_uint8
-from .provider import install_registered_weight
-from .workflow import run_analysis
+from .provider import install_registered_weight, run_provider_features
+from .workflow import build_run_options, run_analysis
 
 
 REGISTERED_WEIGHT_SOURCE = "Registered weight"
 CUSTOM_CHECKPOINT_SOURCE = "Custom checkpoint"
+ANNOTATION_DISPLAY_MAX_EDGE = 720
+APP_CSS = "#annotation-image {max-width: 760px; margin: 0 auto;}"
 
 
 def parse_class_names(value: str) -> list[str]:
@@ -52,6 +59,39 @@ def annotation_rows(state: dict[str, Any]) -> list[list[Any]]:
     return rows
 
 
+def _annotation_display_shape(
+    image_shape: tuple[int, int],
+    maximum_edge: int = ANNOTATION_DISPLAY_MAX_EDGE,
+) -> tuple[int, int]:
+    """Return an aspect-preserving display raster with a bounded longest edge."""
+    height, width = (int(value) for value in image_shape)
+    if height <= 0 or width <= 0 or maximum_edge <= 0:
+        raise ValueError("Annotation display dimensions must be positive.")
+    scale = float(maximum_edge) / float(max(height, width))
+    return max(1, round(height * scale)), max(1, round(width * scale))
+
+
+def _display_to_source_point(
+    point: tuple[int, int], image_shape: tuple[int, int]
+) -> tuple[int, int]:
+    """Map a click in the display raster back to an exact source-array index."""
+    display_height, display_width = _annotation_display_shape(image_shape)
+    source_height, source_width = (int(value) for value in image_shape)
+    display_x, display_y = (int(value) for value in point)
+    if not 0 <= display_x < display_width or not 0 <= display_y < display_height:
+        raise ValueError("The image click falls outside the annotation display raster.")
+
+    def map_index(index: int, display_length: int, source_length: int) -> int:
+        if display_length == 1 or source_length == 1:
+            return 0
+        return int(round(index * (source_length - 1) / (display_length - 1)))
+
+    return (
+        map_index(display_x, display_width, source_width),
+        map_index(display_y, display_height, source_height),
+    )
+
+
 def render_annotations(state: dict[str, Any], patch_size: int) -> np.ndarray | None:
     """Render support points and patch outlines over a display-only image copy."""
     image = state.get("image")
@@ -78,6 +118,11 @@ def render_annotations(state: dict[str, Any], patch_size: int) -> np.ndarray | N
                 width=2,
             )
             draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color, outline="white")
+    display_height, display_width = _annotation_display_shape((height, width))
+    if base.size != (display_width, display_height):
+        base = base.resize(
+            (display_width, display_height), resample=Image.Resampling.BILINEAR
+        )
     return np.asarray(base)
 
 
@@ -96,6 +141,23 @@ def source_patch_preview(
     return unit_to_uint8(patch)
 
 
+def _array_sha256(values: np.ndarray) -> str:
+    """Return a content digest for a normalized array and its geometry."""
+    array = np.ascontiguousarray(values, dtype=np.float32)
+    digest = sha256()
+    digest.update(str(array.shape).encode("ascii"))
+    digest.update(array.tobytes())
+    return digest.hexdigest()
+
+
+def _image_shape_text(record: dict[str, Any] | None) -> str:
+    """Render the only image metadata needed in the interactive layout."""
+    if not record:
+        return "**Image shape:** —"
+    height, width = (int(value) for value in record["shape"])
+    return f"**Image shape:** {height} × {width} (H × W)"
+
+
 def _loaded_image_outputs(
     image: np.ndarray,
     record: dict[str, Any],
@@ -109,21 +171,20 @@ def _loaded_image_outputs(
         "image": image,
         "image_path": record["path"],
         "image_sha256": record["sha256"],
+        "normalized_image_sha256": _array_sha256(image),
         "image_shape": record["shape"],
         "class_names": class_names,
         "colors": colors,
         "points": [[] for _ in class_names],
     }
-    normalization = record.get("normalization", {}).get("policy", "unknown")
     next_step = (
         "Class definitions were retained; select new support points."
         if class_names
         else "Configure local classes next."
     )
+    height, width = (int(value) for value in record["shape"])
     status = (
-        f"Loaded {Path(record['path']).name}: shape {tuple(record['shape'])}, "
-        f"dtype {record['dtype']}, normalization `{normalization}`, SHA-256 "
-        f"`{record['sha256']}`. {next_step}"
+        f"Loaded {Path(record['path']).name}: shape {height} × {width}. {next_step}"
     )
     return render_annotations(state, config.model.classifier_patch_size), state, status
 
@@ -379,6 +440,183 @@ def _model_contract_config(
     )
 
 
+_FEATURE_OPTION_NAMES = (
+    "n_max",
+    "symmetry_patch_size",
+    "rotation_folds",
+    "reflection_p",
+    "normalize_rotation_maps",
+    "device",
+)
+
+
+def _feature_request(
+    config: HarnessConfig,
+    capabilities: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    model_identifier: str,
+    symmetry_patch_size: int,
+    device: str,
+) -> tuple[HarnessConfig, dict[str, Any], dict[str, Any], str]:
+    """Resolve a deterministic feature request and its cache key."""
+    if state.get("image") is None:
+        raise ValueError("Load an input image before computing symmetry maps.")
+    contract = _model_contract_config(config, capabilities, model_identifier)
+    options = build_run_options(
+        contract,
+        {
+            "symmetry_patch_size": int(symmetry_patch_size),
+            "device": str(device),
+        },
+    ).to_dict()
+    capability = model_capability(capabilities, model_identifier)
+    fingerprint = {
+        "input_sha256": state["image_sha256"],
+        "normalized_image_sha256": state["normalized_image_sha256"],
+        "image_shape": list(state["image_shape"]),
+        "input_normalization": options["input_normalization"],
+        "provider_contract_version": capabilities.get("contract_version"),
+        "provider_version": capabilities.get("provider_version"),
+        "model_identifier": model_identifier,
+        "feature_pipeline": capability.get("feature_pipeline"),
+        "feature_options": {name: options[name] for name in _FEATURE_OPTION_NAMES},
+    }
+    # Canonicalize tuples and other JSON-compatible containers before retaining
+    # the fingerprint. The on-disk record is JSON, so comparing it with a
+    # non-canonical in-memory tuple would otherwise turn every lookup into a
+    # false cache miss.
+    serialized_text = json.dumps(fingerprint, sort_keys=True, separators=(",", ":"))
+    fingerprint = json.loads(serialized_text)
+    serialized = serialized_text.encode("utf-8")
+    return contract, options, fingerprint, sha256(serialized).hexdigest()
+
+
+def _feature_cache_paths(cache_root: Path, key: str) -> tuple[Path, Path]:
+    directory = cache_root / key
+    return directory / "features.npz", directory / "feature_record.json"
+
+
+def _load_cached_features(
+    features_path: Path,
+    record_path: Path,
+    *,
+    expected_shape: tuple[int, int, int],
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    with np.load(features_path, allow_pickle=False) as archive:
+        features = np.asarray(archive["features"], dtype=np.float32).copy()
+        channel_names = np.asarray(archive["channel_names"]).copy()
+    if features.shape != expected_shape or not np.isfinite(features).all():
+        raise RuntimeError("Cached features do not match the current image contract.")
+    if channel_names.shape != (expected_shape[0],):
+        raise RuntimeError("Cached feature channel names are incomplete.")
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    return features, channel_names, record
+
+
+def _feature_preview(channel: np.ndarray, name: str) -> np.ndarray:
+    """Convert one float feature channel into a display-only grayscale image."""
+    values = np.asarray(channel, dtype=np.float32)
+    if name == "image":
+        normalized = np.clip(values, 0.0, 1.0)
+    elif name in {"reflection_sin_2theta", "reflection_cos_2theta"}:
+        normalized = (np.clip(values, -1.0, 1.0) + 1.0) / 2.0
+    else:
+        minimum = float(values.min())
+        maximum = float(values.max())
+        normalized = (
+            np.zeros_like(values)
+            if maximum == minimum
+            else (values - minimum) / (maximum - minimum)
+        )
+    return np.rint(np.clip(normalized, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+
+def feature_gallery(
+    features: np.ndarray, channel_names: np.ndarray
+) -> list[tuple[np.ndarray, str]]:
+    """Build the fixed two-by-four display payload for the eight channels."""
+    items: list[tuple[np.ndarray, str]] = []
+    for channel, raw_name in zip(features, channel_names):
+        name = str(raw_name)
+        caption = (
+            f"{name}  [min={float(channel.min()):.4g}, "
+            f"max={float(channel.max()):.4g}]"
+        )
+        items.append((_feature_preview(channel, name), caption))
+    return items
+
+
+def _write_feature_png_bundle(
+    directory: Path, features: np.ndarray, channel_names: np.ndarray
+) -> Path:
+    """Create lossless display PNGs and a labeled two-by-four montage."""
+    png_directory = directory / "png"
+    png_directory.mkdir(parents=True, exist_ok=True)
+    previews: list[tuple[Image.Image, str]] = []
+    paths: list[Path] = []
+    for index, (channel, raw_name) in enumerate(zip(features, channel_names), start=1):
+        name = str(raw_name)
+        preview = Image.fromarray(_feature_preview(channel, name))
+        path = png_directory / f"{index:02d}_{name}.png"
+        preview.save(path)
+        paths.append(path)
+        previews.append((preview, name))
+
+    tile_size = 320
+    label_height = 28
+    montage = Image.new("L", (tile_size * 4, (tile_size + label_height) * 2), 255)
+    draw = ImageDraw.Draw(montage)
+    for index, (preview, name) in enumerate(previews):
+        column = index % 4
+        row = index // 4
+        fitted = ImageOps.contain(
+            preview, (tile_size, tile_size), method=Image.Resampling.LANCZOS
+        )
+        left = column * tile_size + (tile_size - fitted.width) // 2
+        top = row * (tile_size + label_height) + label_height
+        montage.paste(fitted, (left, top))
+        draw.text((column * tile_size + 6, row * (tile_size + label_height) + 7), name, fill=0)
+    montage_path = png_directory / "symmetry_features_montage.png"
+    montage.save(montage_path)
+    paths.append(montage_path)
+
+    archive_path = directory / "symmetry_features_png.zip"
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in paths:
+            archive.write(path, arcname=path.name)
+    return archive_path
+
+
+def prepare_feature_exports(
+    feature_state: dict[str, Any], formats: list[str] | None
+) -> tuple[list[str], str]:
+    """Materialize the user-selected browser-download feature artifacts."""
+    if not feature_state or not feature_state.get("features_path"):
+        raise ValueError("Compute the eight-channel features before exporting them.")
+    selected = list(formats or [])
+    if not selected:
+        raise ValueError("Select PNG, NPY, or both before preparing an export.")
+    features_path = Path(feature_state["features_path"])
+    record_path = Path(feature_state["record_path"])
+    expected = tuple(int(value) for value in feature_state["feature_shape"])
+    features, channel_names, _ = _load_cached_features(
+        features_path, record_path, expected_shape=expected
+    )
+    export_directory = features_path.parent / "exports"
+    export_directory.mkdir(parents=True, exist_ok=True)
+    outputs: list[str] = []
+    if "NPY" in selected:
+        npy_path = export_directory / "symmetry_features.npy"
+        np.save(npy_path, features)
+        outputs.append(str(npy_path))
+    if "PNG" in selected:
+        outputs.append(
+            str(_write_feature_png_bundle(export_directory, features, channel_names))
+        )
+    return outputs, "Feature export is ready. Use the download control to choose its destination."
+
+
 def build_app(
     config: HarnessConfig,
     *,
@@ -416,9 +654,15 @@ def build_app(
         initial_file = initial_record["path"]
         initial_input_record = initial_record
 
+    feature_cache_directory = tempfile.TemporaryDirectory(
+        prefix="symmetry-harness-ui-features-"
+    )
+    feature_cache_root = Path(feature_cache_directory.name)
+
     with gr.Blocks(title="Symmetry Harness") as app:
         state = gr.State(initial_state)
         catalog_state = gr.State(catalog)
+        feature_state = gr.State({})
         gr.Markdown(
             "# Symmetry Harness\n"
             "Choose a local model and image, select three to five representative "
@@ -457,35 +701,116 @@ def build_app(
         install_button = gr.Button("Install selected weight", variant="secondary")
         model_details = gr.Markdown(initial_details)
 
-        gr.Markdown("## Image and support points")
+        gr.Markdown("## Input image")
         with gr.Row():
-            with gr.Column(scale=1):
-                input_file = gr.File(
-                    label="Input image",
-                    type="filepath",
-                    value=initial_file,
-                    file_types=[
-                        ".npy",
-                        ".npz",
-                        ".tif",
-                        ".tiff",
-                        ".png",
-                        ".jpg",
-                        ".jpeg",
-                        ".bmp",
-                    ],
+            input_file = gr.File(
+                label="Input image",
+                type="filepath",
+                value=initial_file,
+                file_types=[
+                    ".npy",
+                    ".npz",
+                    ".tif",
+                    ".tiff",
+                    ".png",
+                    ".jpg",
+                    ".jpeg",
+                    ".bmp",
+                ],
+                scale=2,
+            )
+            image_details = gr.Markdown(
+                _image_shape_text(initial_input_record), min_width=220, scale=1
+            )
+
+        gr.Markdown("## Compute 8-channel symmetry maps")
+        with gr.Row():
+            symmetry_patch_size = gr.Number(
+                label="Symmetry patch size",
+                value=config.features.symmetry_patch_size,
+                precision=0,
+                info="Odd local-neighborhood size used to calculate the symmetry maps.",
+            )
+            device = gr.Dropdown(
+                label="Device",
+                choices=["auto", "cuda", "cpu"],
+                value=config.model.device,
+                info="Used for feature extraction, fine-tuning, and prediction.",
+            )
+            compute_features_button = gr.Button(
+                "Compute / update symmetry maps",
+                variant="primary",
+                interactive=prepared_input is not None,
+            )
+        feature_status = gr.Markdown(
+            "Load an image, then compute its eight-channel representation."
+        )
+        feature_maps = gr.Gallery(
+            label="Eight-channel representation",
+            columns=4,
+            rows=2,
+            height=650,
+            object_fit="contain",
+            allow_preview=True,
+            buttons=["fullscreen"],
+            type="numpy",
+            visible=False,
+        )
+        with gr.Row():
+            export_formats = gr.CheckboxGroup(
+                label="Feature export formats",
+                choices=["PNG", "NPY"],
+                value=["PNG", "NPY"],
+            )
+            export_features_button = gr.Button(
+                "Prepare selected export", variant="secondary"
+            )
+        with gr.Row():
+            png_download = gr.DownloadButton(
+                "Download PNG bundle", value=None, visible=False
+            )
+            npy_download = gr.DownloadButton(
+                "Download NPY array", value=None, visible=False
+            )
+
+        gr.Markdown("## Select support points")
+        with gr.Row():
+            class_names = gr.Textbox(
+                label="Local class names",
+                value="Class A, Class B",
+                info="Enter comma-separated names in the intended local-label order.",
+                scale=3,
+            )
+            configure_button = gr.Button(
+                "Configure classes", variant="secondary", scale=1
+            )
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=3):
+                active_class = gr.Radio(
+                    label="Active class",
+                    choices=[],
+                    interactive=True,
                 )
-                image_details = gr.JSON(
-                    label="Image inspection", value=initial_input_record
+                annotation_image = gr.Image(
+                    label="Click support points",
+                    type="numpy",
+                    format="png",
+                    interactive=True,
+                    buttons=["fullscreen"],
+                    value=initial_annotation,
+                    height=720,
+                    elem_id="annotation-image",
                 )
-                class_names = gr.Textbox(
-                    label="Local class names",
-                    value="Class A, Class B",
-                    info="Enter comma-separated names in the intended local-label order.",
+                gr.Markdown(
+                    f"Classifier patch: {config.model.classifier_patch_size} × "
+                    f"{config.model.classifier_patch_size} px — fixed by the selected model."
                 )
-                configure_button = gr.Button("Configure classes", variant="secondary")
-                active_class = gr.Dropdown(
-                    label="Active class", choices=[], interactive=True
+            with gr.Column(scale=1, min_width=280):
+                patch_preview = gr.Image(
+                    label="Selected source patch",
+                    type="numpy",
+                    interactive=False,
+                    height=260,
                 )
                 support_table = gr.Dataframe(
                     headers=["Class", "Count", "Source coordinates (x, y)"],
@@ -496,25 +821,9 @@ def build_app(
                 with gr.Row():
                     undo_button = gr.Button("Undo last point")
                     clear_button = gr.Button("Clear active class")
-            with gr.Column(scale=2):
-                annotation_image = gr.Image(
-                    label="Click support points",
-                    type="numpy",
-                    interactive=True,
-                    buttons=["fullscreen"],
-                    value=initial_annotation,
-                )
-                patch_preview = gr.Image(
-                    label="Selected source patch", type="numpy", interactive=False
-                )
 
-        gr.Markdown("## Fine-tuning and dense prediction")
+        gr.Markdown("## Fine-tuning")
         with gr.Row():
-            symmetry_patch_size = gr.Number(
-                label="Symmetry patch size",
-                value=config.features.symmetry_patch_size,
-                precision=0,
-            )
             epochs = gr.Number(
                 label="Fine-tuning epochs",
                 value=config.fine_tuning.epochs,
@@ -523,6 +832,8 @@ def build_app(
             learning_rate = gr.Number(
                 label="Learning rate", value=config.fine_tuning.learning_rate
             )
+        gr.Markdown("## Dense prediction")
+        with gr.Row():
             stride = gr.Number(
                 label="Prediction stride",
                 value=config.prediction.stride,
@@ -533,11 +844,6 @@ def build_app(
                 value=config.prediction.batch_size,
                 precision=0,
             )
-            device = gr.Dropdown(
-                label="Device",
-                choices=["auto", "cuda", "cpu"],
-                value=config.model.device,
-            )
         run_button = gr.Button(
             "Fine-tune and predict", variant="primary", interactive=False
         )
@@ -546,10 +852,14 @@ def build_app(
                 label="Prediction overlay", type="numpy", interactive=False
             )
             confidence_image = gr.Image(
-                label="Confidence diagnostic", type="numpy", interactive=False
+                label="Confidence — maximum class probability",
+                type="numpy",
+                interactive=False,
             )
             entropy_image = gr.Image(
-                label="Entropy diagnostic", type="numpy", interactive=False
+                label="Predictive entropy — higher means more ambiguous",
+                type="numpy",
+                interactive=False,
             )
         result_json = gr.JSON(label="Run result")
 
@@ -595,6 +905,12 @@ def build_app(
                 int(defaults.get("stride", contract.prediction.stride)),
                 int(defaults.get("batch_size", contract.prediction.batch_size)),
                 gr.update(interactive=False),
+                {},
+                gr.update(value=None, visible=False),
+                "Model changed; recompute the eight-channel symmetry maps.",
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+                gr.update(interactive=current.get("image") is not None),
             )
 
         model_selector.change(
@@ -619,6 +935,12 @@ def build_app(
                 stride,
                 batch_size,
                 run_button,
+                feature_state,
+                feature_maps,
+                feature_status,
+                png_download,
+                npy_download,
+                compute_features_button,
             ],
         )
 
@@ -687,15 +1009,16 @@ def build_app(
             outputs=[catalog_state, weight_selector, model_details, status],
         )
 
-        def on_image_change(path, current):
+        def on_image_change(path, current, model_id, current_catalog):
             try:
                 if not path:
                     raise ValueError("Choose an input image first.")
                 image, record = inspect_input(
                     path, config.features.input_normalization
                 )
+                contract = _model_contract_config(config, current_catalog, model_id)
                 annotated, updated, message = _loaded_image_outputs(
-                    image, record, config, current
+                    image, record, contract, current
                 )
             except Exception as error:
                 return (
@@ -708,12 +1031,14 @@ def build_app(
                     None,
                     None,
                     None,
-                    {
-                        "status": "invalid",
-                        "error_type": type(error).__name__,
-                        "error": str(error),
-                    },
+                    _image_shape_text(None),
                     f"Image validation failed: {error}",
+                    gr.update(interactive=False),
+                    {},
+                    gr.update(value=None, visible=False),
+                    "Load a valid image before computing symmetry maps.",
+                    gr.update(value=None, visible=False),
+                    gr.update(value=None, visible=False),
                     gr.update(interactive=False),
                 )
             return (
@@ -733,15 +1058,21 @@ def build_app(
                 None,
                 None,
                 None,
-                record,
+                _image_shape_text(record),
                 message
                 + " Selecting another image clears support points and predictions.",
                 gr.update(interactive=False),
+                {},
+                gr.update(value=None, visible=False),
+                "Input changed; compute the eight-channel symmetry maps.",
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+                gr.update(interactive=True),
             )
 
         input_file.change(
             on_image_change,
-            inputs=[input_file, state],
+            inputs=[input_file, state, model_selector, catalog_state],
             outputs=[
                 annotation_image,
                 state,
@@ -755,8 +1086,198 @@ def build_app(
                 image_details,
                 status,
                 run_button,
+                feature_state,
+                feature_maps,
+                feature_status,
+                png_download,
+                npy_download,
+                compute_features_button,
             ],
         )
+
+        def on_feature_setting_change(current):
+            message = (
+                "Feature settings changed; compute the eight-channel symmetry maps."
+                if current.get("image") is not None
+                else "Load an image, then compute its eight-channel representation."
+            )
+            return (
+                {},
+                gr.update(value=None, visible=False),
+                message,
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+                gr.update(interactive=False),
+            )
+
+        symmetry_patch_size.change(
+            on_feature_setting_change,
+            inputs=[state],
+            outputs=[
+                feature_state,
+                feature_maps,
+                feature_status,
+                png_download,
+                npy_download,
+                run_button,
+            ],
+        )
+        device.change(
+            on_feature_setting_change,
+            inputs=[state],
+            outputs=[
+                feature_state,
+                feature_maps,
+                feature_status,
+                png_download,
+                npy_download,
+                run_button,
+            ],
+        )
+
+        def on_compute_features(
+            current, model_id, current_catalog, sym_size, run_device
+        ):
+            contract, options, fingerprint, cache_key = _feature_request(
+                config,
+                current_catalog,
+                current,
+                model_identifier=model_id,
+                symmetry_patch_size=int(sym_size),
+                device=str(run_device),
+            )
+            features_path, record_path = _feature_cache_paths(
+                feature_cache_root, cache_key
+            )
+            expected_shape = (
+                contract.model.input_channels,
+                int(current["image_shape"][0]),
+                int(current["image_shape"][1]),
+            )
+            cache_hit = False
+            try:
+                features, channel_names, feature_record = _load_cached_features(
+                    features_path,
+                    record_path,
+                    expected_shape=expected_shape,
+                )
+                if feature_record.get("harness_cache_fingerprint") != fingerprint:
+                    raise RuntimeError("Cached feature fingerprint mismatch.")
+                cache_hit = True
+            except (FileNotFoundError, KeyError, OSError, ValueError, RuntimeError):
+                result = run_provider_features(
+                    contract,
+                    np.asarray(current["image"], dtype=np.float32),
+                    options=options,
+                )
+                features = result.features
+                channel_names = result.channel_names
+                if features.shape != expected_shape:
+                    raise RuntimeError(
+                        "Provider features do not match the selected model contract."
+                    )
+                feature_record = {
+                    **result.record,
+                    "harness_cache_fingerprint": fingerprint,
+                }
+                features_path.parent.mkdir(parents=True, exist_ok=True)
+                np.savez_compressed(
+                    features_path,
+                    features=features,
+                    channel_names=channel_names,
+                )
+                record_path.write_text(
+                    json.dumps(feature_record, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+            current_features = {
+                "cache_key": cache_key,
+                "features_path": str(features_path),
+                "record_path": str(record_path),
+                "fingerprint": fingerprint,
+                "feature_shape": list(features.shape),
+            }
+            source = "Reused cached" if cache_hit else "Computed"
+            message = (
+                f"{source} eight-channel symmetry maps with shape "
+                f"{tuple(features.shape)}. Changing only classes or support points "
+                "will reuse these maps."
+            )
+            ready = _support_is_ready(current, contract)
+            return (
+                gr.update(
+                    value=feature_gallery(features, channel_names), visible=True
+                ),
+                current_features,
+                message,
+                message,
+                gr.update(interactive=ready),
+                gr.update(value=None, visible=False),
+                gr.update(value=None, visible=False),
+            )
+
+        compute_features_button.click(
+            on_compute_features,
+            inputs=[
+                state,
+                model_selector,
+                catalog_state,
+                symmetry_patch_size,
+                device,
+            ],
+            outputs=[
+                feature_maps,
+                feature_state,
+                status,
+                feature_status,
+                run_button,
+                png_download,
+                npy_download,
+            ],
+        )
+
+        def on_export_features(current_features, formats):
+            outputs, message = prepare_feature_exports(current_features, formats)
+            png_path = next((path for path in outputs if path.endswith(".zip")), None)
+            npy_path = next((path for path in outputs if path.endswith(".npy")), None)
+            return (
+                gr.update(value=png_path, visible=png_path is not None),
+                gr.update(value=npy_path, visible=npy_path is not None),
+                message,
+            )
+
+        export_features_button.click(
+            on_export_features,
+            inputs=[feature_state, export_formats],
+            outputs=[png_download, npy_download, feature_status],
+        )
+
+        def features_are_current(
+            current,
+            current_features,
+            model_id,
+            current_catalog,
+            sym_size,
+            run_device,
+        ):
+            if not current_features:
+                return False
+            try:
+                _, _, _, expected_key = _feature_request(
+                    config,
+                    current_catalog,
+                    current,
+                    model_identifier=model_id,
+                    symmetry_patch_size=int(sym_size),
+                    device=str(run_device),
+                )
+            except (KeyError, TypeError, ValueError):
+                return False
+            return bool(
+                current_features.get("cache_key") == expected_key
+                and Path(str(current_features.get("features_path", ""))).is_file()
+                and Path(str(current_features.get("record_path", ""))).is_file()
+            )
 
         def on_configure_classes(value, current, model_id, current_catalog):
             contract = _model_contract_config(config, current_catalog, model_id)
@@ -775,19 +1296,47 @@ def build_app(
             ],
         )
 
-        def on_select(current, active, model_id, current_catalog, event: gr.SelectData):
+        def on_select(
+            current,
+            active,
+            model_id,
+            current_catalog,
+            current_features,
+            sym_size,
+            run_device,
+            event: gr.SelectData,
+        ):
             index = event.index
             if not isinstance(index, (list, tuple)) or len(index) != 2:
                 raise ValueError("The image click did not provide a valid pixel coordinate.")
             contract = _model_contract_config(config, current_catalog, model_id)
-            result = _add_point(
-                current, active, (int(index[0]), int(index[1])), contract
+            source_point = _display_to_source_point(
+                (int(index[0]), int(index[1])), tuple(current["image_shape"])
             )
-            return (*result, gr.update(interactive=_support_is_ready(result[0], contract)))
+            result = _add_point(
+                current, active, source_point, contract
+            )
+            ready = _support_is_ready(result[0], contract) and features_are_current(
+                result[0],
+                current_features,
+                model_id,
+                current_catalog,
+                sym_size,
+                run_device,
+            )
+            return (*result, gr.update(interactive=ready))
 
         annotation_image.select(
             on_select,
-            inputs=[state, active_class, model_selector, catalog_state],
+            inputs=[
+                state,
+                active_class,
+                model_selector,
+                catalog_state,
+                feature_state,
+                symmetry_patch_size,
+                device,
+            ],
             outputs=[
                 state,
                 annotation_image,
@@ -798,14 +1347,38 @@ def build_app(
             ],
         )
 
-        def on_undo(current, active, model_id, current_catalog):
+        def on_undo(
+            current,
+            active,
+            model_id,
+            current_catalog,
+            current_features,
+            sym_size,
+            run_device,
+        ):
             contract = _model_contract_config(config, current_catalog, model_id)
             result = _undo_point(current, active, contract)
-            return (*result, gr.update(interactive=_support_is_ready(result[0], contract)))
+            ready = _support_is_ready(result[0], contract) and features_are_current(
+                result[0],
+                current_features,
+                model_id,
+                current_catalog,
+                sym_size,
+                run_device,
+            )
+            return (*result, gr.update(interactive=ready))
 
         undo_button.click(
             on_undo,
-            inputs=[state, active_class, model_selector, catalog_state],
+            inputs=[
+                state,
+                active_class,
+                model_selector,
+                catalog_state,
+                feature_state,
+                symmetry_patch_size,
+                device,
+            ],
             outputs=[state, annotation_image, support_table, status, run_button],
         )
 
@@ -822,6 +1395,7 @@ def build_app(
 
         def on_run(
             current,
+            current_features,
             model_id,
             source,
             weight_id,
@@ -836,6 +1410,26 @@ def build_app(
         ):
             if current.get("image") is None or not current.get("class_names"):
                 raise ValueError("Load an image and configure classes before running.")
+            _, _, _, expected_feature_key = _feature_request(
+                config,
+                current_catalog,
+                current,
+                model_identifier=model_id,
+                symmetry_patch_size=int(sym_size),
+                device=str(run_device),
+            )
+            if current_features.get("cache_key") != expected_feature_key:
+                raise ValueError(
+                    "The symmetry maps are missing or stale. Compute them before fine-tuning."
+                )
+            features_path = Path(str(current_features.get("features_path", "")))
+            features_record_path = Path(
+                str(current_features.get("record_path", ""))
+            )
+            if not features_path.is_file() or not features_record_path.is_file():
+                raise ValueError(
+                    "The cached symmetry maps are unavailable. Compute them again."
+                )
             runtime_config = _runtime_config(
                 config,
                 current_catalog,
@@ -843,6 +1437,10 @@ def build_app(
                 source=source,
                 weight_identifier=weight_id,
                 checkpoint_path=checkpoint,
+            )
+            runtime_config = replace(
+                runtime_config,
+                model=replace(runtime_config.model, device=str(run_device)),
             )
             session = create_annotation_session(
                 image_path=current["image_path"],
@@ -865,6 +1463,8 @@ def build_app(
                     "batch_size": int(pred_batch),
                     "device": str(run_device),
                 },
+                features_path=features_path,
+                features_record_path=features_record_path,
             )
             overlay = np.asarray(Image.open(result["prediction_overlay"]).convert("RGB"))
             confidence = np.asarray(Image.open(result["confidence"]).convert("RGB"))
@@ -879,6 +1479,7 @@ def build_app(
             on_run,
             inputs=[
                 state,
+                feature_state,
                 model_selector,
                 weight_source,
                 weight_selector,
@@ -899,6 +1500,7 @@ def build_app(
                 status,
             ],
         )
+    app._symmetry_feature_cache_directory = feature_cache_directory
     return app.queue(default_concurrency_limit=1)
 
 
@@ -964,6 +1566,7 @@ def launch_ui(
         show_error=True,
         prevent_thread_lock=True,
         quiet=on_ready is not None,
+        css=APP_CSS,
     )
     if on_ready is not None:
         on_ready(local_url)

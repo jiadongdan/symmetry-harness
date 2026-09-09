@@ -6,9 +6,10 @@ point-annotation interface, adapter-plus-head fine-tuning, dense prediction,
 versioned run records, and a machine-readable CLI for Codex, Claude Code,
 WorkBuddy, Cursor, and other shell-capable agents.
 
-The intended workflow is interactive. A user defines local classes and clicks
-three to five representative points per class. The Harness records that intent
-and delegates feature extraction, `64 x 64` support-patch construction,
+The intended workflow is interactive. A user first computes and reviews the
+eight symmetry-feature channels, then defines local classes and clicks three to
+five representative points per class. The Harness records that intent and
+delegates feature extraction, `64 x 64` support-patch construction,
 adapter-plus-head fine-tuning, and dense inference to the versioned
 `symmetry-learn` Provider.
 
@@ -166,18 +167,23 @@ Then:
 1. choose a model and registered weight, or select a trusted custom checkpoint;
 2. explicitly install a selected optional weight if its status is not installed;
 3. choose or drag in a single-channel image;
-4. review its shape, dtype, normalization, and checksum status;
-5. enter comma-separated local class names;
-6. choose the active class and click support points;
-7. review the patch outlines and support counts;
-8. select at least three points per class, with five recommended;
-9. run fine-tuning and dense prediction;
-10. inspect the overlay, confidence, entropy, and saved run directory.
+4. review the displayed image shape;
+5. set the symmetry patch size and compute the eight feature maps;
+6. review the maps in the two-by-four gallery and optionally export lossless PNG
+   previews, the raw eight-channel NPY array, or both;
+7. enter comma-separated local class names;
+8. choose the active class in the horizontal selector and click support points;
+9. review the patch outlines and support counts;
+10. select at least three points per class, with five recommended;
+11. run fine-tuning and dense prediction;
+12. inspect the overlay, confidence, entropy, and saved run directory.
 
 Clicks too close to the border are rejected because a complete classifier patch
 cannot be extracted. Choosing another image clears support points and prediction
-state while retaining class names and colors. Registered and custom pretrained
-weights are always read-only.
+state while retaining class names and colors. Changing only support points does
+not recompute the symmetry maps. The cached maps are reused until the input,
+normalization, model, Provider identity, feature parameters, or device changes.
+Registered and custom pretrained weights are always read-only.
 
 The `symmetry ui` compatibility command launches the same browser-first workflow.
 
@@ -245,9 +251,11 @@ checkpoint reproduction applies the same checksum rule.
 Adapter and local-head initialization is seeded before model construction.
 Repeating a run on the same recorded runtime is therefore deterministic;
 bitwise identity across different PyTorch, CUDA, driver, or hardware versions
-is not guaranteed. Confidence is rendered against the fixed interval `0..1`,
-and entropy is rendered against `0..log(N)` for `N` local classes. Both use a
-blue-to-green-to-red scale from low to high.
+is not guaranteed. Confidence is the largest class probability at each pixel
+and is rendered against the fixed interval `0..1`. Predictive entropy is
+`-sum(p * log(p))` over all local classes and measures how spread out the class
+probabilities are; it is rendered against `0..log(N)` for `N` local classes.
+Both use a blue-to-green-to-red scale from low to high.
 
 ## Interpretation
 
