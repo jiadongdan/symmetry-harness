@@ -31,3 +31,16 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install ".[ui,dev]"
       - run: python -m pytest -q -k gradio_interface_builds
+
+  provider-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - run: python -m pip install ".[dev]"
+      - run: python -m pip install "symmetry-learn @ git+https://github.com/jiadongdan/symmetry-learn.git@main"
+      - run: python -m pytest -q tests/test_prediction_integration.py
