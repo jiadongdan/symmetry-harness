@@ -35,6 +35,7 @@ class ProviderAnalysis:
 
     arrays: dict[str, np.ndarray]
     adapter_checkpoint: bytes
+    fine_tuned_model_state: bytes
     record: dict[str, Any]
 
 
@@ -45,6 +46,34 @@ class ProviderFeatures:
     features: np.ndarray
     channel_names: np.ndarray
     record: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class PredictionItemResult:
+    """Provider-reported status for one image in a prediction batch."""
+
+    item_id: str
+    status: str
+    detail: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ProviderPredictionBatch:
+    """Provider-reported summary for one saved-model prediction batch."""
+
+    summary: dict[str, Any]
+
+    @property
+    def items(self) -> list[dict[str, Any]]:
+        return list(self.summary.get("items", []))
+
+    @property
+    def completed_count(self) -> int:
+        return int(self.summary.get("completed_count", 0))
+
+    @property
+    def failed_count(self) -> int:
+        return int(self.summary.get("failed_count", 0))
 
 
 def default_provider_install_command(python_executable: str) -> str:
@@ -473,6 +502,7 @@ def run_provider_analysis(
         input_path = directory / "input.npy"
         output_path = directory / "output.npz"
         adapter_path = directory / "adapter_head.pt"
+        model_state_path = directory / "model_state.pt"
         record_path = directory / "provider_record.json"
         progress_path = directory / "progress.json"
         job_path = directory / "job.json"
@@ -482,6 +512,7 @@ def run_provider_analysis(
             "input_path": str(input_path),
             "output_path": str(output_path),
             "adapter_path": str(adapter_path),
+            "model_state_path": str(model_state_path),
             "record_path": str(record_path),
             "support": {
                 "coordinates_xy": coordinates.tolist(),
@@ -513,7 +544,12 @@ def run_provider_analysis(
             progress_path=progress_path if progress_callback is not None else None,
             progress_callback=progress_callback,
         )
-        if not output_path.is_file() or not adapter_path.is_file() or not record_path.is_file():
+        if (
+            not output_path.is_file()
+            or not adapter_path.is_file()
+            or not model_state_path.is_file()
+            or not record_path.is_file()
+        ):
             raise RuntimeError("Provider completed without all required output artifacts.")
         record = json.loads(record_path.read_text(encoding="utf-8"))
         if record.get("schema_version") != WORKER_SCHEMA_VERSION:
@@ -530,7 +566,13 @@ def run_provider_analysis(
                 for name in payload_arrays.files
             }
         adapter_checkpoint = adapter_path.read_bytes()
-    for temporary_key in ("output_path", "adapter_path", "record_path"):
+        fine_tuned_model_state = model_state_path.read_bytes()
+    for temporary_key in (
+        "output_path",
+        "adapter_path",
+        "model_state_path",
+        "record_path",
+    ):
         record.pop(temporary_key, None)
     record["transport"] = {
         "kind": "subprocess_json_npy_npz",
@@ -540,8 +582,85 @@ def run_provider_analysis(
     return ProviderAnalysis(
         arrays=arrays,
         adapter_checkpoint=adapter_checkpoint,
+        fine_tuned_model_state=fine_tuned_model_state,
         record=record,
     )
+
+
+def run_provider_prediction_batch(
+    config: HarnessConfig,
+    *,
+    model_state_path: str | Path,
+    expected_model: dict[str, Any],
+    feature_options: dict[str, Any],
+    prediction_options: dict[str, Any],
+    items: list[dict[str, Any]],
+    progress_path: Path | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> ProviderPredictionBatch:
+    """Run one saved-model prediction batch in the configured Provider."""
+    if not items:
+        raise ValueError("A prediction batch requires at least one image.")
+    source = Path(model_state_path)
+    if not source.is_file():
+        raise ValueError(f"The materialized model state does not exist: {source}")
+    payload_items = []
+    seen: set[str] = set()
+    for item in items:
+        for key in ("item_id", "input_path", "output_path", "record_path"):
+            if not str(item.get(key, "")).strip():
+                raise ValueError(f"Each prediction item requires {key!r}.")
+        item_id = str(item["item_id"])
+        if item_id in seen:
+            raise ValueError(f"Duplicate prediction item identifier: {item_id!r}")
+        seen.add(item_id)
+        payload_items.append(
+            {
+                "item_id": item_id,
+                "input_path": str(Path(item["input_path"]).resolve()),
+                "output_path": str(Path(item["output_path"]).resolve()),
+                "record_path": str(Path(item["record_path"]).resolve()),
+            }
+        )
+    feature_payload = dict(feature_options)
+    feature_payload.pop("input_normalization", None)
+    if isinstance(feature_payload.get("rotation_folds"), tuple):
+        feature_payload["rotation_folds"] = list(feature_payload["rotation_folds"])
+
+    with tempfile.TemporaryDirectory(prefix="symmetry-harness-predict-") as temporary:
+        directory = Path(temporary)
+        job_path = directory / "predict.json"
+        payload = {
+            "schema_version": WORKER_SCHEMA_VERSION,
+            "model_state_path": str(source.resolve()),
+            "expected_model": dict(expected_model),
+            "feature_options": feature_payload,
+            "prediction_options": dict(prediction_options),
+            "items": payload_items,
+        }
+        if progress_path is not None:
+            payload["progress_path"] = str(progress_path)
+        job_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        summary = _invoke_provider_json(
+            config,
+            "--predict",
+            job_path,
+            timeout_seconds=config.provider.timeout_seconds,
+            progress_path=progress_path if progress_callback is not None else None,
+            progress_callback=progress_callback,
+        )
+    if summary.get("provider_contract_version") != PROVIDER_CONTRACT_VERSION:
+        raise RuntimeError("Provider prediction contract version mismatch.")
+    if summary.get("provider") != config.provider.name:
+        raise RuntimeError("Provider prediction identity mismatch.")
+    summary["transport"] = {
+        "kind": "subprocess_json_npz",
+        "python_executable": config.model.python_executable,
+        "module": config.provider.module,
+    }
+    return ProviderPredictionBatch(summary=summary)
 
 
 def doctor(config: HarnessConfig, *, require_ui: bool = False) -> dict[str, Any]:

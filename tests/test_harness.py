@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import inspect
 import os
 from pathlib import Path
 import re
@@ -16,7 +17,7 @@ import zipfile
 import numpy as np
 import pytest
 
-from symmetry_harness import cli
+from symmetry_harness import __version__, cli
 from symmetry_harness.catalog import choose_model, weight_capability
 from symmetry_harness.analysis import (
     dense_prediction_from_arrays,
@@ -42,6 +43,7 @@ from symmetry_harness.provider import (
 import symmetry_harness.provider as provider_module
 import symmetry_harness.ui as ui_module
 import symmetry_harness.workflow as workflow_module
+from symmetry_harness.contracts import FINE_TUNED_MODEL_PACKAGE_SCHEMA_VERSION
 from symmetry_harness.ui import (
     _annotation_display_shape,
     _display_to_source_point,
@@ -216,6 +218,85 @@ def test_repository_does_not_vendor_models_or_private_paths() -> None:
     assert "C:\\" not in skill
 
 
+def test_package_and_skill_versions_match() -> None:
+    project = (REPOSITORY_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    skill = (REPOSITORY_ROOT / "SKILL.md").read_text(encoding="utf-8")
+    project_match = re.search(r'^version = "([^"]+)"$', project, re.MULTILINE)
+    skill_match = re.search(r'^  version: "([^"]+)"$', skill, re.MULTILINE)
+
+    assert project_match is not None
+    assert skill_match is not None
+    assert project_match.group(1) == __version__
+    assert skill_match.group(1) == __version__
+
+
+def test_tracked_sources_contain_no_machine_specific_paths() -> None:
+    """Published sources must not hard-code one developer's machine layout."""
+    listed = subprocess.run(
+        ["git", "ls-files"],
+        cwd=REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.splitlines()
+    # A Windows drive root or a POSIX home directory always identifies one
+    # machine. Run directories are git-ignored, so anything tracked is source.
+    patterns = (
+        re.compile(r"[A-Za-z]:[\\/]Users[\\/]"),
+        re.compile(r"[A-Za-z]:[\\/]Users$"),
+        re.compile(r"/home/[A-Za-z0-9_.-]+/"),
+        re.compile(r"/Users/[A-Za-z0-9_.-]+/"),
+    )
+    violations: list[str] = []
+    for relative in listed:
+        path = REPOSITORY_ROOT / relative
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in TEXT_SUFFIXES and path.name not in TEXT_FILENAMES:
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        for pattern in patterns:
+            if pattern.search(content):
+                violations.append(f"{relative}: {pattern.pattern}")
+                break
+    assert violations == []
+
+
+def test_run_directories_are_never_tracked() -> None:
+    """Local run output must stay out of the published repository."""
+    listed = subprocess.run(
+        ["git", "ls-files"],
+        cwd=REPOSITORY_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.splitlines()
+    leaked = [name for name in listed if "symmetry-runs" in name.split("/")]
+    assert leaked == []
+    assert (REPOSITORY_ROOT / ".gitignore").is_file()
+    ignored = (REPOSITORY_ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "symmetry-runs/" in ignored
+
+
+def test_skill_resources_are_portable() -> None:
+    """The bundled Skill must not encode host paths or a fixed Python."""
+    for relative in (
+        "SKILL.md",
+        "scripts/launch.ps1",
+        "scripts/launch.sh",
+        "scripts/stop.ps1",
+        "scripts/stop.sh",
+    ):
+        content = (REPOSITORY_ROOT / relative).read_text(encoding="utf-8")
+        assert "D:\\" not in content, relative
+        assert "C:\\" not in content, relative
+        assert "/Users/" not in content, relative
+        assert "anaconda3" not in content, relative
+
+
 def test_installer_persists_runtime_and_copies_skill_resources(tmp_path) -> None:
     script_path = REPOSITORY_ROOT / "scripts" / "install.py"
     specification = importlib.util.spec_from_file_location(
@@ -247,6 +328,8 @@ def test_installer_persists_runtime_and_copies_skill_resources(tmp_path) -> None
     assert (skill_path / "agents" / "openai.yaml").is_file()
     assert (skill_path / "scripts" / "launch.ps1").is_file()
     assert (skill_path / "scripts" / "launch.sh").is_file()
+    assert (skill_path / "scripts" / "stop.ps1").is_file()
+    assert (skill_path / "scripts" / "stop.sh").is_file()
 
 
 def test_example_configuration_is_portable_and_valid() -> None:
@@ -273,6 +356,64 @@ def test_recorded_options_restore_all_execution_parameters() -> None:
     assert restored.n_max == 31
     assert restored.adapter_bottleneck == 7
     assert restored.minimum_shots_per_class == 3
+
+
+def test_portable_fine_tuned_model_package_contains_inference_contract(
+    tmp_path: Path,
+) -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    image_path = tmp_path / "input.npy"
+    np.save(image_path, np.zeros((96, 96), dtype=np.float32))
+    session = create_annotation_session(
+        image_path=str(image_path),
+        image_sha256=file_sha256(image_path),
+        image_shape=(96, 96),
+        classifier_patch_size=64,
+        class_names=["Phase A", "Phase B"],
+        points_by_class=[[(32, 32)], [(63, 63)]],
+    )
+    destination = tmp_path / "fine_tuned_model.symmodel"
+    model_state = b"complete model state"
+    provider_record = {
+        "provider_version": "0.1.0",
+        "model": {
+            "identifier": "cnn_8ch_pg17",
+            "input_channels": 8,
+            "classifier_patch_size": 64,
+            "feature_pipeline": "eight_channel_v1",
+            "checkpoint": {
+                "sha256": "a" * 64,
+                "weight_identifier": "pg17-symmetry-v1",
+            },
+        },
+        "features": {
+            "channel_names": [f"channel_{index}" for index in range(8)]
+        },
+        "runtime": {"torch_version": "2.1.0"},
+        "training": {"epochs": 1, "loss": [0.5]},
+    }
+
+    workflow_module._write_fine_tuned_model_package(
+        destination,
+        model_state=model_state,
+        session=session,
+        options=build_run_options(config),
+        provider_record=provider_record,
+        run_id="symmetry-test",
+    )
+
+    with zipfile.ZipFile(destination) as archive:
+        assert set(archive.namelist()) == {
+            "manifest.json",
+            "model_state.pt",
+            "training_summary.json",
+        }
+        manifest = json.loads(archive.read("manifest.json"))
+        assert archive.read("model_state.pt") == model_state
+    assert manifest["schema_version"] == FINE_TUNED_MODEL_PACKAGE_SCHEMA_VERSION
+    assert manifest["model"]["task_classes"] == 2
+    assert manifest["classes"][1]["name"] == "Phase B"
+    assert manifest["features"]["input_normalization"] == "minmax_0_1"
 
 
 def test_classifier_patch_size_is_an_allowed_integer_run_override() -> None:
@@ -861,7 +1002,13 @@ def test_gradio_interface_builds_when_ui_extra_is_installed() -> None:
         if "Expected" in str(item.message) and "arguments" in str(item.message)
     ]
     assert type(app).__name__ == "Blocks"
-    assert argument_warnings == []
+    # Gradio always warns for the annotation click handler because it injects
+    # SelectData by type annotation instead of listing it in `inputs`. That one
+    # warning is expected; every other argument-count warning is a real defect.
+    unexpected = [
+        message for message in argument_warnings if "on_select" not in message
+    ]
+    assert unexpected == []
     components = app.get_config_file()["components"]
     patch_controls = [
         component
@@ -996,6 +1143,107 @@ def test_gradio_localhost_bypasses_system_proxies(monkeypatch) -> None:
 
     assert os.environ["NO_PROXY"] == "example.test,127.0.0.1,localhost"
     assert os.environ["no_proxy"] == "example.test,127.0.0.1,localhost"
+
+
+def test_annotation_click_accepts_an_injected_select_event() -> None:
+    gradio = pytest.importorskip("gradio")
+    from gradio.events import SelectData
+
+    from symmetry_harness.ui_fine_tune import build_fine_tune_workspace
+
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    captured: dict[str, Any] = {}
+    original_select = gradio.Image.select
+
+    def spy_select(self, function, **kwargs):
+        captured["function"] = function
+        return original_select(self, function, **kwargs)
+
+    gradio.Image.select = spy_select
+    try:
+        with gradio.Blocks() as _:
+            build_fine_tune_workspace(config, capabilities=_capabilities())
+    finally:
+        gradio.Image.select = original_select
+
+    function = captured["function"]
+    parameters = inspect.signature(function).parameters
+    # Gradio injects SelectData by type annotation. Declaring it keyword-only
+    # breaks every click, so it must stay a positional parameter.
+    assert "event" in parameters
+    assert parameters["event"].kind is not inspect.Parameter.KEYWORD_ONLY
+
+    # The annotation must resolve to the real class. `from __future__ import
+    # annotations` makes annotations lazy, and annotating with a name imported
+    # inside the function body leaves the hint unresolvable. Gradio then skips
+    # injection and fills the argument with None, so every click raises
+    # AttributeError. Use Gradio's own resolver to prove injection works.
+    from gradio.utils import get_type_hints
+
+    assert get_type_hints(function).get("event") is SelectData
+
+    state = {
+        "image": np.zeros((96, 96), dtype=np.float32),
+        "image_shape": [96, 96],
+        "image_path": str(config.source_path),
+        "image_sha256": "a" * 64,
+        "class_names": ["Phase A", "Phase B"],
+        "colors": ["#e41a1c", "#377eb8"],
+        "points": [[], []],
+        "classifier_patch_size": 64,
+    }
+    from gradio.helpers import special_args
+
+    event_data = SelectData(target=None, data={"index": [360, 360], "value": None})
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        filled, _, event_index, _ = special_args(
+            function,
+            [state, "Phase A", "cnn_8ch_pg17", _capabilities(), {}, 51, "cpu"],
+            request=None,
+            event_data=event_data,
+        )
+        result = function(*filled)
+    assert event_index is not None
+    assert isinstance(filled[event_index], SelectData)
+    assert result[0]["points"][0] == [(48, 48)]
+
+
+def test_launch_ui_blocks_until_the_server_stops(monkeypatch) -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    events: list[str] = []
+
+    class FakeApp:
+        def launch(self, **kwargs):
+            events.append("launch")
+            return None, "http://127.0.0.1:54321", None
+
+        def block_thread(self):
+            events.append("block_thread")
+
+    def fake_build_app(config, **kwargs):
+        events.append("build")
+        return FakeApp()
+
+    monkeypatch.setattr(ui_module, "build_app", fake_build_app)
+
+    ui_module.launch_ui(
+        config,
+        server_name="127.0.0.1",
+        server_port=0,
+        inbrowser=False,
+        capabilities=_capabilities(),
+        on_ready=lambda url: events.append(f"ready:{url}"),
+    )
+
+    # The server must outlive the ready payload. Returning before blocking would
+    # end the process and close the pipe an orchestrator is still reading.
+    assert events == [
+        "build",
+        "launch",
+        "ready:http://127.0.0.1:54321",
+        "block_thread",
+    ]
 
 
 def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> None:

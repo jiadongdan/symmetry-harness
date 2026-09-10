@@ -1,8 +1,8 @@
 ---
 name: symmetry-harness
-description: Run interactive few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to launch the local interface, choose an installed symmetry model, select three to five representative points per class, fine-tune adapters and a task-specific head, create a dense classification map, inspect confidence or entropy, or reproduce a prior run. Requires the local symmetry-harness CLI and symmetry-learn Provider runtime. Do not use for foundation-model training, silent weight installation, or unattended label selection.
+description: Run local few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to launch the local interface, fine-tune adapters on representative points, inspect confidence or entropy, or apply a saved .symmodel package to new images without re-training. Requires the local symmetry-harness runtime and the symmetry-learn Provider. Do not use for foundation-model training, silent weight installation, or unattended label selection.
 metadata:
-  version: "0.2.0"
+  version: "0.2.1"
   product: "symmetry-harness"
 ---
 
@@ -13,6 +13,21 @@ installer records the exact Harness Python executable and configuration in the
 user's local runtime state. The Harness owns interaction and orchestration.
 `symmetry-learn` owns feature extraction, checkpoint loading, fine-tuning, and
 inference through its versioned Provider contract.
+
+There are two peer workspaces in one application:
+
+```text
+Fine-tune a model                    Predict with a saved model
+-----------------                    --------------------------
+Select base model                    Import .symmodel package
+Load reference image                 Load one or more images
+Compute symmetry features            Validate package and inputs
+Define classes                       Compute matching features
+Select support points                Restore fine-tuned model
+Fine-tune adapters and head          Run dense prediction only
+Review prediction                    Review/export results
+Export .symmodel
+```
 
 ## Fast Launch
 
@@ -33,8 +48,9 @@ For a request to start or open the interactive interface, follow only this path:
 
    Resolve `<skill-directory>` only from the location of this loaded Skill. Do not
    search for it. Append `--input <path>` only when the user explicitly asks to
-   preload an image. Waiting for or reading more output from this same process
-   remains part of the single launch invocation.
+   preload an image. Append `--mode predict` only when the user explicitly asks
+   for the saved-model prediction workspace. Waiting for or reading more output
+   from this same process remains part of the single launch invocation.
 
 2. Read stdout until the first JSON object whose `status` is `ready` or `blocked`.
 
@@ -55,13 +71,39 @@ For a request to start or open the interactive interface, follow only this path:
 
 For a startup-only request, do not read any supporting reference.
 
+## Stopping
+
+For a request to stop, close, or shut down the interface, run exactly one
+bundled stop script. It terminates every Harness instance regardless of which
+tool or terminal started it, and then verifies the count is zero.
+
+On Windows:
+
+```powershell
+& "<skill-directory>\scripts\stop.ps1"
+```
+
+On macOS or Linux:
+
+```bash
+"<skill-directory>/scripts/stop.sh"
+```
+
+The scripts match on the whole command line (`symmetry_harness.cli` together
+with `launch`), so they work whether the interface was started via
+`python -m symmetry_harness.cli` or a console script. Do not hand-roll a
+kill command that matches a single argument position; `-m` shifts the module
+name and such a match silently finds nothing.
+
 ## Other Modes
 
 - When the user explicitly asks to diagnose or repair a blocked launch, read
   [references/troubleshooting.md](references/troubleshooting.md).
-- When the interface is already available and the user asks for workflow help or
-  result interpretation, read
+- When the interface is already available and the user asks for fine-tuning
+  workflow help or result interpretation, read
   [references/interactive-workflow.md](references/interactive-workflow.md).
+- When the user wants to apply a saved `.symmodel` package to new images, read
+  [references/prediction.md](references/prediction.md).
 - For a saved annotation session or completed-run reproduction, read
   [references/reproduction.md](references/reproduction.md).
 

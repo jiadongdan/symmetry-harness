@@ -220,6 +220,7 @@ symmetry models      report the complete model and weight catalog
 symmetry inspect     inspect and normalize an input without running the model
 symmetry launch      preflight the runtime and launch the local UI
 symmetry run         execute a saved annotation session
+symmetry predict     predict images with a saved fine-tuned model package
 symmetry reproduce   repeat a prior completed run
 symmetry ui          launch the local point-annotation interface
 ```
@@ -233,9 +234,16 @@ Examples:
 symmetry inspect --input image.tif
 symmetry launch --config symmetry-harness.json --server-port 0
 symmetry launch --config symmetry-harness.json --input image.tif --server-port 0
+symmetry launch --config symmetry-harness.json --mode predict --server-port 0
 symmetry run --input image.tif --annotations annotation_session.json
+symmetry predict --model fine_tuned_model.symmodel --input image.npy
+symmetry predict --model fine_tuned_model.symmodel \
+  --input one.tif --input two.tif --device cuda
 symmetry reproduce --record symmetry-runs/<run-id>/run_record.json
 ```
+
+`--mode fine-tune|predict` opens the requested workspace when the interface
+starts. Both workspaces live in one application with isolated state.
 
 Configuration defaults to `SYMMETRY_HARNESS_CONFIG` or
 `./symmetry-harness.json`.
@@ -251,6 +259,7 @@ input_preview.png
 features.npz
 support_patches.npz
 adapter_head.pt
+fine_tuned_model.symmodel
 provider_record.json
 training_history.json
 prediction.npz
@@ -260,6 +269,13 @@ entropy.png
 run_record.json
 report.md
 ```
+
+`fine_tuned_model.symmodel` is the portable inference artifact. It is a ZIP-based
+single-file package containing the complete fine-tuned model state, a versioned
+manifest with the model and feature contract, the local class names and colors,
+prediction defaults, checksums, and a training summary. Unlike the compact
+`adapter_head.pt`, it does not require the original pretrained checkpoint to be
+present when a compatible Provider later restores it for prediction.
 
 The Provider record preserves its numerical runtime and contract identity. The
 Harness run record preserves image and resolved weight checksums, exact click
@@ -280,6 +296,48 @@ and is rendered against the fixed interval `0..1`. Predictive entropy is
 `-sum(p * log(p))` over all local classes and measures how spread out the class
 probabilities are; it is rendered against `0..log(N)` for `N` local classes.
 Both use a blue-to-green-to-red scale from low to high.
+
+## Predicting With a Saved Model
+
+The prediction workflow applies a `fine_tuned_model.symmodel` package to new
+images. It never collects support points and never fine-tunes.
+
+```bash
+symmetry predict --model fine_tuned_model.symmodel --input image.npy
+```
+
+Supported inputs are `npy`, `npz`, `tif`, `tiff`, `png`, `jpg`, `jpeg`, and
+`bmp`. Repeat `--input` to submit a batch; the Provider restores the saved model
+once for the whole batch.
+
+Feature parameters and the input normalization policy are restored from the
+package and are read-only. Only `device`, `stride`, and `batch_size` may be
+overridden. Prediction is blocked when the package or its model-state checksum
+is invalid, when the saved model is not registered in the installed Provider, or
+when the saved feature contract does not match it.
+
+Each prediction run writes its own directory:
+
+```text
+symmetry-prediction-runs/
+└── prediction-<UTC>-<id>/
+    ├── batch_record.json
+    ├── report.md
+    ├── results.zip
+    └── items/
+        └── image-0001/
+            ├── input.npy
+            ├── input_preview.png
+            ├── provider_record.json
+            ├── prediction.npz
+            ├── prediction_overlay.png
+            ├── confidence.png
+            ├── entropy.png
+            └── prediction_record.json
+```
+
+The source package is read-only. It is never modified, renamed, or copied into
+per-image directories; each record stores its absolute path and checksum.
 
 ## Interpretation
 

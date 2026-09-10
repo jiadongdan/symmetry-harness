@@ -124,6 +124,12 @@ def _parser() -> argparse.ArgumentParser:
     launch.add_argument(
         "--inbrowser", action=argparse.BooleanOptionalAction, default=True
     )
+    launch.add_argument(
+        "--mode",
+        choices=["fine-tune", "predict"],
+        default="fine-tune",
+        help="Workspace opened when the interface starts.",
+    )
 
     run = commands.add_parser(
         "run", help="Run a saved annotation session and persist all artifacts."
@@ -141,12 +147,36 @@ def _parser() -> argparse.ArgumentParser:
     reproduce.add_argument("--record", type=Path, required=True)
     reproduce.add_argument("--output-root", type=Path)
 
+    predict = commands.add_parser(
+        "predict",
+        help="Predict one or more images with a saved fine-tuned model package.",
+    )
+    _add_config_argument(predict)
+    predict.add_argument("--model", type=Path, required=True)
+    predict.add_argument(
+        "--input",
+        type=Path,
+        action="append",
+        default=[],
+        help="Input image. Repeat the option to predict several images.",
+    )
+    predict.add_argument("--output-root", type=Path)
+    predict.add_argument("--device")
+    predict.add_argument("--stride", type=int)
+    predict.add_argument("--batch-size", type=int)
+
     ui = commands.add_parser("ui", help="Launch the local point-annotation interface.")
     _add_config_argument(ui)
     ui.add_argument("--server-name", default="127.0.0.1")
     ui.add_argument("--server-port", type=int)
     ui.add_argument(
         "--inbrowser", action=argparse.BooleanOptionalAction, default=True
+    )
+    ui.add_argument(
+        "--mode",
+        choices=["fine-tune", "predict"],
+        default="fine-tune",
+        help="Workspace opened when the interface starts.",
     )
     return parser
 
@@ -295,6 +325,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             payload = {
                 "status": "ready",
                 "url": local_url,
+                "mode": str(arguments.mode),
                 "config_path": str(config_path),
                 "output_root": str(config.output_root),
                 "input": input_record,
@@ -320,6 +351,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             inbrowser=bool(arguments.inbrowser),
             prepared_input=prepared_input,
             capabilities=capabilities,
+            mode=str(arguments.mode),
             on_ready=emit_ready,
         )
         return None
@@ -339,6 +371,20 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
         return reproduce_analysis(
             config, arguments.record, output_root=arguments.output_root
         )
+    if arguments.command == "predict":
+        from .prediction_workflow import run_saved_model_prediction_batch
+
+        if not arguments.input:
+            raise ValueError("Provide at least one --input image.")
+        return run_saved_model_prediction_batch(
+            config,
+            model_package=arguments.model,
+            image_paths=list(arguments.input),
+            output_root=arguments.output_root,
+            device=arguments.device,
+            stride=arguments.stride,
+            batch_size=arguments.batch_size,
+        )
     from .ui import launch_ui
 
     readiness = doctor(config, require_ui=True)
@@ -352,6 +398,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
         server_port=arguments.server_port,
         inbrowser=bool(arguments.inbrowser),
         capabilities=readiness["environment"]["capabilities"],
+        mode=str(getattr(arguments, "mode", "fine-tune")),
     )
     return None
 

@@ -9,6 +9,8 @@ from typing import Any
 HARNESS_CONTRACT_VERSION = "symmetry-harness-run-v1"
 ANNOTATION_SCHEMA_VERSION = "symmetry-annotation-session-v1"
 ADAPTER_SCHEMA_VERSION = "symmetry-adapter-head-v1"
+FINE_TUNED_MODEL_PACKAGE_SCHEMA_VERSION = "symmetry-fine-tuned-model-package-v1"
+PREDICTION_RUN_CONTRACT_VERSION = "symmetry-harness-prediction-run-v1"
 
 
 @dataclass(frozen=True)

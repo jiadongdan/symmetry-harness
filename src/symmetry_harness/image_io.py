@@ -126,5 +126,4 @@ def unit_to_uint8(image: np.ndarray) -> np.ndarray:
 
 def save_preview(path: str | Path, image: np.ndarray) -> None:
     """Save a display-only grayscale PNG preview."""
-    Image.fromarray(unit_to_uint8(image), mode="L").save(Path(path))
-
+    Image.fromarray(unit_to_uint8(image)).save(Path(path))

@@ -4,15 +4,18 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Callable
 from uuid import uuid4
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import numpy as np
 from PIL import Image
 
+from . import __version__ as harness_version
 from .catalog import model_capability
 from .analysis import (
     dense_prediction_from_arrays,
@@ -27,7 +30,11 @@ from .annotations import (
     validate_annotation_session,
 )
 from .config import HarnessConfig, config_for_model_selection, config_snapshot
-from .contracts import HARNESS_CONTRACT_VERSION, RunOptions
+from .contracts import (
+    FINE_TUNED_MODEL_PACKAGE_SCHEMA_VERSION,
+    HARNESS_CONTRACT_VERSION,
+    RunOptions,
+)
 from .image_io import file_sha256, inspect_input, save_preview
 from .provider import (
     doctor,
@@ -186,6 +193,7 @@ def _artifact_paths(run_dir: Path) -> dict[str, str]:
         "features": "features.npz",
         "support_patches": "support_patches.npz",
         "adapter_head": "adapter_head.pt",
+        "fine_tuned_model": "fine_tuned_model.symmodel",
         "provider_record": "provider_record.json",
         "training_history": "training_history.json",
         "prediction": "prediction.npz",
@@ -196,6 +204,89 @@ def _artifact_paths(run_dir: Path) -> dict[str, str]:
         "report": "report.md",
     }
     return {key: str((run_dir / name).resolve()) for key, name in names.items()}
+
+
+def _write_fine_tuned_model_package(
+    path: Path,
+    *,
+    model_state: bytes,
+    session: AnnotationSession,
+    options: RunOptions,
+    provider_record: dict[str, Any],
+    run_id: str,
+) -> None:
+    """Create the portable single-file model consumed by prediction workflows."""
+    model_record = dict(provider_record["model"])
+    checkpoint_record = dict(model_record["checkpoint"])
+    feature_record = dict(provider_record["features"])
+    runtime_record = dict(provider_record["runtime"])
+    classes = [
+        {"index": entry.index, "name": entry.name, "color": entry.color}
+        for entry in session.classes
+    ]
+    manifest = {
+        "schema_version": FINE_TUNED_MODEL_PACKAGE_SCHEMA_VERSION,
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "model": {
+            "identifier": model_record["identifier"],
+            "input_channels": model_record["input_channels"],
+            "classifier_patch_size": model_record["classifier_patch_size"],
+            "adapter_bottleneck": options.adapter_bottleneck,
+            "task_classes": len(classes),
+        },
+        "classes": classes,
+        "features": {
+            "pipeline": model_record["feature_pipeline"],
+            "channel_names": list(feature_record["channel_names"]),
+            "n_max": options.n_max,
+            "symmetry_patch_size": options.symmetry_patch_size,
+            "rotation_folds": list(options.rotation_folds),
+            "reflection_p": options.reflection_p,
+            "normalize_rotation_maps": options.normalize_rotation_maps,
+            "input_normalization": options.input_normalization,
+        },
+        "prediction_defaults": {
+            "stride": options.stride,
+            "batch_size": options.batch_size,
+        },
+        "software": {
+            "symmetry_harness_version": harness_version,
+            "symmetry_learn_version": provider_record["provider_version"],
+            "torch_version": runtime_record.get("torch_version"),
+        },
+        "provenance": {
+            "training_run_id": run_id,
+            "base_weight_identifier": checkpoint_record.get("weight_identifier"),
+            "base_checkpoint_sha256": checkpoint_record["sha256"],
+            "model_state_sha256": hashlib.sha256(model_state).hexdigest(),
+        },
+    }
+    training_summary = {
+        "training_run_id": run_id,
+        "classes": [
+            {
+                "index": entry.index,
+                "name": entry.name,
+                "color": entry.color,
+                "support_count": len(entry.points),
+                "support_points_xy": [list(point) for point in entry.points],
+            }
+            for entry in session.classes
+        ],
+        "options": options.to_dict(),
+        "training": dict(provider_record["training"]),
+        "training_image_sha256": session.image_sha256,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with ZipFile(path, "w", compression=ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "manifest.json", json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+        )
+        archive.writestr("model_state.pt", model_state)
+        archive.writestr(
+            "training_summary.json",
+            json.dumps(training_summary, indent=2, sort_keys=True) + "\n",
+        )
 
 
 def _write_report(
@@ -243,6 +334,7 @@ image and relevant domain evidence.
 
 - Prediction overlay: `{artifacts['prediction_overlay']}`
 - Prediction arrays: `{artifacts['prediction']}`
+- Portable fine-tuned model: `{artifacts['fine_tuned_model']}`
 - Adapter and local head: `{artifacts['adapter_head']}`
 - Provider record: `{artifacts['provider_record']}`
 - Run record: `{artifacts['run_record']}`
@@ -369,6 +461,14 @@ def run_analysis(
     )
     Path(artifacts["adapter_head"]).write_bytes(provider_result.adapter_checkpoint)
     _write_json(Path(artifacts["provider_record"]), provider_result.record)
+    _write_fine_tuned_model_package(
+        Path(artifacts["fine_tuned_model"]),
+        model_state=provider_result.fine_tuned_model_state,
+        session=session,
+        options=options,
+        provider_record=provider_result.record,
+        run_id=run_id,
+    )
     training = dict(provider_result.record["training"])
     _write_json(Path(artifacts["training_history"]), training)
 
@@ -461,6 +561,7 @@ def run_analysis(
         "run_id": run_id,
         "run_directory": str(run_dir),
         "run_record": artifacts["run_record"],
+        "fine_tuned_model": artifacts["fine_tuned_model"],
         "prediction_overlay": artifacts["prediction_overlay"],
         "confidence": artifacts["confidence"],
         "entropy": artifacts["entropy"],
