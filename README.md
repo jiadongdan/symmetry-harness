@@ -9,7 +9,8 @@ WorkBuddy, Cursor, and other shell-capable agents.
 The intended workflow is interactive. A user first computes and reviews the
 eight symmetry-feature channels, then defines local classes and clicks three to
 five representative points per class. The Harness records that intent and
-delegates feature extraction, `64 x 64` support-patch construction,
+delegates feature extraction, model-defined support-patch construction
+(`64 x 64` for the current model),
 adapter-plus-head fine-tuning, and dense inference to the versioned
 `symmetry-learn` Provider.
 
@@ -101,6 +102,18 @@ The Skill runs its bundled launcher once and returns the first ready URL. The
 launcher uses the recorded absolute Python executable and configuration path, so
 the command works from any project directory.
 
+The Python packages are installed in editable mode, so pulling source changes
+updates their active code after running processes are restarted. The Codex Skill
+resources are copied rather than linked; after changes to `SKILL.md`, `agents/`,
+`references/`, or the launcher scripts, refresh them with:
+
+```bash
+python scripts/install.py --skip-package-install
+```
+
+Run the full installer again when dependencies, package metadata, or generated
+configuration need to change.
+
 Install the Harness from a cloned checkout:
 
 ```bash
@@ -177,19 +190,24 @@ Then:
 5. set the symmetry patch size and compute the eight feature maps;
 6. review the maps in the two-by-four gallery and optionally export lossless PNG
    previews, the raw eight-channel NPY array, or both;
-7. enter comma-separated local class names;
-8. choose the active class in the horizontal selector and click support points;
-9. review the patch outlines and support counts;
+7. enter comma-separated local class names and configure them with the
+   model-defined input patch size;
+8. review the dashed valid-center boundary, choose the active class in the
+   horizontal selector, and click support points inside that boundary;
+9. review the patch outlines, source-patch preview, and support counts;
 10. select at least three points per class, with five recommended;
 11. run fine-tuning and dense prediction;
 12. inspect the overlay, confidence, entropy, and saved run directory.
 
-Clicks too close to the border are rejected because a complete classifier patch
-cannot be extracted. Choosing another image clears support points and prediction
-state while retaining class names and colors. Changing only support points does
-not recompute the symmetry maps. The cached maps are reused until the input,
-normalization, model, Provider identity, feature parameters, or device changes.
-Registered and custom pretrained weights are always read-only.
+The symmetry patch size controls local symmetry-map computation. The separate
+model input patch size controls support-patch extraction and is fixed by the
+selected model. After class configuration, the dashed frame marks centers from
+which a complete model input patch can be extracted; clicks outside it are
+ignored with guidance. Choosing another image clears support points and
+prediction state while retaining class names and colors. Changing only support
+points does not recompute the symmetry maps. The cached maps are reused until
+the input, normalization, model, Provider identity, feature parameters, or
+device changes. Registered and custom pretrained weights are always read-only.
 
 The `symmetry ui` compatibility command launches the same browser-first workflow.
 
