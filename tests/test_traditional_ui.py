@@ -384,6 +384,8 @@ def _enclosing_column_visibility(
 
 
 def test_fine_tune_annotation_behavior_is_unchanged_after_the_refactor() -> None:
+    # _configure_classes imports gradio lazily, so this needs the ui extra.
+    pytest.importorskip("gradio")
     config = _config()
     assert ui_fine_tune.render_annotations is ui_annotation.render_annotations
     assert ui_fine_tune._annotation_display_shape is ui_annotation.annotation_display_shape
