@@ -23,200 +23,33 @@ except ImportError:  # pragma: no cover - exercised without the UI extra
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
-from .annotations import (
-    DEFAULT_CLASS_COLORS,
-    create_annotation_session,
-    valid_center_bounds,
-)
+from .annotations import create_annotation_session
 from .catalog import model_capability, model_weights, provider_models, weight_capability
 from .config import HarnessConfig, config_for_model_selection
-from .image_io import file_sha256, inspect_input, unit_to_uint8
+from .image_io import file_sha256, inspect_input
 from .provider import install_registered_weight, run_provider_features
 from .workflow import build_run_options, run_analysis
 from .ui_shared import (
-    ANNOTATION_DISPLAY_MAX_EDGE,
-    APP_CSS,
     CUSTOM_CHECKPOINT_SOURCE,
     INVALID_SUPPORT_POINT_MESSAGE,
     REGISTERED_WEIGHT_SOURCE,
-    parse_class_names,
     progress_bar_html,
 )
-
-
-
-
-def _copy_state(state: dict[str, Any]) -> dict[str, Any]:
-    copied = dict(state)
-    copied["class_names"] = list(state.get("class_names", []))
-    copied["colors"] = list(state.get("colors", []))
-    copied["points"] = [list(group) for group in state.get("points", [])]
-    return copied
-
-
-def _state_classifier_patch_size(
-    state: dict[str, Any], fallback: int
-) -> int:
-    """Return the configured classifier patch size retained by the UI state."""
-    patch_size = int(state.get("classifier_patch_size", fallback))
-    if patch_size <= 0:
-        raise ValueError("The model input patch size must be positive.")
-    return patch_size
-
-
-def _draw_dashed_rectangle(
-    draw: ImageDraw.ImageDraw,
-    bounds: tuple[int, int, int, int],
-    *,
-    fill: str,
-    width: int,
-    dash_length: int,
-    gap_length: int,
-) -> None:
-    """Draw a dashed rectangle with a consistent display-space line width."""
-    left, top, right, bottom = bounds
-    step = dash_length + gap_length
-    for start in range(left, right + 1, step):
-        end = min(start + dash_length, right)
-        draw.line((start, top, end, top), fill=fill, width=width)
-        draw.line((start, bottom, end, bottom), fill=fill, width=width)
-    for start in range(top, bottom + 1, step):
-        end = min(start + dash_length, bottom)
-        draw.line((left, start, left, end), fill=fill, width=width)
-        draw.line((right, start, right, end), fill=fill, width=width)
-
-
-def annotation_rows(state: dict[str, Any]) -> list[list[Any]]:
-    """Return compact class counts and source-image coordinates for display."""
-    rows = []
-    for name, points in zip(state.get("class_names", []), state.get("points", [])):
-        rows.append([name, len(points), ", ".join(f"({x}, {y})" for x, y in points)])
-    return rows
-
-
-def _annotation_display_shape(
-    image_shape: tuple[int, int],
-    maximum_edge: int = ANNOTATION_DISPLAY_MAX_EDGE,
-) -> tuple[int, int]:
-    """Return an aspect-preserving display raster with a bounded longest edge."""
-    height, width = (int(value) for value in image_shape)
-    if height <= 0 or width <= 0 or maximum_edge <= 0:
-        raise ValueError("Annotation display dimensions must be positive.")
-    scale = float(maximum_edge) / float(max(height, width))
-    return max(1, round(height * scale)), max(1, round(width * scale))
-
-
-def _display_to_source_point(
-    point: tuple[int, int], image_shape: tuple[int, int]
-) -> tuple[int, int]:
-    """Map a click in the display raster back to an exact source-array index."""
-    display_height, display_width = _annotation_display_shape(image_shape)
-    source_height, source_width = (int(value) for value in image_shape)
-    display_x, display_y = (int(value) for value in point)
-    if not 0 <= display_x < display_width or not 0 <= display_y < display_height:
-        raise ValueError("The image click falls outside the annotation display raster.")
-
-    def map_index(index: int, display_length: int, source_length: int) -> int:
-        if display_length == 1 or source_length == 1:
-            return 0
-        return int(round(index * (source_length - 1) / (display_length - 1)))
-
-    return (
-        map_index(display_x, display_width, source_width),
-        map_index(display_y, display_height, source_height),
-    )
-
-
-def render_annotations(state: dict[str, Any], patch_size: int) -> np.ndarray | None:
-    """Render support points and patch outlines over a display-only image copy."""
-    image = state.get("image")
-    if image is None:
-        return None
-    patch_size = _state_classifier_patch_size(state, patch_size)
-    gray = unit_to_uint8(np.asarray(image, dtype=np.float32))
-    base = Image.fromarray(gray).convert("RGB")
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    shade = ImageDraw.Draw(overlay)
-    before = patch_size // 2
-    after = patch_size - before
-    width, height = base.size
-    shade.rectangle((0, 0, width, before - 1), fill=(50, 50, 50, 95))
-    shade.rectangle((0, height - after + 1, width, height), fill=(50, 50, 50, 95))
-    shade.rectangle((0, 0, before - 1, height), fill=(50, 50, 50, 95))
-    shade.rectangle((width - after + 1, 0, width, height), fill=(50, 50, 50, 95))
-    base = Image.alpha_composite(base.convert("RGBA"), overlay).convert("RGB")
-    draw = ImageDraw.Draw(base)
-    for color, points in zip(state.get("colors", []), state.get("points", [])):
-        for x, y in points:
-            draw.rectangle(
-                (x - before, y - before, x + after - 1, y + after - 1),
-                outline=color,
-                width=2,
-            )
-            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color, outline="white")
-    display_height, display_width = _annotation_display_shape((height, width))
-    if base.size != (display_width, display_height):
-        base = base.resize(
-            (display_width, display_height), resample=Image.Resampling.BILINEAR
-        )
-    if state.get("show_valid_region", False):
-        min_x, max_x, min_y, max_y = valid_center_bounds(
-            (height, width), patch_size
-        )
-
-        def display_index(index: int, source_length: int, display_length: int) -> int:
-            if source_length == 1 or display_length == 1:
-                return 0
-            return int(round(index * (display_length - 1) / (source_length - 1)))
-
-        valid_bounds = (
-            display_index(min_x, width, display_width),
-            display_index(min_y, height, display_height),
-            display_index(max_x, width, display_width),
-            display_index(max_y, height, display_height),
-        )
-        line_width = max(4, round(max(display_width, display_height) / 160))
-        _draw_dashed_rectangle(
-            ImageDraw.Draw(base),
-            valid_bounds,
-            fill="white",
-            width=line_width,
-            dash_length=line_width * 3,
-            gap_length=line_width * 2,
-        )
-    return np.asarray(base)
-
-
-def source_patch_preview(
-    state: dict[str, Any], point: tuple[int, int] | None, patch_size: int
-) -> np.ndarray | None:
-    """Return the raw normalized source patch for immediate annotation review."""
-    if point is None or state.get("image") is None:
-        return None
-    x, y = point
-    before = patch_size // 2
-    after = patch_size - before
-    patch = np.asarray(state["image"])[
-        y - before : y + after, x - before : x + after
-    ]
-    return unit_to_uint8(patch)
-
-
-def _array_sha256(values: np.ndarray) -> str:
-    """Return a content digest for a normalized array and its geometry."""
-    array = np.ascontiguousarray(values, dtype=np.float32)
-    digest = sha256()
-    digest.update(str(array.shape).encode("ascii"))
-    digest.update(array.tobytes())
-    return digest.hexdigest()
-
-
-def _image_shape_text(record: dict[str, Any] | None) -> str:
-    """Render the only image metadata needed in the interactive layout."""
-    if not record:
-        return "**Image shape:** —"
-    height, width = (int(value) for value in record["shape"])
-    return f"**Image shape:** {height} × {width} (H × W)"
+from .ui_annotation import (
+    add_point_state,
+    annotation_display_shape as _annotation_display_shape,
+    annotation_rows,
+    annotation_state,
+    clear_class_state,
+    configure_class_state,
+    copy_state as _copy_state,
+    display_to_source_point as _display_to_source_point,
+    image_shape_text as _image_shape_text,
+    render_annotations,
+    source_patch_preview,
+    state_patch_size as _state_classifier_patch_size,
+    undo_point_state,
+)
 
 
 def _loaded_image_outputs(
@@ -225,29 +58,11 @@ def _loaded_image_outputs(
     config: HarnessConfig,
     previous_state: dict[str, Any] | None = None,
 ):
-    previous = previous_state or {}
-    class_names = list(previous.get("class_names", []))
-    colors = list(previous.get("colors", []))
-    state = {
-        "image": image,
-        "image_path": record["path"],
-        "image_sha256": record["sha256"],
-        "normalized_image_sha256": _array_sha256(image),
-        "image_shape": record["shape"],
-        "class_names": class_names,
-        "colors": colors,
-        "points": [[] for _ in class_names],
-        "classifier_patch_size": config.model.classifier_patch_size,
-        "show_valid_region": False,
-    }
-    next_step = (
-        "Class definitions were retained; select new support points."
-        if class_names
-        else "Configure local classes next."
-    )
-    height, width = (int(value) for value in record["shape"])
-    status = (
-        f"Loaded {Path(record['path']).name}: shape {height} × {width}. {next_step}"
+    state, status = annotation_state(
+        image,
+        record,
+        classifier_patch_size=config.model.classifier_patch_size,
+        previous_state=previous_state,
     )
     return render_annotations(state, config.model.classifier_patch_size), state, status
 
@@ -270,15 +85,9 @@ def _configure_classes(
     *,
     classifier_patch_size: int | None = None,
 ):
+    """Thin fine-tuning wrapper over the shared annotation state machine."""
     import gradio as gr
 
-    if state.get("image") is None:
-        raise ValueError("Load an input image before configuring classes.")
-    names = parse_class_names(value)
-    updated = _copy_state(state)
-    updated["class_names"] = names
-    updated["colors"] = list(DEFAULT_CLASS_COLORS[: len(names)])
-    updated["points"] = [[] for _ in names]
     patch_size = int(
         config.model.classifier_patch_size
         if classifier_patch_size is None
@@ -286,9 +95,10 @@ def _configure_classes(
     )
     if patch_size <= 0:
         raise ValueError("The model input patch size must be positive.")
-    valid_center_bounds(tuple(updated["image_shape"]), patch_size)
-    updated["classifier_patch_size"] = patch_size
-    updated["show_valid_region"] = True
+    updated, patch_size = configure_class_state(
+        value, state, classifier_patch_size=patch_size
+    )
+    names = list(updated["class_names"])
     status = (
         f"Configured {len(names)} classes. Select an active class and click at least "
         f"{config.fine_tuning.minimum_shots_per_class} support points per class; "
@@ -306,76 +116,58 @@ def _configure_classes(
 def _add_point(
     state: dict[str, Any], active_class: str | None, point: tuple[int, int], config: HarnessConfig
 ):
-    if not state.get("class_names"):
-        raise ValueError("Configure local classes before selecting points.")
-    if active_class not in state["class_names"]:
-        raise ValueError("Choose an active class before selecting points.")
-    x, y = int(point[0]), int(point[1])
-    patch_size = _state_classifier_patch_size(
-        state, config.model.classifier_patch_size
+    """Thin fine-tuning wrapper over the shared annotation state machine."""
+    updated, patch_size, status, invalid = add_point_state(
+        state,
+        active_class,
+        point,
+        fallback_patch_size=config.model.classifier_patch_size,
+        maximum_points=config.fine_tuning.maximum_shots_per_class,
     )
-    min_x, max_x, min_y, max_y = valid_center_bounds(
-        tuple(state["image_shape"]), patch_size
-    )
-    if not min_x <= x <= max_x or not min_y <= y <= max_y:
+    if invalid:
         return (
-            state,
-            render_annotations(state, patch_size),
+            updated,
+            render_annotations(updated, patch_size),
             None,
-            annotation_rows(state),
-            INVALID_SUPPORT_POINT_MESSAGE,
+            annotation_rows(updated),
+            status,
         )
-    updated = _copy_state(state)
-    class_index = updated["class_names"].index(active_class)
-    if any((x, y) in group for group in updated["points"]):
-        raise ValueError("This source-image point has already been assigned.")
-    if len(updated["points"][class_index]) >= config.fine_tuning.maximum_shots_per_class:
-        raise ValueError("This class has reached the configured support-point limit.")
-    updated["points"][class_index].append((x, y))
-    count = len(updated["points"][class_index])
-    status = f"Added ({x}, {y}) to {active_class}. This class now has {count} support points."
     return (
         updated,
         render_annotations(updated, patch_size),
-        source_patch_preview(updated, (x, y), patch_size),
+        source_patch_preview(updated, (int(point[0]), int(point[1])), patch_size),
         annotation_rows(updated),
         status,
     )
 
 
 def _undo_point(state: dict[str, Any], active_class: str | None, config: HarnessConfig):
-    if active_class not in state.get("class_names", []):
-        raise ValueError("Choose an active class first.")
-    updated = _copy_state(state)
-    class_index = updated["class_names"].index(active_class)
-    if not updated["points"][class_index]:
-        raise ValueError("The active class has no point to undo.")
-    removed = updated["points"][class_index].pop()
-    patch_size = _state_classifier_patch_size(
-        updated, config.model.classifier_patch_size
+    """Thin fine-tuning wrapper over the shared annotation state machine."""
+    updated, patch_size, _removed, status = undo_point_state(
+        state,
+        active_class,
+        fallback_patch_size=config.model.classifier_patch_size,
     )
     return (
         updated,
         render_annotations(updated, patch_size),
         annotation_rows(updated),
-        f"Removed {removed} from {active_class}.",
+        status,
     )
 
 
 def _clear_class(state: dict[str, Any], active_class: str | None, config: HarnessConfig):
-    if active_class not in state.get("class_names", []):
-        raise ValueError("Choose an active class first.")
-    updated = _copy_state(state)
-    class_index = updated["class_names"].index(active_class)
-    updated["points"][class_index] = []
-    patch_size = _state_classifier_patch_size(
-        updated, config.model.classifier_patch_size
+    """Thin fine-tuning wrapper over the shared annotation state machine."""
+    updated, patch_size, status = clear_class_state(
+        state,
+        active_class,
+        fallback_patch_size=config.model.classifier_patch_size,
     )
     return (
         updated,
         render_annotations(updated, patch_size),
         annotation_rows(updated),
-        f"Cleared all support points for {active_class}.",
+        status,
     )
 
 
@@ -556,11 +348,19 @@ def _feature_request(
     """Resolve a deterministic feature request and its cache key."""
     if state.get("image") is None:
         raise ValueError("Load an input image before computing symmetry maps.")
+    try:
+        resolved_patch_size = int(symmetry_patch_size)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "The symmetry patch size is empty or not a whole number."
+        ) from None
+    if resolved_patch_size <= 0:
+        raise ValueError("The symmetry patch size must be positive.")
     contract = _model_contract_config(config, capabilities, model_identifier)
     options = build_run_options(
         contract,
         {
-            "symmetry_patch_size": int(symmetry_patch_size),
+            "symmetry_patch_size": resolved_patch_size,
             "device": str(device),
         },
     ).to_dict()

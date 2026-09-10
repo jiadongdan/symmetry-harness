@@ -95,7 +95,14 @@ def install_codex_skill(repository_root: Path, codex_home: Path) -> Path:
 
     script_destination = destination / "scripts"
     script_destination.mkdir(parents=True, exist_ok=True)
-    for name in ("launch.ps1", "launch.sh", "stop.ps1", "stop.sh"):
+    for name in (
+        "launch.ps1",
+        "launch.sh",
+        "launch-traditional.ps1",
+        "launch-traditional.sh",
+        "stop.ps1",
+        "stop.sh",
+    ):
         target = script_destination / name
         shutil.copy2(source_root / "scripts" / name, target)
         if name.endswith(".sh"):

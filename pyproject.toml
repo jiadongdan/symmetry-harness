@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "symmetry-harness"
-version = "0.2.1"
+version = "0.2.2"
 description = "Cross-agent harness for interactive few-shot symmetry analysis"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -33,3 +33,6 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "traditional_integration: real cross-repository Provider traditional ML tests (must never be skipped)",
+]

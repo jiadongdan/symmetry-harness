@@ -15,7 +15,12 @@ from .catalog import model_catalog_report
 from .config import load_harness_config
 from .image_io import inspect_input
 from .initialization import initialize_config
-from .provider import default_provider_install_command, doctor, probe_model
+from .provider import (
+    default_provider_install_command,
+    doctor,
+    probe_model,
+    traditional_readiness,
+)
 
 
 DEFAULT_CONFIG_NAME = "symmetry-harness.json"
@@ -178,6 +183,29 @@ def _parser() -> argparse.ArgumentParser:
         default="fine-tune",
         help="Workspace opened when the interface starts.",
     )
+
+    validate_traditional = commands.add_parser(
+        "validate-traditional",
+        help=(
+            "Launch the standalone traditional ML validation page. This "
+            "exploratory page trains a conventional classifier on user-selected "
+            "patches and never requires a pretrained checkpoint."
+        ),
+    )
+    _add_config_argument(validate_traditional)
+    validate_traditional.add_argument(
+        "--input", type=Path, help="Optional image to preload before the page opens."
+    )
+    validate_traditional.add_argument("--server-name", default="127.0.0.1")
+    validate_traditional.add_argument(
+        "--server-port",
+        type=int,
+        default=0,
+        help="Local port. Use 0 (the default) to choose an available port.",
+    )
+    validate_traditional.add_argument(
+        "--inbrowser", action=argparse.BooleanOptionalAction, default=True
+    )
     return parser
 
 
@@ -262,11 +290,18 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             weight_identifier=arguments.weight,
             force=bool(arguments.force),
         )
-    launch_started = perf_counter() if arguments.command == "launch" else None
+    launch_started = (
+        perf_counter()
+        if arguments.command in {"launch", "validate-traditional"}
+        else None
+    )
     config_path = _config_path(arguments.config)
-    if arguments.command in {"doctor", "launch"} and not config_path.is_file():
+    if (
+        arguments.command in {"doctor", "launch", "validate-traditional"}
+        and not config_path.is_file()
+    ):
         report = _missing_config_report(config_path)
-        if arguments.command == "launch":
+        if arguments.command in {"launch", "validate-traditional"}:
             report["phase"] = "config"
             report["timings_seconds"] = {
                 "total": round(perf_counter() - launch_started, 6)
@@ -355,6 +390,105 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             on_ready=emit_ready,
         )
         return None
+    if arguments.command == "validate-traditional":
+        timings = {"config_load": config_seconds}
+        if arguments.server_name not in {"127.0.0.1", "localhost"}:
+            timings["total"] = round(perf_counter() - launch_started, 6)
+            return {
+                "status": "blocked",
+                "phase": "server_name",
+                "config_path": str(config_path),
+                "issues": [
+                    "The traditional validation page only binds to 127.0.0.1 or "
+                    "localhost."
+                ],
+                "recommendations": [
+                    "Re-run with --server-name 127.0.0.1.",
+                ],
+                "timings_seconds": timings,
+            }
+        readiness_started = perf_counter()
+        readiness = traditional_readiness(config)
+        timings["traditional_readiness"] = round(
+            perf_counter() - readiness_started, 6
+        )
+        if readiness["status"] != "ready":
+            timings["total"] = round(perf_counter() - launch_started, 6)
+            return {
+                "status": "blocked",
+                "phase": "traditional_readiness",
+                "config_path": str(config_path),
+                "readiness": readiness,
+                "issues": list(readiness["issues"]),
+                "recommendations": list(readiness["recommendations"]),
+                "timings_seconds": timings,
+            }
+
+        capabilities = readiness["environment"]["capabilities"]
+        prepared_input = None
+        input_record = None
+        if arguments.input is not None:
+            inspect_started = perf_counter()
+            image, input_record = inspect_input(
+                arguments.input, config.features.input_normalization
+            )
+            prepared_input = (image, input_record)
+            timings["input_inspection"] = round(
+                perf_counter() - inspect_started, 6
+            )
+
+        from .ui_traditional import launch_traditional_ui
+
+        ui_started = perf_counter()
+
+        def emit_traditional_ready(local_url: str) -> None:
+            timings["ui_startup"] = round(perf_counter() - ui_started, 6)
+            timings["total"] = round(perf_counter() - launch_started, 6)
+            payload = {
+                "status": "ready",
+                "url": local_url,
+                "mode": "validate-traditional",
+                "config_path": str(config_path),
+                "output_root": str(config.output_root),
+                "input": input_record,
+                "input_status": (
+                    "preloaded"
+                    if input_record is not None
+                    else "awaiting_user_selection"
+                ),
+                "device": readiness["device"],
+                "feature_channels": [
+                    str(name)
+                    for name in (
+                        next(
+                            (
+                                model.get("feature_channels", [])
+                                for model in capabilities.get("models", [])
+                                if isinstance(model, dict)
+                                and model.get("identifier")
+                                == config.model.identifier
+                            ),
+                            [],
+                        )
+                    )
+                ],
+                "traditional_ml": readiness["traditional_ml"],
+                "pretrained_weight_required": False,
+                "readiness_timings_seconds": readiness.get("timings_seconds", {}),
+                "timings_seconds": timings,
+            }
+            print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
+
+        launch_traditional_ui(
+            config,
+            server_name=arguments.server_name,
+            server_port=arguments.server_port,
+            inbrowser=bool(arguments.inbrowser),
+            prepared_input=prepared_input,
+            capabilities=capabilities,
+            on_ready=emit_traditional_ready,
+        )
+        return None
     if arguments.command == "run":
         from .workflow import run_analysis
 
@@ -423,7 +557,10 @@ def main() -> None:
         raise SystemExit(1) from error
     if result is not None:
         print(json.dumps(result, indent=2, sort_keys=True))
-        if arguments.command == "launch" and result.get("status") == "blocked":
+        if (
+            arguments.command in {"launch", "validate-traditional"}
+            and result.get("status") == "blocked"
+        ):
             raise SystemExit(2)
 
 

@@ -287,6 +287,8 @@ def test_skill_resources_are_portable() -> None:
         "SKILL.md",
         "scripts/launch.ps1",
         "scripts/launch.sh",
+        "scripts/launch-traditional.ps1",
+        "scripts/launch-traditional.sh",
         "scripts/stop.ps1",
         "scripts/stop.sh",
     ):
@@ -328,6 +330,8 @@ def test_installer_persists_runtime_and_copies_skill_resources(tmp_path) -> None
     assert (skill_path / "agents" / "openai.yaml").is_file()
     assert (skill_path / "scripts" / "launch.ps1").is_file()
     assert (skill_path / "scripts" / "launch.sh").is_file()
+    assert (skill_path / "scripts" / "launch-traditional.ps1").is_file()
+    assert (skill_path / "scripts" / "launch-traditional.sh").is_file()
     assert (skill_path / "scripts" / "stop.ps1").is_file()
     assert (skill_path / "scripts" / "stop.sh").is_file()
 

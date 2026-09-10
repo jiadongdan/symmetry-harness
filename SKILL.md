@@ -2,7 +2,7 @@
 name: symmetry-harness
 description: Run local few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to launch the local interface, fine-tune adapters on representative points, inspect confidence or entropy, or apply a saved .symmodel package to new images without re-training. Requires the local symmetry-harness runtime and the symmetry-learn Provider. Do not use for foundation-model training, silent weight installation, or unattended label selection.
 metadata:
-  version: "0.2.1"
+  version: "0.2.2"
   product: "symmetry-harness"
 ---
 
@@ -71,6 +71,31 @@ For a request to start or open the interactive interface, follow only this path:
 
 For a startup-only request, do not read any supporting reference.
 
+## Traditional ML Validation (explicit request only)
+
+This is a separate page, not a normal workspace. Launch it only when the user
+explicitly asks for traditional machine-learning validation. Fast Launch is
+unchanged.
+
+On Windows:
+
+```powershell
+& "<skill-directory>\scripts\launch-traditional.ps1"
+```
+
+On macOS or Linux:
+
+```bash
+"<skill-directory>/scripts/launch-traditional.sh"
+```
+
+Scientific scope: the page trains a conventional scikit-learn classifier from
+scratch on user-selected patches and densely predicts the image for exploratory
+comparison. It is **not** proof that the pretrained model is necessary or
+unnecessary, and it never loads, probes, or requires a pretrained checkpoint.
+See [references/traditional-validation.md](references/traditional-validation.md)
+for inputs, classifiers, outputs, and limits.
+
 ## Stopping
 
 For a request to stop, close, or shut down the interface, run exactly one
@@ -97,6 +122,12 @@ name and such a match silently finds nothing.
 
 ## Other Modes
 
+- When the user explicitly asks for traditional machine-learning validation — a
+  conventional scikit-learn classifier trained on user-selected patches and
+  compared against the source image — read
+  [references/traditional-validation.md](references/traditional-validation.md).
+  This is a separate, explicit-request-only page. It is **not** part of Fast
+  Launch and does not change the two normal workspaces.
 - When the user explicitly asks to diagnose or repair a blocked launch, read
   [references/troubleshooting.md](references/troubleshooting.md).
 - When the interface is already available and the user asks for fine-tuning

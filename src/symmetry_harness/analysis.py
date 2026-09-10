@@ -27,6 +27,41 @@ class DensePrediction:
     entropy_grid: np.ndarray
 
 
+@dataclass(frozen=True)
+class TraditionalPrediction:
+    """Dense traditional-ML outputs in source-image coordinates.
+
+    This mirrors :class:`DensePrediction` without neural-network logits. The
+    traditional workflow never fabricates logits, so its contract is validated
+    separately and the existing DL contract stays strict.
+    """
+
+    coordinates_xy: np.ndarray
+    x_coordinates: np.ndarray
+    y_coordinates: np.ndarray
+    probabilities: np.ndarray
+    predictions: np.ndarray
+    confidence: np.ndarray
+    entropy: np.ndarray
+    prediction_grid: np.ndarray
+    confidence_grid: np.ndarray
+    entropy_grid: np.ndarray
+
+
+TRADITIONAL_REQUIRED_ARRAYS = (
+    "coordinates_xy",
+    "x_coordinates",
+    "y_coordinates",
+    "probabilities",
+    "predictions",
+    "confidence",
+    "entropy",
+    "prediction_grid",
+    "confidence_grid",
+    "entropy_grid",
+)
+
+
 def dense_prediction_from_arrays(arrays: dict[str, np.ndarray]) -> DensePrediction:
     """Validate and materialize the dense output contract returned by the provider."""
     required = {
@@ -83,13 +118,88 @@ def dense_prediction_from_arrays(arrays: dict[str, np.ndarray]) -> DensePredicti
     return prediction
 
 
+def traditional_prediction_from_arrays(
+    arrays: dict[str, np.ndarray],
+    *,
+    class_count: int | None = None,
+) -> TraditionalPrediction:
+    """Validate and materialize a traditional-ML dense output contract.
+
+    Unlike the DL contract this validator requires no ``logits`` array, and it
+    additionally checks that the returned probability matrix is a real
+    probability distribution aligned with contiguous class indices.
+    """
+    missing = sorted(set(TRADITIONAL_REQUIRED_ARRAYS).difference(arrays))
+    if missing:
+        raise RuntimeError(f"Traditional Provider output is missing arrays: {missing}")
+    prediction = TraditionalPrediction(
+        coordinates_xy=np.asarray(arrays["coordinates_xy"], dtype=np.int32),
+        x_coordinates=np.asarray(arrays["x_coordinates"], dtype=np.int32),
+        y_coordinates=np.asarray(arrays["y_coordinates"], dtype=np.int32),
+        probabilities=np.asarray(arrays["probabilities"], dtype=np.float32),
+        predictions=np.asarray(arrays["predictions"], dtype=np.int16),
+        confidence=np.asarray(arrays["confidence"], dtype=np.float32),
+        entropy=np.asarray(arrays["entropy"], dtype=np.float32),
+        prediction_grid=np.asarray(arrays["prediction_grid"], dtype=np.int16),
+        confidence_grid=np.asarray(arrays["confidence_grid"], dtype=np.float32),
+        entropy_grid=np.asarray(arrays["entropy_grid"], dtype=np.float32),
+    )
+    sample_count = len(prediction.coordinates_xy)
+    grid_shape = (len(prediction.y_coordinates), len(prediction.x_coordinates))
+    if prediction.coordinates_xy.shape != (sample_count, 2):
+        raise RuntimeError("Traditional Provider coordinates have an invalid shape.")
+    if prediction.probabilities.ndim != 2 or prediction.probabilities.shape[0] != sample_count:
+        raise RuntimeError(
+            "Traditional Provider probabilities do not align with coordinates."
+        )
+    if prediction.probabilities.shape[1] < 2:
+        raise RuntimeError("Traditional Provider probabilities require two classes.")
+    if class_count is not None and prediction.probabilities.shape[1] != int(class_count):
+        raise RuntimeError(
+            "Traditional Provider probabilities do not match the requested classes."
+        )
+    if not np.isfinite(prediction.probabilities).all():
+        raise RuntimeError("Traditional Provider probabilities contain nonfinite values.")
+    if float(prediction.probabilities.min()) < -1e-6:
+        raise RuntimeError("Traditional Provider probabilities contain negative values.")
+    row_sums = prediction.probabilities.sum(axis=1)
+    if not np.allclose(row_sums, 1.0, atol=1e-4):
+        raise RuntimeError("Traditional Provider probability rows must sum to one.")
+    for values in (
+        prediction.predictions,
+        prediction.confidence,
+        prediction.entropy,
+    ):
+        if values.shape != (sample_count,):
+            raise RuntimeError(
+                "Traditional Provider vector outputs do not align with coordinates."
+            )
+    for grid in (
+        prediction.prediction_grid,
+        prediction.confidence_grid,
+        prediction.entropy_grid,
+    ):
+        if grid.shape != grid_shape:
+            raise RuntimeError(
+                "Traditional Provider grid outputs do not match the coordinate grid."
+            )
+    if not np.isfinite(prediction.confidence).all() or not np.isfinite(
+        prediction.entropy
+    ).all():
+        raise RuntimeError("Traditional Provider confidence or entropy is nonfinite.")
+    return prediction
+
+
+GridPrediction = DensePrediction | TraditionalPrediction
+
+
 def _resize_grid(grid: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     image = Image.fromarray(grid)
     return np.asarray(image.resize(size, resample=Image.Resampling.NEAREST))
 
 
 def prediction_display_bounds(
-    prediction: DensePrediction,
+    prediction: GridPrediction,
     image_shape: tuple[int, int],
     *,
     stride: int,
@@ -115,7 +225,7 @@ def prediction_display_bounds(
 
 def render_prediction_overlay(
     image: np.ndarray,
-    prediction: DensePrediction,
+    prediction: GridPrediction,
     class_colors: list[str],
     *,
     stride: int,
@@ -136,6 +246,7 @@ def render_prediction_overlay(
     ).astype(np.float32)
     overlay[:] = (1.0 - alpha) * overlay + alpha * colors
     return np.rint(np.clip(overlay, 0, 255)).astype(np.uint8)
+
 
 
 def render_scalar_map(

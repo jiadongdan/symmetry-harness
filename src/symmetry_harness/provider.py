@@ -28,6 +28,13 @@ PROVIDER_INSTALL_REQUIREMENT = (
     "git+https://github.com/jiadongdan/symmetry-learn.git@main"
 )
 
+# Public traditional-ML capability contract. These literals intentionally mirror
+# the Provider contract names instead of importing symmetry-learn, so Harness
+# stays independent of the numerical repository at import time.
+TRADITIONAL_ML_OPERATION = "traditional_ml_analyze"
+TRADITIONAL_ML_CAPABILITY_SCHEMA_VERSION = "symmetry-traditional-ml-capability-v1"
+TRADITIONAL_ML_RECORD_SCHEMA_VERSION = "symmetry-traditional-ml-run-v1"
+
 
 @dataclass(frozen=True)
 class ProviderAnalysis:
@@ -46,6 +53,18 @@ class ProviderFeatures:
     features: np.ndarray
     channel_names: np.ndarray
     record: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ProviderTraditionalMLResult:
+    """Dense traditional-ML outputs returned by one Provider worker job.
+
+    No estimator object and no neural-network logits are part of this result.
+    """
+
+    arrays: dict[str, np.ndarray]
+    record: dict[str, Any]
+
 
 
 @dataclass(frozen=True)
@@ -159,6 +178,222 @@ def validate_provider_capabilities(
     ):
         issues.append("configured support-point bounds exceed the provider contract")
     return issues
+
+
+def validate_traditional_capabilities(
+    config: HarnessConfig, capabilities: dict[str, Any]
+) -> list[str]:
+    """Return compatibility issues for the standalone traditional-ML page.
+
+    This validator is deliberately separate from
+    :func:`validate_provider_capabilities`. The shared validator is used by
+    ``launch``, ``ui`` and ``doctor``, so adding traditional-ML requirements to
+    it would make the normal two-workspace application refuse to start on an
+    older Provider. The traditional page has its own, narrower requirements.
+    """
+    issues: list[str] = []
+    if capabilities.get("contract_version") != PROVIDER_CONTRACT_VERSION:
+        issues.append("provider contract version mismatch")
+    if capabilities.get("provider") != config.provider.name:
+        issues.append("unexpected provider identity")
+    operations = capabilities.get("operations", [])
+    if "compute_features" not in operations:
+        issues.append("provider does not expose reusable feature computation")
+    if TRADITIONAL_ML_OPERATION not in operations:
+        issues.append("provider does not expose traditional ML analysis")
+    actual = str(capabilities.get("provider_version", "unknown"))
+    minimum = config.provider.minimum_version
+    if minimum is not None:
+        actual_tuple = _version_tuple(actual)
+        minimum_tuple = _version_tuple(minimum)
+        if actual_tuple is None:
+            issues.append("provider version is unavailable")
+        elif minimum_tuple is not None and _version_is_older(actual_tuple, minimum_tuple):
+            issues.append(f"provider version {actual} is older than required {minimum}")
+
+    # The page always builds the eight-channel representation through
+    # compute_features, so one available model with the configured feature
+    # contract is required. No pretrained weight is required.
+    models = capabilities.get("models", [])
+    model = next(
+        (
+            entry
+            for entry in models
+            if isinstance(entry, dict)
+            and entry.get("identifier") == config.model.identifier
+        ),
+        None,
+    )
+    if model is None:
+        issues.append("configured model is missing from provider capabilities")
+    elif not bool(model.get("available", False)):
+        issues.append("configured model dependency is unavailable")
+    elif (
+        int(model.get("input_channels", -1)) != config.model.input_channels
+        or len(model.get("feature_channels", [])) != config.model.input_channels
+        or not str(model.get("feature_pipeline", "")).strip()
+    ):
+        issues.append(
+            "configured eight-channel feature contract does not match the provider"
+        )
+
+    traditional = capabilities.get("traditional_ml")
+    if not isinstance(traditional, dict):
+        issues.append("provider does not advertise a traditional ML capability block")
+        return issues
+    if traditional.get("schema_version") != TRADITIONAL_ML_CAPABILITY_SCHEMA_VERSION:
+        issues.append("traditional ML capability schema mismatch")
+    modes = {str(item) for item in traditional.get("feature_modes", [])}
+    for mode in ("raw_image", "image_plus_symmetry_maps"):
+        if mode not in modes:
+            issues.append(f"provider does not support the {mode} feature mode")
+    classifiers = {
+        str(entry.get("identifier")): entry
+        for entry in traditional.get("classifiers", [])
+        if isinstance(entry, dict)
+    }
+    for identifier in ("logistic_regression", "random_forest"):
+        entry = classifiers.get(identifier)
+        if entry is None:
+            issues.append(f"provider does not expose classifier {identifier!r}")
+        elif not bool(entry.get("supports_predict_proba", False)):
+            issues.append(
+                f"classifier {identifier!r} does not guarantee predict_proba support"
+            )
+    return issues
+
+
+def traditional_capability(capabilities: dict[str, Any]) -> dict[str, Any]:
+    """Return the validated traditional-ML capability block."""
+    block = capabilities.get("traditional_ml")
+    if not isinstance(block, dict):
+        raise RuntimeError(
+            "The Provider does not advertise a traditional ML capability block."
+        )
+    return dict(block)
+
+
+def traditional_classifier(capabilities: dict[str, Any], identifier: str) -> dict[str, Any]:
+    """Return one advertised traditional classifier record."""
+    classifiers = [
+        dict(entry)
+        for entry in traditional_capability(capabilities).get("classifiers", [])
+        if isinstance(entry, dict)
+    ]
+    for entry in classifiers:
+        if str(entry.get("identifier")) == str(identifier):
+            return entry
+    available = ", ".join(str(entry.get("identifier")) for entry in classifiers)
+    raise ValueError(
+        f"The Provider does not expose traditional classifier {identifier!r}; "
+        f"available classifiers: {available or 'none'}."
+    )
+
+
+def traditional_classifier_defaults(
+    capabilities: dict[str, Any], identifier: str
+) -> dict[str, Any]:
+    """Return the Provider-declared defaults for one traditional classifier."""
+    entry = traditional_classifier(capabilities, identifier)
+    defaults = entry.get("defaults")
+    if not isinstance(defaults, dict) or not defaults:
+        raise ValueError(
+            f"Traditional classifier {identifier!r} declares no defaults."
+        )
+    return dict(defaults)
+
+
+def traditional_readiness(
+    config: HarnessConfig, *, require_ui: bool = True
+) -> dict[str, Any]:
+    """Check only the prerequisites of the standalone traditional-ML page.
+
+    Unlike :func:`doctor` this never resolves, probes, or requires a pretrained
+    checkpoint, adapter, or saved model. An absent pretrained weight must not
+    block this page.
+
+    ``require_ui`` gates the Gradio dependency check. The page needs Gradio, but
+    the headless validation workflow does not, so orchestration can reuse this
+    readiness probe without pulling in the optional UI extra.
+    """
+    total_started = perf_counter()
+    timings: dict[str, float] = {}
+    issues: list[str] = []
+    recommendations: list[str] = []
+    executable = Path(config.model.python_executable)
+    environment: dict[str, Any] = {
+        "python_executable": config.model.python_executable,
+        "status": "blocked",
+    }
+    capabilities: dict[str, Any] | None = None
+    provider_started = perf_counter()
+    if not executable.is_file():
+        issues.append("The configured Provider Python executable does not exist.")
+        recommendations.append(
+            f"Configure an existing Python executable: {config.model.python_executable}"
+        )
+    else:
+        try:
+            capabilities = provider_capabilities(config)
+            compatibility_issues = validate_traditional_capabilities(
+                config, capabilities
+            )
+            if compatibility_issues:
+                issues.extend(compatibility_issues)
+                recommendations.append(
+                    "Install a compatible symmetry Provider: "
+                    + _install_command(config)
+                )
+            else:
+                environment["status"] = "ready"
+                environment["capabilities"] = capabilities
+        except Exception as error:
+            issues.append(str(error))
+            recommendations.append(
+                "Install the symmetry Provider in this runtime: "
+                + _install_command(config)
+            )
+    timings["provider_capabilities"] = round(perf_counter() - provider_started, 6)
+
+    ui_started = perf_counter()
+    try:
+        gradio_available = find_spec("gradio") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        gradio_available = False
+    if require_ui and not gradio_available:
+        issues.append("Gradio is required for the traditional validation page.")
+        recommendations.append(
+            f'"{Path(sys.executable).resolve()}" -m pip install "symmetry-harness[ui]"'
+        )
+    timings["ui_dependency"] = round(perf_counter() - ui_started, 6)
+    timings["total"] = round(perf_counter() - total_started, 6)
+
+    traditional: dict[str, Any] | None = None
+    if capabilities is not None:
+        block = capabilities.get("traditional_ml")
+        if isinstance(block, dict):
+            traditional = dict(block)
+    return {
+        "status": "ready" if not issues else "blocked",
+        "config_path": str(config.source_path),
+        "provider": {
+            "name": config.provider.name,
+            "module": config.provider.module,
+            "source_root": (
+                None
+                if config.provider.source_root is None
+                else str(config.provider.source_root)
+            ),
+        },
+        "device": config.model.device,
+        "input_channels": config.model.input_channels,
+        "traditional_ml": traditional,
+        "environment": environment,
+        "issues": issues,
+        "recommendations": list(dict.fromkeys(recommendations)),
+        "pretrained_weight_required": False,
+        "timings_seconds": timings,
+    }
 
 
 def provider_environment(config: HarnessConfig) -> dict[str, str]:
@@ -466,6 +701,128 @@ def run_provider_features(
         channel_names=channel_names,
         record=record,
     )
+
+
+def run_provider_traditional_ml(
+    config: HarnessConfig,
+    *,
+    input_path: str | Path,
+    features_path: str | Path,
+    features_record_path: str | Path,
+    coordinates_xy: np.ndarray,
+    labels: np.ndarray,
+    class_names: list[str],
+    classifier: str,
+    parameters: dict[str, Any] | None,
+    feature_mode: str,
+    options: dict[str, Any],
+    output_path: str | Path,
+    record_path: str | Path,
+    input_sha256: str | None = None,
+    progress_path: str | Path | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
+) -> ProviderTraditionalMLResult:
+    """Fit one conventional classifier and densely predict through the Provider.
+
+    This adapter never references a model weight, adapter, or model-state path.
+    """
+    source_input = Path(input_path).expanduser().resolve()
+    source_features = Path(features_path).expanduser().resolve()
+    source_feature_record = Path(features_record_path).expanduser().resolve()
+    for label, path in (
+        ("input", source_input),
+        ("features", source_features),
+        ("feature record", source_feature_record),
+    ):
+        if not path.is_file():
+            raise ValueError(f"The traditional ML {label} artifact does not exist: {path}")
+    coordinates = np.asarray(coordinates_xy, dtype=np.int32)
+    support_labels = np.asarray(labels, dtype=np.int64)
+    if coordinates.ndim != 2 or coordinates.shape[1:] != (2,):
+        raise ValueError("Support coordinates must have shape (samples, 2).")
+    if support_labels.shape != (len(coordinates),):
+        raise ValueError("Support labels must align with support coordinates.")
+    if len(coordinates) == 0:
+        raise ValueError("Traditional ML requires at least one support patch.")
+    if len(class_names) < 2 or not all(str(name).strip() for name in class_names):
+        raise ValueError("At least two non-empty class names are required.")
+    identifier = str(classifier).strip()
+    if not identifier:
+        raise ValueError("A traditional ML job requires a classifier identifier.")
+    if str(feature_mode) not in {
+        "raw_image",
+        "image_plus_symmetry_maps",
+    }:
+        raise ValueError(f"Unsupported traditional ML feature mode: {feature_mode!r}")
+    resolved_parameters = dict(parameters or {})
+
+    payload: dict[str, Any] = {
+        "schema_version": WORKER_SCHEMA_VERSION,
+        "input_path": str(source_input),
+        "features_path": str(source_features),
+        "features_record_path": str(source_feature_record),
+        "feature_mode": str(feature_mode),
+        "support": {
+            "coordinates_xy": coordinates.tolist(),
+            "labels": support_labels.tolist(),
+            "class_names": [str(name) for name in class_names],
+        },
+        "classifier": {
+            "identifier": identifier,
+            "parameters": resolved_parameters,
+        },
+        "options": dict(options),
+        "output_path": str(Path(output_path).expanduser().resolve()),
+        "record_path": str(Path(record_path).expanduser().resolve()),
+    }
+    if input_sha256 is not None:
+        payload["input_sha256"] = str(input_sha256)
+    resolved_progress = (
+        None if progress_path is None else Path(progress_path).expanduser().resolve()
+    )
+    if resolved_progress is not None:
+        payload["progress_path"] = str(resolved_progress)
+
+    with tempfile.TemporaryDirectory(
+        prefix="symmetry-harness-traditional-"
+    ) as temporary:
+        job_path = Path(temporary) / "traditional.json"
+        job_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        _invoke_provider_json(
+            config,
+            "--traditional-ml",
+            job_path,
+            timeout_seconds=config.provider.timeout_seconds,
+            progress_path=resolved_progress if progress_callback is not None else None,
+            progress_callback=progress_callback,
+        )
+    output = Path(payload["output_path"])
+    record_file = Path(payload["record_path"])
+    if not output.is_file() or not record_file.is_file():
+        raise RuntimeError(
+            "Provider completed without traditional ML output artifacts."
+        )
+    record = json.loads(record_file.read_text(encoding="utf-8"))
+    if record.get("worker_schema_version") != WORKER_SCHEMA_VERSION:
+        raise RuntimeError("Provider traditional ML worker schema mismatch.")
+    if record.get("schema_version") != TRADITIONAL_ML_RECORD_SCHEMA_VERSION:
+        raise RuntimeError("Provider traditional ML record schema mismatch.")
+    if record.get("operation") != TRADITIONAL_ML_OPERATION:
+        raise RuntimeError("Provider traditional ML operation identity mismatch.")
+    if record.get("provider") != config.provider.name:
+        raise RuntimeError("Provider traditional ML identity mismatch.")
+    if record.get("provider_contract_version") != PROVIDER_CONTRACT_VERSION:
+        raise RuntimeError("Provider traditional ML contract version mismatch.")
+    with np.load(output, allow_pickle=False) as archive:
+        arrays = {name: np.asarray(archive[name]).copy() for name in archive.files}
+    record["transport"] = {
+        "kind": "subprocess_json_npy_npz",
+        "python_executable": config.model.python_executable,
+        "module": config.provider.module,
+    }
+    return ProviderTraditionalMLResult(arrays=arrays, record=record)
 
 
 def run_provider_analysis(
