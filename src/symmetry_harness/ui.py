@@ -2,11 +2,14 @@
 
 from dataclasses import replace
 from hashlib import sha256
+from html import escape
 import json
 from pathlib import Path
 import os
+from queue import Empty, Queue
 import socket
 import tempfile
+from threading import Thread
 from typing import Any, Callable
 import zipfile
 
@@ -37,8 +40,33 @@ APP_CSS = (
     "align-items: center; padding: 12px 16px; border: 1px solid "
     "var(--border-color-primary); border-left: 4px solid var(--color-accent); "
     "border-radius: var(--radius-lg); background: var(--background-fill-secondary);} "
-    "#symmetry-compute-status p {margin: 0; font-weight: 600;}"
+    "#symmetry-compute-status p {margin: 0; font-weight: 600;} "
+    ".phase-progress {padding: 8px 2px 4px;} "
+    ".phase-progress-label {display: flex; justify-content: space-between; "
+    "font-weight: 600; margin-bottom: 6px;} "
+    ".phase-progress-track {height: 14px; overflow: hidden; border-radius: 7px; "
+    "background: var(--background-fill-secondary); border: 1px solid "
+    "var(--border-color-primary);} "
+    ".phase-progress-fill {height: 100%; background: var(--color-accent); "
+    "transition: width 0.15s ease;} "
+    ".phase-progress-status {font-size: 0.85em; color: var(--body-text-color-subdued); "
+    "margin-top: 4px;}"
 )
+
+
+def progress_bar_html(label: str, current: int, total: int, status: str) -> str:
+    """Render one deterministic progress bar for a long-running phase."""
+    safe_total = max(1, int(total))
+    safe_current = min(max(0, int(current)), safe_total)
+    percent = int(round(100 * safe_current / safe_total))
+    return (
+        '<div class="phase-progress">'
+        '<div class="phase-progress-label">'
+        f"<span>{escape(label)}</span><span>{percent}%</span></div>"
+        '<div class="phase-progress-track">'
+        f'<div class="phase-progress-fill" style="width: {percent}%"></div></div>'
+        f'<div class="phase-progress-status">{escape(status)}</div></div>'
+    )
 
 
 def parse_class_names(value: str) -> list[str]:
@@ -968,6 +996,12 @@ def build_app(
         run_button = gr.Button(
             "Fine-tune and predict", variant="primary", interactive=False
         )
+        fine_tuning_progress = gr.HTML(
+            progress_bar_html("Fine-tuning", 0, 1, "Waiting to start.")
+        )
+        prediction_progress = gr.HTML(
+            progress_bar_html("Prediction", 0, 1, "Waiting for fine-tuning.")
+        )
         with gr.Row():
             prediction_overlay = gr.Image(
                 label="Prediction overlay", type="numpy", interactive=False
@@ -1634,22 +1668,106 @@ def build_app(
                 points_by_class=current["points"],
                 colors=current["colors"],
             )
-            result = run_analysis(
-                runtime_config,
-                image_path=current["image_path"],
-                annotation_session=session,
-                overrides={
-                    "symmetry_patch_size": int(sym_size),
-                    "classifier_patch_size": selected_classifier_patch_size,
-                    "epochs": int(epoch_count),
-                    "learning_rate": float(lr),
-                    "stride": int(pred_stride),
-                    "batch_size": int(pred_batch),
-                    "device": str(run_device),
-                },
-                features_path=features_path,
-                features_record_path=features_record_path,
+            progress_events: Queue[tuple[str, Any]] = Queue()
+
+            def report_progress(phase: str, completed: int, total: int) -> None:
+                progress_events.put(("progress", (phase, completed, total)))
+
+            def execute_analysis() -> None:
+                try:
+                    result = run_analysis(
+                        runtime_config,
+                        image_path=current["image_path"],
+                        annotation_session=session,
+                        overrides={
+                            "symmetry_patch_size": int(sym_size),
+                            "classifier_patch_size": selected_classifier_patch_size,
+                            "epochs": int(epoch_count),
+                            "learning_rate": float(lr),
+                            "stride": int(pred_stride),
+                            "batch_size": int(pred_batch),
+                            "device": str(run_device),
+                        },
+                        features_path=features_path,
+                        features_record_path=features_record_path,
+                        progress_callback=report_progress,
+                    )
+                except Exception as error:
+                    progress_events.put(("error", error))
+                else:
+                    progress_events.put(("result", result))
+
+            fine_html = progress_bar_html(
+                "Fine-tuning", 0, int(epoch_count), "Starting fine-tuning..."
             )
+            prediction_html = progress_bar_html(
+                "Prediction", 0, 1, "Waiting for fine-tuning."
+            )
+            yield None, None, None, None, "Fine-tuning started.", fine_html, prediction_html
+
+            worker = Thread(target=execute_analysis, daemon=True)
+            worker.start()
+            result = None
+            while result is None:
+                try:
+                    event, payload = progress_events.get(timeout=0.25)
+                except Empty:
+                    continue
+                if event == "progress":
+                    phase, completed, total = payload
+                    if phase == "fine_tuning":
+                        phase_status = (
+                            "Fine-tuning complete."
+                            if completed >= total
+                            else f"Training epoch {completed} of {total}."
+                        )
+                        fine_html = progress_bar_html(
+                            "Fine-tuning", completed, total, phase_status
+                        )
+                    elif phase == "prediction":
+                        fine_html = progress_bar_html(
+                            "Fine-tuning",
+                            int(epoch_count),
+                            int(epoch_count),
+                            "Fine-tuning complete.",
+                        )
+                        phase_status = (
+                            "Prediction complete."
+                            if completed >= total
+                            else f"Predicting batch {completed} of {total}."
+                        )
+                        prediction_html = progress_bar_html(
+                            "Prediction", completed, total, phase_status
+                        )
+                    yield (
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        fine_html,
+                        prediction_html,
+                    )
+                elif event == "error":
+                    fine_html = progress_bar_html(
+                        "Fine-tuning", 0, 1, "Run failed."
+                    )
+                    prediction_html = progress_bar_html(
+                        "Prediction", 0, 1, "Run failed."
+                    )
+                    yield (
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        gr.skip(),
+                        fine_html,
+                        prediction_html,
+                    )
+                    raise payload
+                elif event == "result":
+                    result = payload
+
             overlay = np.asarray(Image.open(result["prediction_overlay"]).convert("RGB"))
             confidence = np.asarray(Image.open(result["confidence"]).convert("RGB"))
             entropy = np.asarray(Image.open(result["entropy"]).convert("RGB"))
@@ -1657,7 +1775,24 @@ def build_app(
                 f"Completed run `{result['run_id']}`. Artifacts were saved to "
                 f"`{result['run_directory']}`."
             )
-            return overlay, confidence, entropy, result, message
+            fine_html = progress_bar_html(
+                "Fine-tuning",
+                int(epoch_count),
+                int(epoch_count),
+                "Fine-tuning complete.",
+            )
+            prediction_html = progress_bar_html(
+                "Prediction", 1, 1, "Prediction complete."
+            )
+            yield (
+                overlay,
+                confidence,
+                entropy,
+                result,
+                message,
+                fine_html,
+                prediction_html,
+            )
 
         run_button.click(
             on_run,
@@ -1682,7 +1817,10 @@ def build_app(
                 entropy_image,
                 result_json,
                 status,
+                fine_tuning_progress,
+                prediction_progress,
             ],
+            show_progress="hidden",
         )
     app._symmetry_feature_cache_directory = feature_cache_directory
     return app.queue(default_concurrency_limit=1)

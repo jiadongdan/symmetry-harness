@@ -88,6 +88,31 @@ def _resize_grid(grid: np.ndarray, size: tuple[int, int]) -> np.ndarray:
     return np.asarray(image.resize(size, resample=Image.Resampling.NEAREST))
 
 
+def prediction_display_bounds(
+    prediction: DensePrediction,
+    image_shape: tuple[int, int],
+    *,
+    stride: int,
+) -> tuple[int, int, int, int]:
+    """Return the source-image rectangle covered by dense prediction cells."""
+    if stride <= 0:
+        raise ValueError("Prediction stride must be positive.")
+    height, width = (int(value) for value in image_shape)
+    if height <= 0 or width <= 0:
+        raise ValueError("Prediction image dimensions must be positive.")
+    if not len(prediction.x_coordinates) or not len(prediction.y_coordinates):
+        raise ValueError("Dense prediction coordinates cannot be empty.")
+    before = stride // 2
+    after = stride - before
+    left = max(0, int(prediction.x_coordinates[0]) - before)
+    top = max(0, int(prediction.y_coordinates[0]) - before)
+    right = min(width, int(prediction.x_coordinates[-1]) + after)
+    bottom = min(height, int(prediction.y_coordinates[-1]) + after)
+    if right <= left or bottom <= top:
+        raise ValueError("Dense prediction has no displayable region.")
+    return left, top, right, bottom
+
+
 def render_prediction_overlay(
     image: np.ndarray,
     prediction: DensePrediction,
@@ -96,29 +121,20 @@ def render_prediction_overlay(
     stride: int,
     alpha: float = 0.48,
 ) -> np.ndarray:
-    """Render a nearest-neighbor class overlay without changing numerical outputs."""
+    """Render only the source-image region covered by dense predictions."""
     base = np.repeat(unit_to_uint8(image)[..., None], 3, axis=2).astype(np.float32)
     palette = np.asarray(
         [ImageColor.getrgb(color) for color in class_colors], dtype=np.uint8
     )
     color_grid = palette[prediction.prediction_grid]
-    width = min(
-        base.shape[1],
-        int(prediction.x_coordinates[-1] - prediction.x_coordinates[0] + stride),
+    left, top, right, bottom = prediction_display_bounds(
+        prediction, image.shape, stride=stride
     )
-    height = min(
-        base.shape[0],
-        int(prediction.y_coordinates[-1] - prediction.y_coordinates[0] + stride),
-    )
-    expanded = _resize_grid(color_grid, (width, height)).astype(np.float32)
-    left = max(0, int(prediction.x_coordinates[0] - stride // 2))
-    top = max(0, int(prediction.y_coordinates[0] - stride // 2))
-    right = min(base.shape[1], left + expanded.shape[1])
-    bottom = min(base.shape[0], top + expanded.shape[0])
-    overlay = base.copy()
-    target = overlay[top:bottom, left:right]
-    colors = expanded[: bottom - top, : right - left]
-    target[:] = (1.0 - alpha) * target + alpha * colors
+    overlay = base[top:bottom, left:right].copy()
+    colors = _resize_grid(
+        color_grid, (right - left, bottom - top)
+    ).astype(np.float32)
+    overlay[:] = (1.0 - alpha) * overlay + alpha * colors
     return np.rint(np.clip(overlay, 0, 255)).astype(np.uint8)
 
 

@@ -11,8 +11,8 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from time import perf_counter
-from typing import Any
+from time import monotonic, perf_counter
+from typing import Any, Callable
 
 import numpy as np
 
@@ -249,7 +249,64 @@ def _invoke_provider_json(
     path: Path | None = None,
     *,
     timeout_seconds: int,
+    progress_path: Path | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
+    if progress_path is not None and progress_callback is not None:
+        process = subprocess.Popen(
+            provider_command(config, action, path),
+            cwd=provider_working_directory(config),
+            env=provider_environment(config),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        deadline = monotonic() + timeout_seconds
+        last_progress: tuple[str, int, int] | None = None
+        while True:
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                process.kill()
+                process.communicate()
+                raise RuntimeError("symmetry-learn provider timed out.")
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.2, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if not progress_path.is_file():
+                    continue
+                try:
+                    payload = json.loads(progress_path.read_text(encoding="utf-8"))
+                    progress = (
+                        str(payload["phase"]),
+                        int(payload["current"]),
+                        int(payload["total"]),
+                    )
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    continue
+                if progress != last_progress:
+                    progress_callback(*progress)
+                    last_progress = progress
+        if progress_path.is_file():
+            try:
+                payload = json.loads(progress_path.read_text(encoding="utf-8"))
+                progress = (
+                    str(payload["phase"]),
+                    int(payload["current"]),
+                    int(payload["total"]),
+                )
+                if progress != last_progress:
+                    progress_callback(*progress)
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                pass
+        if process.returncode != 0:
+            detail = stderr.strip() or stdout.strip()
+            raise RuntimeError(f"symmetry-learn provider failed: {detail}")
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"symmetry-learn returned invalid JSON: {error}") from error
+
     completed = subprocess.run(
         provider_command(config, action, path),
         cwd=provider_working_directory(config),
@@ -392,6 +449,7 @@ def run_provider_analysis(
     options: dict[str, Any],
     features_path: str | Path | None = None,
     features_record_path: str | Path | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> ProviderAnalysis:
     """Execute the complete numerical workflow in the configured provider."""
     values = np.asarray(image, dtype=np.float32)
@@ -416,6 +474,7 @@ def run_provider_analysis(
         output_path = directory / "output.npz"
         adapter_path = directory / "adapter_head.pt"
         record_path = directory / "provider_record.json"
+        progress_path = directory / "progress.json"
         job_path = directory / "job.json"
         np.save(input_path, values)
         payload = {
@@ -432,6 +491,8 @@ def run_provider_analysis(
             "options": provider_options,
             "method": _method_payload(config),
         }
+        if progress_callback is not None:
+            payload["progress_path"] = str(progress_path)
         if features_path is not None or features_record_path is not None:
             if features_path is None or features_record_path is None:
                 raise ValueError(
@@ -449,6 +510,8 @@ def run_provider_analysis(
             "--job",
             job_path,
             timeout_seconds=config.provider.timeout_seconds,
+            progress_path=progress_path if progress_callback is not None else None,
+            progress_callback=progress_callback,
         )
         if not output_path.is_file() or not adapter_path.is_file() or not record_path.is_file():
             raise RuntimeError("Provider completed without all required output artifacts.")

@@ -20,6 +20,7 @@ from symmetry_harness import cli
 from symmetry_harness.catalog import choose_model, weight_capability
 from symmetry_harness.analysis import (
     dense_prediction_from_arrays,
+    prediction_display_bounds,
     render_prediction_overlay,
     render_scalar_map,
     DensePrediction,
@@ -53,6 +54,7 @@ from symmetry_harness.ui import (
     feature_gallery,
     parse_class_names,
     prepare_feature_exports,
+    progress_bar_html,
 )
 from symmetry_harness.workflow import build_run_options, recorded_run_options
 
@@ -475,6 +477,50 @@ def test_provider_capability_contract_and_install_guidance() -> None:
     assert "symmetry-learn[provider]" in command
 
 
+def test_provider_progress_file_is_forwarded_without_duplication(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    progress_path = tmp_path / "progress.json"
+
+    class FakeProcess:
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def communicate(self, timeout=None):
+            self.calls += 1
+            if self.calls == 1:
+                progress_path.write_text(
+                    json.dumps(
+                        {"phase": "fine_tuning", "current": 4, "total": 10}
+                    ),
+                    encoding="utf-8",
+                )
+                raise subprocess.TimeoutExpired("provider", timeout)
+            return json.dumps({"status": "completed"}), ""
+
+        def kill(self) -> None:
+            self.returncode = -1
+
+    monkeypatch.setattr(
+        provider_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess()
+    )
+    updates = []
+    result = provider_module._invoke_provider_json(
+        config,
+        "--job",
+        tmp_path / "job.json",
+        timeout_seconds=5,
+        progress_path=progress_path,
+        progress_callback=lambda *values: updates.append(values),
+    )
+
+    assert result == {"status": "completed"}
+    assert updates == [("fine_tuning", 4, 10)]
+
+
 def test_doctor_reports_stage_timings(monkeypatch) -> None:
     with tempfile.TemporaryDirectory() as temporary:
         directory = Path(temporary)
@@ -633,7 +679,7 @@ def test_harness_source_has_no_in_process_model_runtime_dependency() -> None:
     assert "symmlearn.maps" not in source
 
 
-def test_prediction_overlay_preserves_source_shape() -> None:
+def test_prediction_overlay_crops_to_dense_prediction_region() -> None:
     x_values = np.array([32, 36], dtype=np.int32)
     y_values = np.array([32, 36], dtype=np.int32)
     coordinates = np.array([[32, 32], [36, 32], [32, 36], [36, 36]], dtype=np.int32)
@@ -656,7 +702,21 @@ def test_prediction_overlay_preserves_source_shape() -> None:
         ["#ff0000", "#0000ff"],
         stride=4,
     )
-    assert overlay.shape == (96, 96, 3)
+    assert prediction_display_bounds(prediction, (96, 96), stride=4) == (
+        30,
+        30,
+        38,
+        38,
+    )
+    assert overlay.shape == (8, 8, 3)
+
+
+def test_progress_bar_html_clamps_values_and_escapes_text() -> None:
+    rendered = progress_bar_html("Fine <tuning>", 12, 10, "Done & saved")
+    assert "Fine &lt;tuning&gt;" in rendered
+    assert "Done &amp; saved" in rendered
+    assert "100%" in rendered
+    assert "width: 100%" in rendered
 
 
 def test_provider_prediction_arrays_are_validated() -> None:

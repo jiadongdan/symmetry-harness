@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 
 import numpy as np
@@ -16,6 +16,7 @@ from PIL import Image
 from .catalog import model_capability
 from .analysis import (
     dense_prediction_from_arrays,
+    prediction_display_bounds,
     render_prediction_overlay,
     render_scalar_map,
 )
@@ -259,6 +260,7 @@ def run_analysis(
     resolved_options: RunOptions | None = None,
     features_path: str | Path | None = None,
     features_record_path: str | Path | None = None,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     """Validate user input and delegate the complete numerical run to the provider."""
     readiness = doctor(config)
@@ -320,6 +322,7 @@ def run_analysis(
         options=options.to_dict(),
         features_path=features_path,
         features_record_path=features_record_path,
+        progress_callback=progress_callback,
     )
     arrays = provider_result.arrays
     features = np.asarray(arrays.get("features"), dtype=np.float32)
@@ -376,7 +379,10 @@ def run_analysis(
         image, prediction, colors, stride=options.stride
     )
     Image.fromarray(overlay, mode="RGB").save(artifacts["prediction_overlay"])
-    map_size = (image.shape[1], image.shape[0])
+    left, top, right, bottom = prediction_display_bounds(
+        prediction, image.shape, stride=options.stride
+    )
+    map_size = (right - left, bottom - top)
     Image.fromarray(
         render_scalar_map(
             prediction.confidence_grid,
