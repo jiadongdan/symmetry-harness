@@ -22,7 +22,46 @@ CLASS_STATISTICS_NOTE = (
     "They are not ground-truth accuracy or direct physical area measurements."
 )
 
+# Typography contract (font size / line height / font weight only).
+#
+# Every value below is a font decision from the Phase 2 typography protocol.
+# Nothing here may change spacing, radius, colour, shadow, size or layout: those
+# variables are deliberately left untouched, and the rules that follow only
+# restate size, line-height and weight. The single responsive entry is the
+# 700 px H1 step; H2, H3 and body text never shrink on narrow screens.
 APP_CSS = (
+    # --- Theme typography tokens -----------------------------------------
+    ":root {"
+    " --text-sm: 13px; --text-md: 15px; --text-lg: 18px;"
+    " --text-xl: 24px; --text-xxl: 30px;"
+    " --body-text-size: 15px; --prose-text-size: 15px; --input-text-size: 15px;"
+    " --block-label-text-size: 14px; --block-info-text-size: 13px;"
+    " --block-title-text-size: 14px; --section-header-text-size: 15px;"
+    " --checkbox-label-text-size: 14px;"
+    " --button-large-text-size: 15px; --button-medium-text-size: 15px;"
+    " --button-small-text-size: 13px;"
+    " --block-label-text-weight: 600; --block-title-text-weight: 600;"
+    " --section-header-text-weight: 600;"
+    "} "
+    # --- Headings and prose ----------------------------------------------
+    ".prose h1 {font-size: 30px; line-height: 38px; font-weight: 600;} "
+    ".prose h2 {font-size: 24px; line-height: 32px; font-weight: 600;} "
+    ".prose h3 {font-size: 18px; line-height: 26px; font-weight: 600;} "
+    ".prose p {font-size: 15px; line-height: 23px;} "
+    ".prose code {font-size: 13px; line-height: 20px;} "
+    # --- Stage navigation: tabs and accordions ---------------------------
+    '[role="tab"] {font-size: 15px; line-height: 22px; font-weight: 600;} '
+    ".label-wrap {font-size: 15px; line-height: 22px; font-weight: 600;} "
+    # --- Controls, helper text and tables --------------------------------
+    'input:not([type="checkbox"]):not([type="radio"]):not([type="range"])'
+    ':not([type="file"]), textarea, select {font-size: 15px; line-height: 22px;} '
+    ".info-text {font-size: 13px; line-height: 19px;} "
+    "button.sm {line-height: 18px;} "
+    "button.md, button.lg {line-height: 22px;} "
+    "table th, table td {font-size: 14px; line-height: 20px;} "
+    "table th {font-weight: 600;} "
+    ".header-table, .virtual-table-viewport {font-size: 14px; line-height: 20px;} "
+    # --- Application shell ------------------------------------------------
     "#annotation-image {max-width: 760px; margin: 0 auto;} "
     "#symmetry-compute-status {min-height: 72px; display: flex; "
     "align-items: center; padding: 12px 16px; border: 1px solid "
@@ -31,14 +70,15 @@ APP_CSS = (
     "#symmetry-compute-status p {margin: 0; font-weight: 600;} "
     ".phase-progress {padding: 8px 2px 4px;} "
     ".phase-progress-label {display: flex; justify-content: space-between; "
+    "font-size: 14px; line-height: 20px; "
     "font-weight: 600; margin-bottom: 6px;} "
     ".phase-progress-track {height: 14px; overflow: hidden; border-radius: 7px; "
     "background: var(--background-fill-secondary); border: 1px solid "
     "var(--border-color-primary);} "
     ".phase-progress-fill {height: 100%; background: var(--color-accent); "
     "transition: width 0.15s ease;} "
-    ".phase-progress-status {font-size: 0.85em; color: var(--body-text-color-subdued); "
-    "margin-top: 4px;} "
+    ".phase-progress-status {font-size: 13px; line-height: 18px; "
+    "color: var(--body-text-color-subdued); margin-top: 4px;} "
     # Sticky has to *not* be stretched: a full-height grid/flex item has no room
     # left to travel, so ``position: sticky`` silently degenerates to static and
     # the panel scrolls out of view. ``align-self: start`` works for both flex and
@@ -49,22 +89,27 @@ APP_CSS = (
     ".readiness-panel {border: 1px solid var(--border-color-primary); "
     "border-radius: var(--radius-lg); padding: 10px 12px; "
     "background: var(--background-fill-secondary);} "
-    ".readiness-title {font-weight: 600; margin-bottom: 8px;} "
+    ".readiness-title {font-size: 16px; line-height: 24px; "
+    "font-weight: 600; margin-bottom: 8px;} "
     ".readiness-item {display: flex; gap: 8px; padding: 3px 0; "
-    "font-size: 0.9em; line-height: 1.3;} "
+    "font-size: 14px; line-height: 20px;} "
     ".readiness-icon {font-weight: 700; width: 1em; text-align: center;} "
     ".readiness-ready .readiness-icon {color: #2e7d32;} "
     ".readiness-recommendation .readiness-icon {color: #b26a00;} "
     ".readiness-blocker .readiness-icon {color: #c62828;} "
     ".readiness-body {display: flex; flex-direction: column;} "
-    ".readiness-detail {color: var(--body-text-color-subdued); font-size: 0.92em;} "
-    ".readiness-hint {font-weight: 600; font-size: 0.92em;} "
+    ".readiness-detail {color: var(--body-text-color-subdued); "
+    "font-size: 13px; line-height: 18px;} "
+    ".readiness-hint {font-weight: 600; font-size: 13px; line-height: 18px;} "
     ".class-statistics-note {color: var(--body-text-color-subdued); "
-    "font-size: 0.85em; margin-top: 4px;} "
+    "font-size: 13px; line-height: 19px; margin-top: 4px;} "
     ".class-legend-grid {display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); "
     "gap: 8px 16px; padding: 8px 4px;} "
     ".class-legend-item {display: flex; align-items: center; gap: 8px; min-width: 0;} "
     ".class-legend-label {overflow-wrap: anywhere;} "
+    "@media (max-width: 700px) {"
+    "  .prose h1 {font-size: 28px; line-height: 36px;}"
+    "}"
     "@media (max-width: 1100px) {"
     "  #readiness-panel, .readiness-sticky "
     "{position: sticky; top: 0; order: -1; align-self: start; width: 100%; height: auto; "
