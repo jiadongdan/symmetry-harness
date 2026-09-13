@@ -313,7 +313,10 @@ def _render_item_artifacts(
     map_size = (right - left, bottom - top)
     Image.fromarray(
         render_scalar_map(
-            prediction.confidence_grid, map_size, value_range=(0.0, 1.0)
+            prediction.confidence_grid,
+            map_size,
+            value_range=(0.0, 1.0),
+            colormap="viridis",
         ),
     ).save(directory / "confidence.png")
     Image.fromarray(
@@ -321,6 +324,7 @@ def _render_item_artifacts(
             prediction.entropy_grid,
             map_size,
             value_range=(0.0, float(np.log(max(len(colors), 2)))),
+            colormap="magma",
         ),
     ).save(directory / "entropy.png")
     return {

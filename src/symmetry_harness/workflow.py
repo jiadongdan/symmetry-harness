@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import tempfile
 from time import perf_counter
 from typing import Any, Callable
 from uuid import uuid4
@@ -183,6 +184,67 @@ def _save_prediction(path: Path, prediction) -> None:
         confidence_grid=prediction.confidence_grid,
         entropy_grid=prediction.entropy_grid,
     )
+
+
+def create_run_archive(
+    run_directory: str | Path,
+    *,
+    output_root: str | Path | None = None,
+) -> Path:
+    """Archive a completed run directory into one deterministic ZIP.
+
+    Rules (protocol section 3.8 / 7.3):
+
+    1. every file below ``run_directory`` is enumerated recursively (``rglob``).
+       The current run directory is flat with its 15 artifacts, but nested
+       sub-files are archived safely too;
+    2. member names are the file paths relative to ``run_directory`` as POSIX
+       strings, sorted deterministically;
+    3. absolute or parent-traversal member names are rejected defensively;
+    4. the destination lives beside the run directory (a sibling), so the
+       archive can never include itself, and any member matching the resolved
+       destination is skipped;
+    5. source files are only read, never modified.
+    """
+    source = Path(run_directory).expanduser().resolve()
+    if not source.is_dir():
+        raise ValueError(f"The run directory does not exist: {source}")
+    if output_root is None:
+        root = source.parent
+    else:
+        root = Path(output_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    target = (root / f"{source.name}-full-run.zip").resolve()
+
+    members: list[tuple[Path, str]] = []
+    for path in sorted(source.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(source)
+        name = relative.as_posix()
+        if name.startswith("/") or ".." in relative.parts:
+            continue
+        if path.resolve() == target:
+            continue
+        members.append((path, name))
+
+    temporary_handle = tempfile.NamedTemporaryFile(
+        prefix=f".{source.name}-",
+        suffix=".zip.tmp",
+        dir=root,
+        delete=False,
+    )
+    temporary = Path(temporary_handle.name)
+    temporary_handle.close()
+    try:
+        with ZipFile(temporary, "w", compression=ZIP_DEFLATED) as archive:
+            for path, name in members:
+                archive.write(path, name)
+        temporary.replace(target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return target
 
 
 def _artifact_paths(run_dir: Path) -> dict[str, str]:
@@ -478,7 +540,9 @@ def run_analysis(
     overlay = render_prediction_overlay(
         image, prediction, colors, stride=options.stride
     )
-    Image.fromarray(overlay, mode="RGB").save(artifacts["prediction_overlay"])
+    # mode is inferred as "RGB" from the uint8 (H, W, 3) arrays below; passing it
+    # explicitly is deprecated and breaks in Pillow 13.
+    Image.fromarray(overlay).save(artifacts["prediction_overlay"])
     left, top, right, bottom = prediction_display_bounds(
         prediction, image.shape, stride=options.stride
     )
@@ -488,16 +552,16 @@ def run_analysis(
             prediction.confidence_grid,
             map_size,
             value_range=(0.0, 1.0),
+            colormap="viridis",
         ),
-        mode="RGB",
     ).save(artifacts["confidence"])
     Image.fromarray(
         render_scalar_map(
             prediction.entropy_grid,
             map_size,
             value_range=(0.0, float(np.log(len(session.classes)))),
+            colormap="magma",
         ),
-        mode="RGB",
     ).save(artifacts["entropy"])
 
     class_records = [
@@ -556,6 +620,22 @@ def run_analysis(
         training=training,
         artifacts=artifacts,
     )
+    # The complete run archive is created only after every ordinary run file,
+    # the run record, and the report have been written. It is a faithful copy of
+    # the run directory (including the normalized ``input.npy``) and never adds
+    # the original uploaded source file.
+    archive_path: Path | None
+    try:
+        archive_path = create_run_archive(run_dir, output_root=root)
+    except Exception as error:  # artifact failure must not erase a valid model
+        archive_path = None
+        warnings.append(
+            "The numerical run completed, but the complete run ZIP could not "
+            f"be created: {error}"
+        )
+        record["warnings"] = warnings
+        record["artifact_errors"] = {"full_run_zip": str(error)}
+        _write_json(Path(artifacts["run_record"]), record)
     return {
         "status": "completed",
         "run_id": run_id,
@@ -565,6 +645,12 @@ def run_analysis(
         "prediction_overlay": artifacts["prediction_overlay"],
         "confidence": artifacts["confidence"],
         "entropy": artifacts["entropy"],
+        "prediction": artifacts["prediction"],
+        "input_array": artifacts["input_array"],
+        "input_preview": artifacts["input_preview"],
+        "full_run_zip": None if archive_path is None else str(archive_path),
+        "stride": options.stride,
+        "class_names": [entry["name"] for entry in class_records],
         "classes": class_records,
         "warnings": warnings,
     }

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image, ImageColor
 
+from .colormaps import map_scalar_to_rgb
 from .image_io import unit_to_uint8
 
 
@@ -248,24 +250,52 @@ def render_prediction_overlay(
     return np.rint(np.clip(overlay, 0, 255)).astype(np.uint8)
 
 
+def render_prediction_mask(
+    prediction: GridPrediction,
+    image_shape: tuple[int, int],
+    *,
+    colors: Sequence[str],
+    stride: int,
+) -> np.ndarray:
+    """Render the categorical class mask over the dense prediction region.
+
+    The mask uses nearest-neighbour resampling only: it never blends the source
+    image and never applies alpha. Its geometry shares
+    :func:`prediction_display_bounds` with :func:`render_prediction_overlay` so
+    pure overlays, masks, confidence and entropy maps always cover the same
+    predicted source-image region.
+    """
+    palette = np.asarray(
+        [ImageColor.getrgb(color) for color in colors], dtype=np.uint8
+    )
+    color_grid = palette[prediction.prediction_grid]
+    left, top, right, bottom = prediction_display_bounds(
+        prediction, image_shape, stride=stride
+    )
+    return _resize_grid(color_grid, (right - left, bottom - top)).astype(np.uint8)
+
 
 def render_scalar_map(
     grid: np.ndarray,
     size: tuple[int, int],
     *,
     value_range: tuple[float, float],
+    colormap: str,
 ) -> np.ndarray:
-    """Render a scalar grid against a fixed, interpretable value range."""
+    """Render a scalar grid against a fixed, interpretable value range.
+
+    ``colormap`` is a required keyword-only argument so every caller states its
+    rendering intent explicitly. Scientific maps pass ``"viridis"`` (confidence)
+    or ``"magma"`` (entropy); the standalone traditional-ML page passes
+    ``"legacy_rainbow"`` to preserve its historical output byte-for-byte.
+    """
     values = np.asarray(grid, dtype=np.float32)
     minimum, maximum = (float(value) for value in value_range)
     if not np.isfinite(values).all():
         raise ValueError("Scalar maps must contain only finite values.")
     if not np.isfinite(minimum) or not np.isfinite(maximum) or maximum <= minimum:
         raise ValueError("Scalar map value_range must be finite and increasing.")
-    normalized = np.clip((values - minimum) / (maximum - minimum), 0.0, 1.0)
-    red = normalized
-    green = 1.0 - np.abs(2.0 * normalized - 1.0)
-    blue = 1.0 - normalized
-    rgb = np.stack((red, green, blue), axis=2)
-    pixels = np.rint(rgb * 255.0).astype(np.uint8)
+    pixels = map_scalar_to_rgb(
+        values, value_range=(minimum, maximum), colormap=colormap
+    )
     return _resize_grid(pixels, size).astype(np.uint8)

@@ -389,9 +389,15 @@ def run_traditional_validation(
             prediction, image.shape, stride=settings.stride
         )
         map_size = (right - left, bottom - top)
+        # The standalone traditional-ML validation page is an explicit non-goal
+        # of the Phase 1 UI revision (protocol section 4). It keeps rendering
+        # with the historical rainbow ramp so its output stays byte-identical.
         Image.fromarray(
             render_scalar_map(
-                prediction.confidence_grid, map_size, value_range=(0.0, 1.0)
+                prediction.confidence_grid,
+                map_size,
+                value_range=(0.0, 1.0),
+                colormap="legacy_rainbow",
             )
         ).save(artifacts["confidence"])
         Image.fromarray(
@@ -399,6 +405,7 @@ def run_traditional_validation(
                 prediction.entropy_grid,
                 map_size,
                 value_range=(0.0, float(np.log(len(session.classes)))),
+                colormap="legacy_rainbow",
             )
         ).save(artifacts["entropy"])
 

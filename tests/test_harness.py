@@ -885,13 +885,19 @@ def test_provider_prediction_arrays_are_validated() -> None:
 
 
 def test_scalar_map_uses_fixed_value_range() -> None:
+    from symmetry_harness.colormaps import viridis_lut
+
     rendered = render_scalar_map(
         np.full((2, 2), 0.5, dtype=np.float32),
         (4, 4),
         value_range=(0.0, 1.0),
+        colormap="viridis",
     )
     assert rendered.shape == (4, 4, 3)
-    assert rendered[0, 0].tolist() == [128, 255, 128]
+    # A 0.5 value normalizes to LUT index 128 (rint(0.5 * 255)); the previous
+    # rainbow contract returned [128, 255, 128] and is intentionally replaced
+    # by viridis for scientific scalar maps (protocol section 3.6).
+    assert rendered[0, 0].tolist() == viridis_lut()[128].tolist()
 
 
 def test_class_name_parser() -> None:
