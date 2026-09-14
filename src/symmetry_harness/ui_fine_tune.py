@@ -22,6 +22,7 @@ from hashlib import sha256
 import json
 from pathlib import Path
 from queue import Empty, Queue
+import re
 import tempfile
 from threading import Thread
 from typing import Any
@@ -831,6 +832,14 @@ _SIGNED_FEATURE_CHANNELS = {
     "reflection_cos_2theta",
 }
 
+_UNSAFE_FEATURE_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_feature_filename(raw_name: Any) -> str:
+    """Return a short, portable filename component for one feature channel."""
+    name = _UNSAFE_FEATURE_FILENAME.sub("_", str(raw_name)).strip("._")
+    return ((name or "channel")[:80].rstrip("._") or "channel")
+
 
 def _feature_display_range(name: str) -> tuple[float, float]:
     """Return the fixed value range used for a feature-channel preview."""
@@ -868,10 +877,18 @@ def _write_feature_png_bundle(
     png_directory.mkdir(parents=True, exist_ok=True)
     previews: list[tuple[Image.Image, str]] = []
     paths: list[Path] = []
+    resolved_png_directory = png_directory.resolve()
     for index, (channel, raw_name) in enumerate(zip(features, channel_names), start=1):
         name = str(raw_name)
         preview = Image.fromarray(_feature_preview(channel, name))
-        path = png_directory / f"{index:02d}_{name}.png"
+        safe_name = _safe_feature_filename(name)
+        path = (png_directory / f"{index:02d}_{safe_name}.png").resolve()
+        try:
+            path.relative_to(resolved_png_directory)
+        except ValueError as error:  # pragma: no cover - sanitizer invariant
+            raise RuntimeError(
+                "Feature export path escaped its output directory."
+            ) from error
         preview.save(path)
         paths.append(path)
         previews.append((preview, name))

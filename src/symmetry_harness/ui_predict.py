@@ -22,6 +22,7 @@ Design notes (Phase 1 usability revision):
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from queue import Empty, Queue
 import tempfile
@@ -64,6 +65,9 @@ from .ui_shared import (
     progress_bar_html,
     result_item_label,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 SUPPORTED_IMAGE_SUFFIXES = (
@@ -398,21 +402,57 @@ def _stride_for_item(result: dict[str, Any] | None, entry: dict[str, Any]) -> in
     The UI always records the stride it actually ran with on the batch result;
     reading the persisted record is only a defensive fallback.
     """
-    stride: Any = (result or {}).get("stride")
-    if stride is None:
-        record_path = entry.get("prediction_record")
-        if not record_path and entry.get("item_directory"):
-            record_path = str(
-                Path(str(entry["item_directory"])) / "prediction_record.json"
-            )
-        try:
-            payload = json.loads(
-                Path(str(record_path)).read_text(encoding="utf-8")
-            )
-            stride = payload.get("prediction_options", {}).get("stride")
-        except Exception:
-            stride = None
-    return _coerce_positive_int(stride, DEFAULT_STRIDE)
+    result_payload = result or {}
+    if "stride" in result_payload:
+        return require_whole_number(
+            result_payload["stride"], "Recorded prediction stride", minimum=1
+        )
+
+    record_path = entry.get("prediction_record")
+    if not record_path and entry.get("item_directory"):
+        record_path = str(
+            Path(str(entry["item_directory"])) / "prediction_record.json"
+        )
+    if not record_path:
+        LOGGER.warning(
+            "Prediction stride metadata is absent; using legacy default %d.",
+            DEFAULT_STRIDE,
+        )
+        return DEFAULT_STRIDE
+
+    try:
+        payload = json.loads(Path(str(record_path)).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        LOGGER.warning(
+            "Prediction stride metadata is absent; using legacy default %d.",
+            DEFAULT_STRIDE,
+        )
+        return DEFAULT_STRIDE
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(
+            f"Prediction stride metadata could not be read from {record_path}."
+        ) from error
+
+    if not isinstance(payload, dict):
+        raise ValueError("Prediction record must contain a JSON object.")
+    prediction_options = payload.get("prediction_options")
+    if prediction_options is None:
+        LOGGER.warning(
+            "Prediction stride metadata is absent; using legacy default %d.",
+            DEFAULT_STRIDE,
+        )
+        return DEFAULT_STRIDE
+    if not isinstance(prediction_options, dict):
+        raise ValueError("Recorded prediction options must be an object.")
+    if "stride" not in prediction_options:
+        LOGGER.warning(
+            "Prediction stride metadata is absent; using legacy default %d.",
+            DEFAULT_STRIDE,
+        )
+        return DEFAULT_STRIDE
+    return require_whole_number(
+        prediction_options["stride"], "Recorded prediction stride", minimum=1
+    )
 
 
 def _write_variant_downloads(

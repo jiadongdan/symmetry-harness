@@ -19,6 +19,7 @@ from symmetry_harness.ui_predict import (
     _provider_supports_prediction,
     _readiness_snapshot,
     _saved_prediction_defaults,
+    _stride_for_item,
     _validate_inputs,
     new_presentation_state,
     presentation_colors_text,
@@ -756,6 +757,42 @@ def _write_completed_prediction(tmp_path, *, stride: int = 4, size: int = 16) ->
         "class_colors": ["#e41a1c", "#377eb8"],
         "items": [entry],
     }
+
+
+def test_stride_for_item_rejects_invalid_result_metadata() -> None:
+    with pytest.raises(
+        ValueError, match="Recorded prediction stride must be at least 1"
+    ):
+        _stride_for_item({"stride": 0}, {})
+
+
+def test_stride_for_item_rejects_corrupt_record(tmp_path: Path) -> None:
+    record_path = tmp_path / "prediction_record.json"
+    record_path.write_text("not json", encoding="utf-8")
+    with pytest.raises(ValueError, match="could not be read"):
+        _stride_for_item({}, {"prediction_record": str(record_path)})
+
+
+def test_stride_for_item_rejects_invalid_record_metadata(tmp_path: Path) -> None:
+    record_path = tmp_path / "prediction_record.json"
+    record_path.write_text(
+        json.dumps({"prediction_options": {"stride": -2}}), encoding="utf-8"
+    )
+    with pytest.raises(
+        ValueError, match="Recorded prediction stride must be at least 1"
+    ):
+        _stride_for_item({}, {"prediction_record": str(record_path)})
+
+
+def test_stride_for_item_uses_default_only_for_absent_legacy_metadata(
+    tmp_path: Path, caplog
+) -> None:
+    record_path = tmp_path / "prediction_record.json"
+    record_path.write_text("{}", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        stride = _stride_for_item({}, {"prediction_record": str(record_path)})
+    assert stride == 4
+    assert "legacy default" in caplog.text
 
 
 def test_render_selected_item_produces_all_variants(tmp_path) -> None:

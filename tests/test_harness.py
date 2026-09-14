@@ -1011,6 +1011,52 @@ def test_feature_gallery_and_exports_preserve_all_eight_channels(
     assert "symmetry_features_montage.png" in names_in_archive
 
 
+def test_feature_png_exports_sanitize_provider_channel_names(tmp_path: Path) -> None:
+    names = np.asarray(
+        [
+            "../../escape",
+            r"..\escape",
+            "bad:name",
+            "angle<bracket",
+            "pipe|name",
+            "question?mark",
+            "star*name",
+            "normal-channel",
+        ]
+    )
+    features = np.zeros((8, 16, 16), dtype=np.float32)
+    feature_path = tmp_path / "features.npz"
+    record_path = tmp_path / "feature_record.json"
+    np.savez_compressed(feature_path, features=features, channel_names=names)
+    record_path.write_text(
+        json.dumps(
+            {
+                "features": {
+                    "normalized_image_sha256": "a" * 64,
+                    "feature_sha256": ui_annotation.array_sha256(features),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = {
+        "features_path": str(feature_path),
+        "record_path": str(record_path),
+        "feature_shape": list(features.shape),
+    }
+
+    exports, _ = prepare_feature_exports(state, ["PNG"])
+
+    with zipfile.ZipFile(exports[0]) as archive:
+        archived_names = archive.namelist()
+    assert len(archived_names) == 9
+    assert "01_escape.png" in archived_names
+    assert "02_escape.png" in archived_names
+    assert "03_bad_name.png" in archived_names
+    assert all("/" not in name and "\\" not in name for name in archived_names)
+    assert not (tmp_path / "escape.png").exists()
+
+
 def test_gradio_interface_builds_when_ui_extra_is_installed() -> None:
     pytest.importorskip("gradio")
     config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
