@@ -37,6 +37,7 @@ from .model_package import (
     ModelPackageError,
     inspect_model_package,
 )
+from .numeric import require_whole_number
 from .prediction_workflow import (
     PREDICTION_OPERATION,
     PredictionError,
@@ -124,8 +125,10 @@ def _provider_supports_prediction(capabilities: dict[str, Any] | None) -> bool:
 
 def _overrides_are_valid(stride: Any, batch_size: Any) -> bool:
     try:
-        return int(stride) > 0 and int(batch_size) > 0
-    except (TypeError, ValueError):
+        require_whole_number(stride, "Prediction stride", minimum=1)
+        require_whole_number(batch_size, "Prediction batch size", minimum=1)
+        return True
+    except ValueError:
         return False
 
 
@@ -1041,13 +1044,19 @@ def build_prediction_workspace(
 
         def execute() -> None:
             try:
+                resolved_stride = require_whole_number(
+                    stride, "Prediction stride", minimum=1
+                )
+                resolved_batch_size = require_whole_number(
+                    batch_size, "Prediction batch size", minimum=1
+                )
                 batch = run_saved_model_prediction_batch(
                     config,
                     model_package=package.source_path,
                     image_paths=selected_paths,
                     device=None if device in {None, "auto"} else str(device),
-                    stride=int(stride),
-                    batch_size=int(batch_size),
+                    stride=resolved_stride,
+                    batch_size=resolved_batch_size,
                     progress_callback=report_progress,
                 )
             except (PredictionError, ModelPackageError, ValueError) as error:

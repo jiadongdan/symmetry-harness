@@ -544,8 +544,9 @@ def test_no_hardcoded_default_is_passed_as_override_in_on_predict():
     body = source[start:end]
     assert "DEFAULT_STRIDE" not in body
     assert "DEFAULT_BATCH_SIZE" not in body
-    assert "stride=int(stride)" in body
-    assert "batch_size=int(batch_size)" in body
+    assert "stride=resolved_stride" in body
+    assert "batch_size=resolved_batch_size" in body
+    assert "require_whole_number(" in body
     # No numeric literal is used where the runtime overrides are forwarded.
     assert "stride=4" not in body and "batch_size=512" not in body
 

@@ -287,6 +287,7 @@ def test_runtime_overrides_are_validated() -> None:
     assert not _overrides_are_valid(0, 512)
     assert not _overrides_are_valid(4, 0)
     assert not _overrides_are_valid("many", 512)
+    assert not _overrides_are_valid(3.8, 512)
 
 
 def test_prediction_support_checks_the_provider_capabilities() -> None:

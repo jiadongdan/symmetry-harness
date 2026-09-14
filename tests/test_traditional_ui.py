@@ -34,6 +34,7 @@ from symmetry_harness.ui_traditional import (
     features_are_current,
     run_is_enabled,
     support_is_complete,
+    whole_number,
 )
 
 
@@ -491,12 +492,20 @@ def test_traditional_settings_validate_and_serialize() -> None:
         "minimum_patches_per_class": 2,
         "maximum_patches_per_class": 5000,
     }
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match="at least 1"):
         TraditionalMLSettings(classifier_patch_size=0)
-    with pytest.raises(ValueError, match="must be positive"):
+    with pytest.raises(ValueError, match="at least 1"):
         TraditionalMLSettings(stride=-1)
     with pytest.raises(ValueError, match="seed must be an integer"):
         TraditionalMLSettings(seed=2**32)
+    with pytest.raises(ValueError, match="whole number"):
+        TraditionalMLSettings(stride=3.8)
+
+
+def test_whole_number_rejects_fractional_ui_values() -> None:
+    assert whole_number(4.0, "Prediction stride", minimum=1) == 4
+    with pytest.raises(ValueError, match="whole number"):
+        whole_number(3.8, "Prediction stride", minimum=1)
 
 
 # --- CLI --------------------------------------------------------------------
@@ -922,6 +931,34 @@ def test_every_handler_returns_exactly_one_value_per_output() -> None:
         assert actual == expected, (
             f"{name} returned {actual} values for {expected} declared outputs"
         )
+
+
+def test_annotation_handlers_report_friendly_errors_for_empty_state() -> None:
+    """Annotation actions before image loading must not leak state-key errors."""
+    pytest.importorskip("gradio")
+    app = build_traditional_app(_config(), capabilities=_capabilities())
+    handlers = {block_fn.fn.__name__: block_fn.fn for block_fn in app.fns.values()}
+    cases = [
+        (
+            "on_select",
+            ({}, None, None, 51, "auto", _Event([0, 0])),
+            "Load an input image before selecting points.",
+        ),
+        (
+            "on_undo",
+            ({}, None, None, 51, "auto"),
+            "Choose an active class first.",
+        ),
+        (
+            "on_clear",
+            ({}, None),
+            "Choose an active class first.",
+        ),
+    ]
+
+    for handler_name, args, message in cases:
+        with pytest.raises(ValueError, match=message):
+            handlers[handler_name](*args)
 
 
 def test_provider_backed_handlers_are_registered_with_outputs() -> None:

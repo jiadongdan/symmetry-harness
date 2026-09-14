@@ -109,13 +109,16 @@ def build_app(
         selected_tab = FINE_TUNE_TAB_ID if mode == FINE_TUNE_MODE else PREDICTION_TAB_ID
         with gr.Tabs(selected=selected_tab) as tabs:
             with gr.TabItem("Fine-tune a model", id=FINE_TUNE_TAB_ID):
-                build_fine_tune_workspace(
+                feature_cache_directory = build_fine_tune_workspace(
                     config,
                     prepared_input=prepared_input,
                     capabilities=catalog,
                 )
             with gr.TabItem("Predict with a saved model", id=PREDICTION_TAB_ID):
                 build_prediction_workspace(config, capabilities=catalog)
+    # Keep the TemporaryDirectory owner alive for as long as Gradio can invoke
+    # callbacks that read or write the fine-tune feature cache.
+    app._fine_tune_feature_cache = feature_cache_directory  # type: ignore[attr-defined]
     return app.queue(default_concurrency_limit=1)
 
 

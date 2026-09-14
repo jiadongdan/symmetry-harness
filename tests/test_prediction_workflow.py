@@ -63,7 +63,13 @@ def _capabilities(operations=None, **overrides) -> dict:
     return payload
 
 
-def _fake_provider(monkeypatch, *, capabilities=None, fail_item: str | None = None):
+def _fake_provider(
+    monkeypatch,
+    *,
+    capabilities=None,
+    fail_item: str | None = None,
+    corrupt_item: str | None = None,
+):
     """Capture the submitted batch job and write deterministic predictions."""
     captured: dict = {}
 
@@ -109,6 +115,8 @@ def _fake_provider(monkeypatch, *, capabilities=None, fail_item: str | None = No
                 confidence_grid=np.full((2, 2), 0.5, dtype=np.float32),
                 entropy_grid=np.full((2, 2), np.log(2), dtype=np.float32),
             )
+            if item_id == corrupt_item:
+                output_path.write_bytes(b"not a valid npz artifact")
             record_path.write_text(
                 json.dumps(
                     {
@@ -194,6 +202,10 @@ def test_prediction_request_allows_only_runtime_overrides(
     with pytest.raises(PredictionError, match="at least 1"):
         validate_prediction_request(
             config, model_package=package, image_paths=[image], stride=0
+        )
+    with pytest.raises(PredictionError, match="whole number"):
+        validate_prediction_request(
+            config, model_package=package, image_paths=[image], stride=3.8
         )
     with pytest.raises(PredictionError, match="at least one image"):
         validate_prediction_request(config, model_package=package, image_paths=[])
@@ -382,6 +394,29 @@ def test_batch_prediction_reports_partial_failure(
     assert failed["item_id"] == "image-0001"
     assert failed["error"]
     assert "failed" in Path(result["report"]).read_text(encoding="utf-8")
+
+
+def test_batch_prediction_isolates_postprocessing_failure(
+    config, tmp_path, monkeypatch, model_package_factory, unit_image
+) -> None:
+    _fake_provider(monkeypatch, corrupt_item="image-0001")
+    package = model_package_factory()
+    images = [unit_image(tmp_path / f"image{index}.npy") for index in range(2)]
+
+    result = run_saved_model_prediction_batch(
+        config,
+        model_package=package,
+        image_paths=images,
+        output_root=tmp_path / "runs",
+    )
+
+    assert result["counts"] == {"requested": 2, "completed": 1, "failed": 1}
+    failed = next(entry for entry in result["items"] if entry["status"] == "failed")
+    assert failed["item_id"] == "image-0001"
+    assert failed["phase"] == "postprocessing"
+    assert Path(failed["prediction_record"]).is_file()
+    assert Path(result["batch_record"]).is_file()
+    assert Path(result["results_archive"]).is_file()
 
 
 def test_batch_prediction_records_invalid_input_and_continues(

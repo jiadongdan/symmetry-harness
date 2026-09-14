@@ -42,6 +42,7 @@ from .contracts import (
     TraditionalMLSettings,
 )
 from .image_io import inspect_input
+from .numeric import require_whole_number
 from .provider import (
     run_provider_features,
     traditional_classifier_defaults,
@@ -191,15 +192,7 @@ def validate_classifier_parameters(
 
 def whole_number(value: Any, label: str, *, minimum: int) -> int:
     """Coerce one UI value to a whole number, reporting empty input clearly."""
-    if value is None or (isinstance(value, str) and not value.strip()):
-        raise ValueError(f"{label} is empty. Enter a whole number.")
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        raise ValueError(f"{label} must be a whole number.") from None
-    if number < minimum:
-        raise ValueError(f"{label} must be at least {minimum}.")
-    return number
+    return require_whole_number(value, label, minimum=minimum)
 
 
 def support_is_complete(
@@ -1139,6 +1132,8 @@ def build_traditional_app(
             run_device,
             event: SelectData,  # type: ignore[valid-type]
         ):
+            if current.get("image") is None or "image_shape" not in current:
+                raise ValueError("Load an input image before selecting points.")
             index = event.index
             if not isinstance(index, (list, tuple)) or len(index) != 2:
                 raise ValueError("The image click did not provide a valid pixel coordinate.")
@@ -1149,7 +1144,11 @@ def build_traditional_app(
                 current,
                 active,
                 source_point,
-                fallback_patch_size=int(current["classifier_patch_size"]),
+                fallback_patch_size=int(
+                    current.get(
+                        "classifier_patch_size", config.model.classifier_patch_size
+                    )
+                ),
                 maximum_points=TRADITIONAL_MAXIMUM_PATCHES_PER_CLASS,
             )
             enabled = run_is_enabled(
@@ -1199,7 +1198,11 @@ def build_traditional_app(
             updated, patch_size, _removed, message = undo_point_state(
                 current,
                 active,
-                fallback_patch_size=int(current["classifier_patch_size"]),
+                fallback_patch_size=int(
+                    current.get(
+                        "classifier_patch_size", config.model.classifier_patch_size
+                    )
+                ),
             )
             enabled = run_is_enabled(
                 updated,
@@ -1237,7 +1240,11 @@ def build_traditional_app(
             updated, patch_size, message = clear_class_state(
                 current,
                 active,
-                fallback_patch_size=int(current["classifier_patch_size"]),
+                fallback_patch_size=int(
+                    current.get(
+                        "classifier_patch_size", config.model.classifier_patch_size
+                    )
+                ),
             )
             return (
                 updated,

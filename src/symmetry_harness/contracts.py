@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from .numeric import require_whole_number
+
 
 HARNESS_CONTRACT_VERSION = "symmetry-harness-run-v1"
 ANNOTATION_SCHEMA_VERSION = "symmetry-annotation-session-v1"
@@ -67,12 +69,10 @@ class TraditionalMLSettings:
 
     def __post_init__(self) -> None:
         for name in ("classifier_patch_size", "stride", "batch_size"):
-            value = int(getattr(self, name))
-            if value <= 0:
-                raise ValueError(f"{name} must be positive.")
+            value = require_whole_number(getattr(self, name), name, minimum=1)
             object.__setattr__(self, name, value)
-        seed = int(self.seed)
-        if not 0 <= seed <= 2**32 - 1:
+        seed = require_whole_number(self.seed, "seed", minimum=0)
+        if seed > 2**32 - 1:
             raise ValueError("seed must be an integer between 0 and 4294967295.")
         object.__setattr__(self, "seed", seed)
 
@@ -89,4 +89,3 @@ class TraditionalMLSettings:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
-

@@ -42,6 +42,7 @@ from symmetry_harness.provider import (
 )
 import symmetry_harness.provider as provider_module
 import symmetry_harness.ui as ui_module
+import symmetry_harness.ui_annotation as ui_annotation
 import symmetry_harness.workflow as workflow_module
 from symmetry_harness.contracts import FINE_TUNED_MODEL_PACKAGE_SCHEMA_VERSION
 from symmetry_harness.ui import (
@@ -979,7 +980,17 @@ def test_feature_gallery_and_exports_preserve_all_eight_channels(
     feature_path = tmp_path / "features.npz"
     record_path = tmp_path / "feature_record.json"
     np.savez_compressed(feature_path, features=features, channel_names=names)
-    record_path.write_text("{}", encoding="utf-8")
+    record_path.write_text(
+        json.dumps(
+            {
+                "features": {
+                    "normalized_image_sha256": "a" * 64,
+                    "feature_sha256": ui_annotation.array_sha256(features),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     state = {
         "features_path": str(feature_path),
         "record_path": str(record_path),
@@ -1012,6 +1023,7 @@ def test_gradio_interface_builds_when_ui_extra_is_installed() -> None:
         if "Expected" in str(item.message) and "arguments" in str(item.message)
     ]
     assert type(app).__name__ == "Blocks"
+    assert Path(app._fine_tune_feature_cache.name).is_dir()
     # Gradio always warns for the annotation click handler because it injects
     # SelectData by type annotation instead of listing it in `inputs`. That one
     # warning is expected; every other argument-count warning is a real defect.

@@ -29,6 +29,7 @@ from .config import HarnessConfig, config_for_model_selection
 from .contracts import PREDICTION_RUN_CONTRACT_VERSION
 from .image_io import file_sha256, inspect_input, save_preview
 from .model_package import FineTunedModelPackage, inspect_model_package, materialize_model_state
+from .numeric import require_whole_number
 from .provider import (
     provider_capabilities,
     run_provider_prediction_batch,
@@ -67,12 +68,9 @@ def _resolve_runtime_value(
     """Resolve one runtime-only override, falling back to the saved default."""
     value = saved if override is None else override
     try:
-        resolved = int(value)
-    except (TypeError, ValueError) as error:
-        raise PredictionError(f"{name} must be an integer.") from error
-    if resolved < minimum:
-        raise PredictionError(f"{name} must be at least {minimum}.")
-    return resolved
+        return require_whole_number(value, name, minimum=minimum)
+    except ValueError as error:
+        raise PredictionError(str(error)) from error
 
 
 def _version_core(value: Any) -> tuple[int, int, int] | None:
@@ -405,6 +403,104 @@ def _downloadable_copy(archive_path: Path, run_id: str) -> Path:
     return destination
 
 
+def _finalize_completed_item(
+    *,
+    entry: dict[str, Any],
+    item_directory: Path,
+    request: PredictionRequest,
+    package: FineTunedModelPackage,
+    colors: list[str],
+    feature_options: dict[str, Any],
+    run_id: str,
+) -> dict[str, Any]:
+    """Validate and render one Provider-completed prediction item."""
+    with np.load(item_directory / "prediction.npz", allow_pickle=False) as archive:
+        arrays = {name: np.asarray(archive[name]).copy() for name in archive.files}
+    if "features" not in arrays or "channel_names" not in arrays:
+        raise RuntimeError(
+            "Provider prediction output is missing reusable feature arrays."
+        )
+    np.savez_compressed(
+        item_directory / "features.npz",
+        features=np.asarray(arrays["features"], dtype=np.float32),
+        channel_names=np.asarray(arrays["channel_names"]),
+    )
+    artifacts = _render_item_artifacts(
+        item_directory,
+        image=np.asarray(
+            np.load(item_directory / "input.npy", allow_pickle=False),
+            dtype=np.float32,
+        ),
+        arrays=arrays,
+        colors=colors,
+        stride=request.stride,
+    )
+    provider_record = json.loads(
+        (item_directory / "provider_record.json").read_text(encoding="utf-8")
+    )
+    statistics = _class_statistics(arrays["prediction_grid"], len(colors))
+    record = {
+        "contract_version": PREDICTION_RUN_CONTRACT_VERSION,
+        "run_id": run_id,
+        "item_id": entry["item_id"],
+        "status": "completed",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "package": {
+            "path": str(package.source_path),
+            "package_sha256": package.package_sha256,
+            "schema_version": package.manifest["schema_version"],
+            "model_state_sha256": package.model_state_sha256,
+        },
+        "model": {
+            "identifier": package.model_identifier,
+            "task_classes": package.task_classes,
+            "class_names": package.class_names,
+            "class_colors": colors,
+            "classifier_patch_size": package.manifest["model"][
+                "classifier_patch_size"
+            ],
+            "adapter_bottleneck": package.manifest["model"]["adapter_bottleneck"],
+        },
+        "input": {"path": str(entry["source_path"]), **entry["input_record"]},
+        "features": feature_options,
+        "prediction_options": {
+            "device": request.device,
+            "stride": request.stride,
+            "batch_size": request.batch_size,
+        },
+        "provider": {
+            "name": provider_record.get("provider"),
+            "version": provider_record.get("provider_version"),
+            "contract_version": provider_record.get("provider_contract_version"),
+            "record_path": str(item_directory / "provider_record.json"),
+        },
+        "output": {
+            "grid_shape": artifacts["grid_shape"],
+            "bounds": artifacts["bounds"],
+            "class_statistics": statistics,
+        },
+        "artifacts": {
+            "prediction": str(artifacts["prediction"]),
+            "features": str(item_directory / "features.npz"),
+            "prediction_overlay": str(artifacts["prediction_overlay"]),
+            "confidence": str(artifacts["confidence"]),
+            "entropy": str(artifacts["entropy"]),
+            "input": str(item_directory / "input.npy"),
+            "input_preview": str(item_directory / "input_preview.png"),
+        },
+        "warnings": ["Confidence and entropy do not establish physical correctness."],
+    }
+    _write_json(item_directory / "prediction_record.json", record)
+    return {
+        "item_id": entry["item_id"],
+        "item_directory": str(item_directory),
+        "status": "completed",
+        "source_path": str(entry["source_path"]),
+        **record["output"],
+        **{f"artifact_{key}": value for key, value in record["artifacts"].items()},
+    }
+
+
 def run_saved_model_prediction_batch(
     config: HarnessConfig,
     *,
@@ -575,107 +671,40 @@ def run_saved_model_prediction_batch(
                 }
             )
             continue
-        with np.load(item_directory / "prediction.npz", allow_pickle=False) as archive:
-            arrays = {
-                name: np.asarray(archive[name]).copy() for name in archive.files
-            }
-        if "features" not in arrays or "channel_names" not in arrays:
-            raise RuntimeError(
-                "Provider prediction output is missing reusable feature arrays."
+        try:
+            completed_item = _finalize_completed_item(
+                entry=entry,
+                item_directory=item_directory,
+                request=request,
+                package=package,
+                colors=colors,
+                feature_options=feature_options,
+                run_id=run_id,
             )
-        np.savez_compressed(
-            item_directory / "features.npz",
-            features=np.asarray(arrays["features"], dtype=np.float32),
-            channel_names=np.asarray(arrays["channel_names"]),
-        )
-        artifacts = _render_item_artifacts(
-            item_directory,
-            image=np.asarray(
-                np.load(item_directory / "input.npy", allow_pickle=False),
-                dtype=np.float32,
-            ),
-            arrays=arrays,
-            colors=colors,
-            stride=request.stride,
-        )
-        provider_record = json.loads(
-            (item_directory / "provider_record.json").read_text(encoding="utf-8")
-        )
-        statistics = _class_statistics(
-            arrays["prediction_grid"], len(colors)
-        )
-        record = {
-            "contract_version": PREDICTION_RUN_CONTRACT_VERSION,
-            "run_id": run_id,
-            "item_id": item_id,
-            "status": "completed",
-            "created_utc": datetime.now(timezone.utc).isoformat(),
-            "package": {
-                "path": str(package.source_path),
-                "package_sha256": package.package_sha256,
-                "schema_version": package.manifest["schema_version"],
-                "model_state_sha256": package.model_state_sha256,
-            },
-            "model": {
-                "identifier": package.model_identifier,
-                "task_classes": package.task_classes,
-                "class_names": package.class_names,
-                "class_colors": colors,
-                "classifier_patch_size": package.manifest["model"][
-                    "classifier_patch_size"
-                ],
-                "adapter_bottleneck": package.manifest["model"]["adapter_bottleneck"],
-            },
-            "input": {
-                "path": str(entry["source_path"]),
-                **entry["input_record"],
-            },
-            "features": feature_options,
-            "prediction_options": {
-                "device": request.device,
-                "stride": request.stride,
-                "batch_size": request.batch_size,
-            },
-            "provider": {
-                "name": provider_record.get("provider"),
-                "version": provider_record.get("provider_version"),
-                "contract_version": provider_record.get(
-                    "provider_contract_version"
-                ),
-                "record_path": str(item_directory / "provider_record.json"),
-            },
-            "output": {
-                "grid_shape": artifacts["grid_shape"],
-                "bounds": artifacts["bounds"],
-                "class_statistics": statistics,
-            },
-            "artifacts": {
-                "prediction": str(artifacts["prediction"]),
-                "features": str(item_directory / "features.npz"),
-                "prediction_overlay": str(artifacts["prediction_overlay"]),
-                "confidence": str(artifacts["confidence"]),
-                "entropy": str(artifacts["entropy"]),
-                "input": str(item_directory / "input.npy"),
-                "input_preview": str(item_directory / "input_preview.png"),
-            },
-            "warnings": [
-                "Confidence and entropy do not establish physical correctness."
-            ],
-        }
-        _write_json(item_directory / "prediction_record.json", record)
-        results.append(
-            {
+        except Exception as error:
+            failure = {
+                "contract_version": PREDICTION_RUN_CONTRACT_VERSION,
+                "run_id": run_id,
                 "item_id": item_id,
-                "item_directory": str(item_directory),
-                "status": "completed",
+                "status": "failed",
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "phase": "postprocessing",
                 "source_path": str(entry["source_path"]),
-                **record["output"],
-                **{
-                    f"artifact_{key}": value
-                    for key, value in record["artifacts"].items()
-                },
+                "error_type": type(error).__name__,
+                "error": str(error),
             }
-        )
+            _write_json(item_directory / "prediction_record.json", failure)
+            results.append(
+                {
+                    **failure,
+                    "item_directory": str(item_directory),
+                    "prediction_record": str(
+                        item_directory / "prediction_record.json"
+                    ),
+                }
+            )
+        else:
+            results.append(completed_item)
 
     results.sort(key=lambda entry: str(entry["item_id"]))
     completed = [entry for entry in results if entry["status"] == "completed"]

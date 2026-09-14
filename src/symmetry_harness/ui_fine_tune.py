@@ -43,6 +43,7 @@ from .annotations import create_annotation_session
 from .catalog import model_capability, model_weights, provider_models, weight_capability
 from .config import HarnessConfig, config_for_model_selection
 from .image_io import file_sha256, inspect_input
+from .numeric import require_whole_number
 from .provider import install_registered_weight, run_provider_features
 from .result_exports import (
     DEFAULT_OVERLAY_ALPHA,
@@ -59,6 +60,7 @@ from .ui_annotation import (
     annotation_display_shape as _annotation_display_shape,
     annotation_rows,
     annotation_state,
+    array_sha256,
     clear_class_state,
     configure_class_state,
     copy_state as _copy_state,
@@ -342,7 +344,7 @@ def build_fine_tune_snapshot(
                 dict(capabilities),
                 dict(state),
                 model_identifier=str(model_identifier),
-                symmetry_patch_size=int(symmetry_patch_size),
+                symmetry_patch_size=symmetry_patch_size,
                 device=str(device),
             )
             if (
@@ -751,14 +753,9 @@ def _feature_request(
     """Resolve a deterministic feature request and its cache key."""
     if state.get("image") is None:
         raise ValueError("Load an input image before computing symmetry maps.")
-    try:
-        resolved_patch_size = int(symmetry_patch_size)
-    except (TypeError, ValueError):
-        raise ValueError(
-            "The symmetry patch size is empty or not a whole number."
-        ) from None
-    if resolved_patch_size <= 0:
-        raise ValueError("The symmetry patch size must be positive.")
+    resolved_patch_size = require_whole_number(
+        symmetry_patch_size, "The symmetry patch size", minimum=1
+    )
     contract = _model_contract_config(config, capabilities, model_identifier)
     options = build_run_options(
         contract,
@@ -808,6 +805,24 @@ def _load_cached_features(
     if channel_names.shape != (expected_shape[0],):
         raise RuntimeError("Cached feature channel names are incomplete.")
     record = json.loads(record_path.read_text(encoding="utf-8"))
+    provider_features = record.get("features")
+    if not isinstance(provider_features, dict):
+        raise RuntimeError("Cached feature provenance is missing; compute again.")
+    recorded_image_sha256 = str(
+        provider_features.get("normalized_image_sha256", "")
+    ).lower()
+    recorded_feature_sha256 = str(provider_features.get("feature_sha256", "")).lower()
+    if len(recorded_image_sha256) != 64 or len(recorded_feature_sha256) != 64:
+        raise RuntimeError("Cached feature provenance is missing; compute again.")
+    if recorded_feature_sha256 != array_sha256(features):
+        raise RuntimeError("Cached feature contents do not match their checksum.")
+    fingerprint = record.get("harness_cache_fingerprint")
+    if isinstance(fingerprint, dict):
+        expected_image_sha256 = str(
+            fingerprint.get("normalized_image_sha256", "")
+        ).lower()
+        if expected_image_sha256 and recorded_image_sha256 != expected_image_sha256:
+            raise RuntimeError("Cached features belong to a different normalized image.")
     return features, channel_names, record
 
 
@@ -1889,7 +1904,7 @@ def build_fine_tune_workspace(
             current_catalog,
             current,
             model_identifier=model_id,
-            symmetry_patch_size=int(sym_size),
+            symmetry_patch_size=sym_size,
             device=str(run_device),
         )
         features_path, record_path = _feature_cache_paths(
@@ -2049,7 +2064,7 @@ def build_fine_tune_workspace(
                 current_catalog,
                 current,
                 model_identifier=model_id,
-                symmetry_patch_size=int(sym_size),
+                symmetry_patch_size=sym_size,
                 device=str(run_device),
             )
         except (KeyError, TypeError, ValueError):
@@ -2242,12 +2257,24 @@ def build_fine_tune_workspace(
     ):
         if current.get("image") is None or not current.get("class_names"):
             raise ValueError("Load an image and configure classes before running.")
+        resolved_symmetry_patch_size = require_whole_number(
+            sym_size, "The symmetry patch size", minimum=1
+        )
+        resolved_epochs = require_whole_number(
+            epoch_count, "Fine-tuning epochs", minimum=1
+        )
+        resolved_stride = require_whole_number(
+            pred_stride, "Prediction stride", minimum=1
+        )
+        resolved_batch_size = require_whole_number(
+            pred_batch, "Prediction batch size", minimum=1
+        )
         _, _, _, expected_feature_key = _feature_request(
             config,
             current_catalog,
             current,
             model_identifier=model_id,
-            symmetry_patch_size=int(sym_size),
+            symmetry_patch_size=resolved_symmetry_patch_size,
             device=str(run_device),
         )
         if current_features.get("cache_key") != expected_feature_key:
@@ -2294,12 +2321,12 @@ def build_fine_tune_workspace(
                     image_path=current["image_path"],
                     annotation_session=session,
                     overrides={
-                        "symmetry_patch_size": int(sym_size),
+                        "symmetry_patch_size": resolved_symmetry_patch_size,
                         "classifier_patch_size": selected_classifier_patch_size,
-                        "epochs": int(epoch_count),
+                        "epochs": resolved_epochs,
                         "learning_rate": float(lr),
-                        "stride": int(pred_stride),
-                        "batch_size": int(pred_batch),
+                        "stride": resolved_stride,
+                        "batch_size": resolved_batch_size,
                         "device": str(run_device),
                     },
                     features_path=features_path,
@@ -2312,7 +2339,7 @@ def build_fine_tune_workspace(
                 progress_events.put(("result", result))
 
         fine_html = progress_bar_html(
-            "Fine-tuning", 0, int(epoch_count), "Starting fine-tuning..."
+            "Fine-tuning", 0, resolved_epochs, "Starting fine-tuning..."
         )
         prediction_html = progress_bar_html(
             "Prediction", 0, 1, "Waiting for fine-tuning."
@@ -2346,8 +2373,8 @@ def build_fine_tune_workspace(
                 elif phase == "prediction":
                     fine_html = progress_bar_html(
                         "Fine-tuning",
-                        int(epoch_count),
-                        int(epoch_count),
+                        resolved_epochs,
+                        resolved_epochs,
                         "Fine-tuning complete.",
                     )
                     phase_status = (
@@ -2440,8 +2467,8 @@ def build_fine_tune_workspace(
             run_summary += "\n\n**Warnings:** " + "; ".join(result_warnings)
         fine_html = progress_bar_html(
             "Fine-tuning",
-            int(epoch_count),
-            int(epoch_count),
+            resolved_epochs,
+            resolved_epochs,
             "Fine-tuning complete.",
         )
         prediction_html = progress_bar_html("Prediction", 1, 1, "Prediction complete.")
