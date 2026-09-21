@@ -49,6 +49,15 @@ try {
         "0",
         "--no-inbrowser"
     ) + $args
+    # The host writes progress and library deprecation notices to stderr. When
+    # this script is invoked with its streams merged or redirected, PowerShell
+    # converts every native stderr line into an ErrorRecord; under the `Stop`
+    # preference set above that aborts this script mid-run and takes the host
+    # process down with it. Stderr is never a launch failure, so the host must
+    # run with a non-terminating preference.
+    $ErrorActionPreference = "Continue"
+    $PSNativeCommandUseErrorActionPreference = $false
+
     & $harnessPython @launchArguments
     exit $LASTEXITCODE
 }
