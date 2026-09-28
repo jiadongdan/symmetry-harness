@@ -4,6 +4,16 @@
 
 set -u
 
+# MSYS / Git Bash `ps` cannot see native Windows processes. Without this guard
+# the script below would print "No running Symmetry Harness interface found"
+# while the interface is still up, which is worse than doing nothing.
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        printf '%s\n' "Windows detected: POSIX process listing cannot see the Harness. Run scripts/stop.ps1 instead."
+        exit 1
+        ;;
+esac
+
 self=$$
 
 # Collect PIDs whose full command line contains both "symmetry_harness.cli"

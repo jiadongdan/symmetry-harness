@@ -40,7 +40,11 @@ def _run(command: Sequence[str], *, capture: bool = False) -> subprocess.Complet
 def _write_text_atomic(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(content, encoding="utf-8")
+    # Always write LF endings. Text mode translates "\n" to CRLF on Windows, and
+    # the POSIX launchers read these files with `IFS= read -r`, which keeps the
+    # trailing CR and makes every `-x` / `-f` check fail.
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write(content)
     temporary.replace(path)
 
 

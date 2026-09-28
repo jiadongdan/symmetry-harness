@@ -13,8 +13,11 @@ blocked() {
 [ -f "$python_path_file" ] || blocked
 [ -f "$config_path_file" ] || blocked
 
-IFS= read -r harness_python < "$python_path_file"
-IFS= read -r config_path < "$config_path_file"
+# Strip a trailing CR: installer versions that wrote these files in text mode
+# produced CRLF on Windows, and `IFS= read -r` keeps the CR, which makes every
+# `-x` / `-f` check below fail with a false "runtime unavailable".
+harness_python="$(tr -d '\r' < "$python_path_file")"
+config_path="$(tr -d '\r' < "$config_path_file")"
 
 [ -x "$harness_python" ] || blocked
 [ -f "$config_path" ] || blocked

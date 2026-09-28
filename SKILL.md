@@ -142,3 +142,9 @@ name and such a match silently finds nothing.
 
 The launchers contain no fixed workspace paths or Python environments. The
 installer writes host-specific paths only to user-local runtime state.
+
+Runtime state is written with LF endings, and the POSIX launchers strip a stray
+CR from state written by older installers, so `launch.sh` works on Windows as
+well as on macOS and Linux. Prefer the `.ps1` scripts on Windows anyway:
+`stop.sh` deliberately refuses to run there because MSYS cannot list native
+Windows processes and would otherwise report a false "nothing running".
