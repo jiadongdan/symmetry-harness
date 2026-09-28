@@ -71,6 +71,12 @@ For a request to start or open the interactive interface, follow only this path:
 
 For a startup-only request, do not read any supporting reference.
 
+Startup is not instantaneous and the launchers print nothing before the final
+JSON. Readiness probes the Provider (capability discovery plus a model probe),
+which commonly takes one to two minutes where `import torch` is slow and is much
+faster where it is cheap. Silence is not failure: while the launched process is
+alive, keep reading and do not restart the launcher or report `blocked`.
+
 ## Traditional ML Validation (explicit request only)
 
 This is a separate page, not a normal workspace. Launch it only when the user

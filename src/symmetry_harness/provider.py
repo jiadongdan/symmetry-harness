@@ -35,6 +35,15 @@ TRADITIONAL_ML_OPERATION = "traditional_ml_analyze"
 TRADITIONAL_ML_CAPABILITY_SCHEMA_VERSION = "symmetry-traditional-ml-capability-v1"
 TRADITIONAL_ML_RECORD_SCHEMA_VERSION = "symmetry-traditional-ml-run-v1"
 
+# Provider capability discovery starts a subprocess whose cost is dominated by
+# initialising the Provider's numerical runtime, which is slow on some platforms
+# and is paid on every launch even though the catalog is static metadata. The
+# catalog is therefore cached in the runtime state directory and revalidated
+# with cheap filesystem checks.
+CAPABILITIES_CACHE_SCHEMA_VERSION = 1
+CAPABILITIES_CACHE_NAME = "provider-capabilities.json"
+CAPABILITIES_CACHE_DISABLE_ENV = "SYMMETRY_HARNESS_DISABLE_CAPABILITIES_CACHE"
+
 
 @dataclass(frozen=True)
 class ProviderAnalysis:
@@ -589,9 +598,108 @@ def _invoke_provider_json(
         raise RuntimeError(f"symmetry-learn returned invalid JSON: {error}") from error
 
 
+def _state_directory() -> Path:
+    """Runtime state directory, mirroring the launcher rule."""
+    configured = os.environ.get("SYMMETRY_HARNESS_HOME", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".symmetry-harness"
+
+
+def _truthy_environment(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _capabilities_cache_key(config: HarnessConfig) -> dict[str, Any]:
+    """Identify the Provider this cached catalog belongs to."""
+    source_root = config.provider.source_root
+    return {
+        "cache_schema_version": CAPABILITIES_CACHE_SCHEMA_VERSION,
+        "contract_version": PROVIDER_CONTRACT_VERSION,
+        "provider_name": config.provider.name,
+        "provider_module": config.provider.module,
+        "python_executable": str(config.model.python_executable),
+        "source_root": None if source_root is None else str(source_root),
+    }
+
+
+def _weight_signatures(capabilities: dict[str, Any]) -> dict[str, Any]:
+    """Fingerprint registered weight files without loading them."""
+    signatures: dict[str, Any] = {}
+    for model in capabilities.get("models") or []:
+        if not isinstance(model, dict):
+            continue
+        weights: list[Any] = []
+        default_weight = model.get("default_weight")
+        if isinstance(default_weight, dict):
+            weights.append(default_weight)
+        extra = model.get("weights")
+        if isinstance(extra, list):
+            weights.extend(extra)
+        for weight in weights:
+            if not isinstance(weight, dict):
+                continue
+            raw_path = weight.get("installed_path")
+            if not raw_path:
+                continue
+            try:
+                stat = Path(str(raw_path)).expanduser().stat()
+            except OSError:
+                signatures[str(raw_path)] = None
+                continue
+            signatures[str(raw_path)] = [stat.st_size, stat.st_mtime_ns]
+    return signatures
+
+
+def _read_cached_capabilities(config: HarnessConfig) -> dict[str, Any] | None:
+    """Return a cached catalog, or None when it is missing or stale."""
+    path = _state_directory() / CAPABILITIES_CACHE_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("key") != _capabilities_cache_key(config):
+        return None
+    cached = payload.get("capabilities")
+    if not isinstance(cached, dict):
+        return None
+    if payload.get("weight_signatures") != _weight_signatures(cached):
+        return None
+    return cached
+
+
+def _write_cached_capabilities(
+    config: HarnessConfig, capabilities: dict[str, Any]
+) -> None:
+    """Persist a catalog for later launches. Caching is best effort."""
+    path = _state_directory() / CAPABILITIES_CACHE_NAME
+    payload = {
+        "key": _capabilities_cache_key(config),
+        "weight_signatures": _weight_signatures(capabilities),
+        "capabilities": capabilities,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        temporary.replace(path)
+    except OSError:
+        return
+
+
 def provider_capabilities(config: HarnessConfig) -> dict[str, Any]:
     """Read the current versioned Provider model and weight catalog."""
-    return _invoke_provider_json(config, "--capabilities", timeout_seconds=120)
+    if not _truthy_environment(CAPABILITIES_CACHE_DISABLE_ENV):
+        cached = _read_cached_capabilities(config)
+        if cached is not None:
+            return cached
+    capabilities = _invoke_provider_json(config, "--capabilities", timeout_seconds=120)
+    _write_cached_capabilities(config, capabilities)
+    return capabilities
 
 
 def _method_payload(config: HarnessConfig) -> dict[str, Any]:

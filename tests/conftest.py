@@ -88,6 +88,18 @@ def model_package_factory(tmp_path):
     return factory
 
 
+@pytest.fixture(autouse=True)
+def isolated_runtime_state(tmp_path, monkeypatch):
+    """Point runtime state at a scratch directory for every test.
+
+    Capability caching reads and writes under ``SYMMETRY_HARNESS_HOME``. Tests
+    replace Provider responses, so they must never see a cache written by a real
+    launch, and they must never write one the next launch would read.
+    """
+    monkeypatch.setenv("SYMMETRY_HARNESS_HOME", str(tmp_path / "state"))
+    return tmp_path / "state"
+
+
 @pytest.fixture()
 def unit_image():
     """Return a deterministic single-channel image writer."""
