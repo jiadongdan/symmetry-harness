@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -321,7 +322,17 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
     if arguments.command == "launch":
         timings = {"config_load": config_seconds}
         doctor_started = perf_counter()
-        readiness = doctor(config, require_ui=True)
+
+        # Readiness probes the Provider in a subprocess, and importing the UI
+        # stack is CPU bound and independent of that probe. Running them at the
+        # same time hides the slower of the two instead of paying both in
+        # sequence. The probe still gates the launch: readiness is joined before
+        # anything is served, so a blocked launch is reported exactly as before.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            readiness_future = executor.submit(doctor, config, require_ui=True)
+            from .ui import launch_ui
+
+            readiness = readiness_future.result()
         timings["doctor"] = round(perf_counter() - doctor_started, 6)
         if readiness["status"] != "ready":
             timings["total"] = round(perf_counter() - launch_started, 6)
@@ -349,8 +360,6 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             timings["input_inspection"] = round(
                 perf_counter() - inspect_started, 6
             )
-
-        from .ui import launch_ui
 
         ui_started = perf_counter()
 
