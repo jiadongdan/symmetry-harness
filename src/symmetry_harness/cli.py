@@ -17,6 +17,7 @@ from .config import load_harness_config
 from .image_io import inspect_input
 from .initialization import initialize_config
 from .provider import (
+    apply_model_probe,
     default_provider_install_command,
     doctor,
     probe_model,
@@ -323,18 +324,39 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
         timings = {"config_load": config_seconds}
         doctor_started = perf_counter()
 
-        # Readiness probes the Provider in a subprocess, and importing the UI
-        # stack is CPU bound and independent of that probe. Running them at the
-        # same time hides the slower of the two instead of paying both in
-        # sequence. The probe still gates the launch: readiness is joined before
-        # anything is served, so a blocked launch is reported exactly as before.
+        # Three things must happen before a URL can be printed: the readiness
+        # probe, the UI import, and the model contract. They are independent, so
+        # they run at the same time and the launch pays the slowest instead of
+        # the sum. Two of them are dominated by a fresh interpreter importing a
+        # numerical runtime, which is why overlapping matters here.
+        #
+        # The strict model probe is deliberately excluded: it is the single most
+        # expensive step and it starts its own Provider process. Deferring it lets
+        # the URL be printed as soon as the UI is up. That is safe only because
+        # the interface can repair an unusable weight -- the deferred result is
+        # reported on the ready payload, and a non-interactive caller that needs
+        # the strict answer keeps calling `doctor`.
         with ThreadPoolExecutor(max_workers=1) as executor:
-            readiness_future = executor.submit(doctor, config, require_ui=True)
+            probe_future = executor.submit(probe_model, config)
+            readiness = doctor(config, require_ui=True, probe=False)
             from .ui import launch_ui
 
-            readiness = readiness_future.result()
+            try:
+                probe_result = probe_future.result()
+            except Exception as error:  # noqa: BLE001 - reported, never raised
+                readiness = apply_model_probe(readiness, None, error=error)
+            else:
+                readiness = apply_model_probe(readiness, probe_result)
         timings["doctor"] = round(perf_counter() - doctor_started, 6)
-        if readiness["status"] != "ready":
+        # Only a blocker that the interface cannot repair stops the launch. A
+        # failed weight load is repairable there (select another weight), and
+        # `apply_model_probe` records it as `selection_required`, so it opens the
+        # interface and reports the problem instead of withholding it. Every
+        # other blocker -- missing Gradio, an incompatible Provider, an
+        # unreadable config -- is still fatal, exactly as before.
+        model_status = readiness["model"]["status"]
+        fatal = readiness["status"] != "ready" and model_status != "selection_required"
+        if fatal:
             timings["total"] = round(perf_counter() - launch_started, 6)
             return {
                 "status": "blocked",
@@ -381,6 +403,15 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
                 "model": model_report["model"],
                 "feature_channels": model_report["feature_channels"],
                 "fine_tuning": model_report["fine_tuning"],
+                "model_probe": {
+                    "status": readiness["model"]["status"],
+                    "issues": [
+                        issue
+                        for issue in readiness["issues"]
+                        if "model probe" in issue
+                    ],
+                    "recommendations": readiness["recommendations"],
+                },
                 "readiness_timings_seconds": readiness.get(
                     "timings_seconds", {}
                 ),

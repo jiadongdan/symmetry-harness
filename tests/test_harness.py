@@ -197,6 +197,142 @@ def _capabilities() -> dict:
     }
 
 
+def test_doctor_can_defer_the_strict_model_probe() -> None:
+    """The interactive launch overlaps the probe with UI construction.
+
+    ``doctor(probe=False)`` must answer without starting the Provider, and the
+    report must say the probe was deferred rather than presenting an absent
+    probe as a successful one.
+    """
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    calls: list[object] = []
+
+    def _explode(*args, **kwargs):  # pragma: no cover - must not be reached
+        calls.append(args)
+        raise AssertionError("A deferred probe must not start the Provider.")
+
+    original = provider_module.probe_model
+    provider_module.probe_model = _explode
+    try:
+        report = provider_module.doctor(config, require_ui=False, probe=False)
+    finally:
+        provider_module.probe_model = original
+
+    assert calls == []
+    assert report["probe_deferred"] is True
+    assert report["model"]["probe"] is None
+    # A deferred probe must not be charged to the probe timing. Timers are not
+    # exactly zero, so this asserts "no real work happened" rather than equality.
+    assert report["timings_seconds"]["model_probe"] < 0.05
+
+
+def test_deferring_the_probe_never_skips_the_provider_capability_check() -> None:
+    """Deferring the weight load must not weaken the cheap compatibility gate.
+
+    The capabilities call is what rejects an incompatible Provider, so it has to
+    still run and its issues still have to block.
+    """
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    original = provider_module.provider_capabilities
+    provider_module.provider_capabilities = lambda _config: {
+        "contract_version": "not-the-provider-contract",
+        "provider": config.provider.name,
+        "operations": [],
+        "models": [],
+    }
+    try:
+        report = provider_module.doctor(config, require_ui=False, probe=False)
+    finally:
+        provider_module.provider_capabilities = original
+
+    assert report["status"] == "blocked"
+    assert report["issues"], "capability issues must survive a deferred probe"
+
+
+def test_apply_model_probe_merges_without_mutating_the_input() -> None:
+    base = {
+        "status": "ready",
+        "model": {"identifier": "m", "weight_identifier": "w", "status": "ready"},
+        "checkpoint": {"kind": "registered", "exists": True},
+        "issues": [],
+        "recommendations": [],
+        "probe_deferred": True,
+        "timings_seconds": {"total": 0.01},
+    }
+    merged = provider_module.apply_model_probe(
+        base,
+        {
+            "details": {
+                "checkpoint": {
+                    "path": "D:/weights/w.pth",
+                    "sha256": "abc",
+                    "weight_identifier": "w-from-probe",
+                    "source": "bundled",
+                    "bundled": True,
+                    "strict_load": True,
+                }
+            }
+        },
+    )
+
+    assert merged is not base
+    assert merged["status"] == "ready"
+    assert merged["model"]["status"] == "ready"
+    assert merged["probe_deferred"] is False
+    assert merged["checkpoint"]["path"] == "D:/weights/w.pth"
+    assert merged["model"]["weight_identifier"] == "w-from-probe"
+
+    # The input report is left exactly as it was.
+    assert base["probe_deferred"] is True
+    assert "probe" not in base["model"]
+    assert "path" not in base["checkpoint"]
+
+
+def test_a_failed_deferred_probe_blocks_and_asks_for_a_selection() -> None:
+    """A strict-load failure must be reported, and must stay repairable in the UI."""
+    base = {
+        "status": "ready",
+        "model": {"identifier": "m", "weight_identifier": "w", "status": "ready"},
+        "checkpoint": {"kind": "registered", "exists": True},
+        "issues": [],
+        "recommendations": ["Pick another weight."],
+        "probe_deferred": True,
+        "timings_seconds": {"total": 0.01},
+    }
+    merged = provider_module.apply_model_probe(
+        base, None, error=RuntimeError("strict load failed")
+    )
+
+    assert merged["status"] == "blocked"
+    assert any("strict load failed" in issue for issue in merged["issues"])
+    # The interface can repair this, so it must not be a dead end.
+    assert merged["model"]["status"] == "selection_required"
+    # Recommendations are deduplicated but preserved.
+    assert merged["recommendations"] == ["Pick another weight."]
+
+
+def test_the_launch_command_defers_and_then_reports_the_model_probe() -> None:
+    """Pin the launch wiring: the probe runs alongside the UI, never before it.
+
+    The contract is (1) readiness is requested with ``probe=False``, (2) the
+    probe is started before that call so both overlap, and (3) its result is
+    merged into the report that gates the launch.
+    """
+    source = (REPOSITORY_ROOT / "src" / "symmetry_harness" / "cli.py").read_text(
+        encoding="utf-8"
+    )
+    launch_block = source.split('if arguments.command == "launch":', 1)[1]
+    launch_block = launch_block.split('if arguments.command == "validate-traditional":', 1)[0]
+
+    assert "doctor(config, require_ui=True, probe=False)" in launch_block
+    assert "executor.submit(probe_model, config)" in launch_block
+    assert "apply_model_probe(" in launch_block
+    # The probe must be submitted before the blocking readiness call starts.
+    assert launch_block.index("executor.submit(probe_model, config)") < launch_block.index(
+        "doctor(config, require_ui=True, probe=False)"
+    )
+
+
 def test_repository_contains_no_cjk_text() -> None:
     violations = []
     for path in REPOSITORY_ROOT.rglob("*"):
@@ -1328,18 +1464,45 @@ def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> Non
     readiness = {
         "status": "ready",
         "environment": {"capabilities": _capabilities()},
-        "model": {"identifier": "cnn_8ch_pg17", "probe": {}},
+        "model": {
+            "identifier": "cnn_8ch_pg17",
+            "weight_identifier": "pg17-symmetry-v1",
+            "status": "selection_required",
+            "probe": None,
+        },
         "checkpoint": {},
         "issues": [],
         "recommendations": [],
+        "probe_deferred": True,
         "timings_seconds": {"total": 0.01},
     }
-    calls = {"doctor": 0, "inspect": 0, "launch": 0}
+    calls = {"doctor": 0, "inspect": 0, "launch": 0, "probe": 0}
 
-    def fake_doctor(config, *, require_ui=False):
+    def fake_doctor(config, *, require_ui=False, probe=True):
         calls["doctor"] += 1
         assert require_ui is True
+        # The launcher must ask for the deferred probe; the strict load happens
+        # alongside it, not inside this call.
+        assert probe is False
         return readiness
+
+    def fake_probe_model(config):
+        calls["probe"] += 1
+        return {
+            "provider_contract_version": PROVIDER_CONTRACT_VERSION,
+            "provider": "symmetry-learn",
+            "identifier": "cnn_8ch_pg17",
+            "details": {
+                "checkpoint": {
+                    "path": "/models/pg17-symmetry-v1.pth",
+                    "sha256": "c" * 64,
+                    "strict_load": True,
+                    "weight_identifier": "pg17-symmetry-v1",
+                    "source": "bundled",
+                    "bundled": True,
+                }
+            },
+        }
 
     image = np.zeros((96, 96), dtype=np.float32)
     input_record = {
@@ -1366,6 +1529,7 @@ def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> Non
         kwargs["on_ready"]("http://127.0.0.1:54321")
 
     monkeypatch.setattr(cli, "doctor", fake_doctor)
+    monkeypatch.setattr(cli, "probe_model", fake_probe_model)
     monkeypatch.setattr(cli, "inspect_input", fake_inspect)
     monkeypatch.setattr(ui_module, "launch_ui", fake_launch_ui)
     arguments = cli._parser().parse_args(
@@ -1381,11 +1545,124 @@ def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> Non
 
     assert cli._execute(arguments) is None
     payload = json.loads(capsys.readouterr().out)
-    assert calls == {"doctor": 1, "inspect": 1, "launch": 1}
+    assert calls == {"doctor": 1, "inspect": 1, "launch": 1, "probe": 1}
     assert payload["status"] == "ready"
     assert payload["url"] == "http://127.0.0.1:54321"
     assert payload["input"]["sha256"] == "b" * 64
     assert payload["timings_seconds"]["total"] >= 0
+    # The deferred result is reported, not silently dropped.
+    assert payload["model_probe"]["status"] == "ready"
+    assert payload["model_probe"]["issues"] == []
+
+
+def test_launch_reports_a_failed_probe_but_still_opens_the_interface(
+    monkeypatch, capsys
+) -> None:
+    """An unusable weight is repairable in the UI, so it must not withhold it."""
+    config_path = REPOSITORY_ROOT / "configs" / "config.example.json"
+    readiness = {
+        "status": "ready",
+        "environment": {"capabilities": _capabilities()},
+        "model": {
+            "identifier": "cnn_8ch_pg17",
+            "weight_identifier": "pg17-symmetry-v1",
+            "status": "selection_required",
+            "probe": None,
+        },
+        "checkpoint": {"kind": "registered", "exists": True},
+        "issues": [],
+        "recommendations": ["Pick another weight."],
+        "probe_deferred": True,
+        "timings_seconds": {"total": 0.01},
+    }
+
+    monkeypatch.setattr(
+        cli,
+        "doctor",
+        lambda config, *, require_ui=False, probe=True: readiness,
+    )
+
+    def fake_probe_model(config):
+        raise RuntimeError("strict load failed")
+
+    monkeypatch.setattr(cli, "probe_model", fake_probe_model)
+
+    def fake_launch_ui(config, **kwargs):
+        kwargs["on_ready"]("http://127.0.0.1:54323")
+
+    monkeypatch.setattr(ui_module, "launch_ui", fake_launch_ui)
+    arguments = cli._parser().parse_args(
+        ["launch", "--config", str(config_path), "--no-inbrowser"]
+    )
+
+    assert cli._execute(arguments) is None
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "ready"
+    assert payload["url"] == "http://127.0.0.1:54323"
+    assert payload["model_probe"]["status"] == "selection_required"
+    assert any("strict load failed" in issue for issue in payload["model_probe"]["issues"])
+
+
+def test_launch_still_blocks_on_a_non_probe_failure(monkeypatch, capsys) -> None:
+    """Deferring the probe must not turn a real blocker into a silent launch."""
+    config_path = REPOSITORY_ROOT / "configs" / "config.example.json"
+    readiness = {
+        "status": "blocked",
+        "environment": {"capabilities": _capabilities()},
+        "model": {
+            "identifier": "cnn_8ch_pg17",
+            "weight_identifier": None,
+            "status": "blocked",
+            "probe": None,
+        },
+        "checkpoint": {},
+        "issues": ["Gradio is required for the local annotation interface."],
+        "recommendations": ["Install the UI extra."],
+        "probe_deferred": True,
+        "timings_seconds": {"total": 0.01},
+    }
+
+    monkeypatch.setattr(
+        cli,
+        "doctor",
+        lambda config, *, require_ui=False, probe=True: readiness,
+    )
+    # A successful probe must not be able to clear an unrelated blocker, so the
+    # probe is stubbed to succeed and the Gradio issue has to survive it.
+    monkeypatch.setattr(
+        cli,
+        "probe_model",
+        lambda config: {
+            "provider_contract_version": PROVIDER_CONTRACT_VERSION,
+            "provider": "symmetry-learn",
+            "identifier": "cnn_8ch_pg17",
+            "details": {
+                "checkpoint": {
+                    "path": "/models/pg17-symmetry-v1.pth",
+                    "sha256": "c" * 64,
+                    "strict_load": True,
+                    "weight_identifier": "pg17-symmetry-v1",
+                    "source": "bundled",
+                    "bundled": True,
+                }
+            },
+        },
+    )
+    launched = {"count": 0}
+
+    def fake_launch_ui(config, **kwargs):  # pragma: no cover - must not run
+        launched["count"] += 1
+
+    monkeypatch.setattr(ui_module, "launch_ui", fake_launch_ui)
+    arguments = cli._parser().parse_args(
+        ["launch", "--config", str(config_path), "--no-inbrowser"]
+    )
+
+    result = cli._execute(arguments)
+    capsys.readouterr()
+    assert launched["count"] == 0
+    assert result is not None and result["status"] == "blocked"
+    assert result["phase"] == "doctor"
 
 
 def test_launch_without_input_waits_for_gradio_selection(monkeypatch, capsys) -> None:
@@ -1396,17 +1673,20 @@ def test_launch_without_input_waits_for_gradio_selection(monkeypatch, capsys) ->
         "model": {
             "identifier": "cnn_8ch_pg17",
             "weight_identifier": "pg17-symmetry-v1",
-            "probe": {},
+            "status": "selection_required",
+            "probe": None,
         },
         "checkpoint": {},
         "issues": [],
         "recommendations": [],
+        "probe_deferred": True,
         "timings_seconds": {"total": 0.01},
     }
 
     monkeypatch.setattr(
-        cli, "doctor", lambda config, *, require_ui=False: readiness
+        cli, "doctor", lambda config, *, require_ui=False, probe=True: readiness
     )
+    monkeypatch.setattr(cli, "probe_model", lambda config: {"details": {}})
 
     def fake_launch_ui(config, **kwargs):
         assert kwargs["prepared_input"] is None

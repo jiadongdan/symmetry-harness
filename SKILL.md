@@ -77,6 +77,19 @@ which commonly takes one to two minutes where `import torch` is slow and is much
 faster where it is cheap. Silence is not failure: while the launched process is
 alive, keep reading and do not restart the launcher or report `blocked`.
 
+The strict model probe starts a second Provider process and is overlapped with
+UI construction instead of being paid first, so the ready JSON arrives as soon
+as the interface is up. The payload reports the outcome under `model_probe`:
+
+```json
+"model_probe": {"status": "ready", "issues": [], "recommendations": []}
+```
+
+Any status other than `ready` means the configured weight could not be strictly
+loaded. The interface still opened, because the user can select another weight
+there, so report the issue and do not treat it as a launch failure. Do not run
+`doctor` yourself to re-check it; the payload already carries the answer.
+
 ## Traditional ML Validation (explicit request only)
 
 This is a separate page, not a normal workspace. Launch it only when the user

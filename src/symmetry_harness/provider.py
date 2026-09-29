@@ -1128,8 +1128,25 @@ def run_provider_prediction_batch(
     return ProviderPredictionBatch(summary=summary)
 
 
-def doctor(config: HarnessConfig, *, require_ui: bool = False) -> dict[str, Any]:
-    """Check Provider, selected weight, device, and optional UI readiness."""
+def doctor(
+    config: HarnessConfig,
+    *,
+    require_ui: bool = False,
+    probe: bool = True,
+) -> dict[str, Any]:
+    """Check Provider, selected weight, device, and optional UI readiness.
+
+    ``probe`` controls the strict model-weight load. The probe is the single
+    most expensive readiness step -- it starts a fresh Provider process that has
+    to import its numerical runtime -- and the launcher can overlap it with UI
+    construction instead of paying it up front. Pass ``probe=False`` to get an
+    answer in milliseconds; the caller is then responsible for calling
+    :func:`probe_model` and merging the result with :func:`apply_model_probe`.
+    An interactive launch may legitimately defer the probe, because the
+    interface lets the user repair an unusable weight. Non-interactive callers
+    (``doctor``, the installer) must keep the default so a blocked runtime is
+    still reported as blocked.
+    """
     total_started = perf_counter()
     timings: dict[str, float] = {}
     issues: list[str] = []
@@ -1253,12 +1270,12 @@ def doctor(config: HarnessConfig, *, require_ui: bool = False) -> dict[str, Any]
             )
     timings["checkpoint_sha256"] = round(perf_counter() - checkpoint_started, 6)
 
-    probe: dict[str, Any] | None = None
+    probe_result: dict[str, Any] | None = None
     probe_started = perf_counter()
-    if not issues and selected_weight_ready:
+    if probe and not issues and selected_weight_ready:
         try:
-            probe = probe_model(config)
-            resolved = dict(probe.get("details", {}).get("checkpoint", {}))
+            probe_result = probe_model(config)
+            resolved = dict(probe_result.get("details", {}).get("checkpoint", {}))
             if resolved:
                 checkpoint_record.update(
                     {
@@ -1312,10 +1329,76 @@ def doctor(config: HarnessConfig, *, require_ui: bool = False) -> dict[str, Any]
             "identifier": config.model.identifier,
             "weight_identifier": checkpoint_record.get("weight_identifier"),
             "status": model_status,
-            "probe": probe,
+            "probe": probe_result,
         },
         "checkpoint": checkpoint_record,
         "issues": issues,
         "recommendations": list(dict.fromkeys(recommendations)),
+        "probe_deferred": not probe,
         "timings_seconds": timings,
     }
+
+
+def apply_model_probe(
+    readiness: dict[str, Any],
+    probe: dict[str, Any] | None,
+    *,
+    error: Exception | None = None,
+) -> dict[str, Any]:
+    """Merge a deferred :func:`probe_model` result into a readiness report.
+
+    Returns a new report; the input is not mutated. This exists so a launcher can
+    answer "is the runtime usable?" quickly, print the URL, and then fold in the
+    strict weight load once it finishes -- without a second, differently-shaped
+    readiness code path that could drift from :func:`doctor`.
+    """
+    merged = dict(readiness)
+    merged["model"] = dict(readiness.get("model", {}))
+    merged["checkpoint"] = dict(readiness.get("checkpoint", {}))
+    merged["issues"] = list(readiness.get("issues", []))
+    merged["recommendations"] = list(readiness.get("recommendations", []))
+    merged["timings_seconds"] = dict(readiness.get("timings_seconds", {}))
+    merged["probe_deferred"] = False
+    merged["model"]["probe"] = probe
+
+    if error is not None:
+        merged["issues"].append(f"Provider model probe failed: {error}")
+    elif probe is not None:
+        resolved = dict(probe.get("details", {}).get("checkpoint", {}))
+        if resolved:
+            merged["checkpoint"].update(
+                {
+                    "path": resolved.get("path"),
+                    "actual_sha256": resolved.get("sha256"),
+                    "weight_identifier": resolved.get("weight_identifier"),
+                    "source": resolved.get("source"),
+                    "bundled": bool(resolved.get("bundled", False)),
+                    "strict_load": bool(resolved.get("strict_load", False)),
+                    "exists": True,
+                }
+            )
+            merged["model"]["weight_identifier"] = (
+                resolved.get("weight_identifier")
+                or merged["model"].get("weight_identifier")
+            )
+
+    if merged["issues"]:
+        merged["status"] = "blocked"
+    else:
+        merged["status"] = "ready"
+
+    # ``selection_required`` means exactly one thing: the strict weight load this
+    # call was given failed, and the user can fix it by picking another weight in
+    # the interface. It must not be inferred from "some issue exists" -- a
+    # missing Gradio or an incompatible Provider would then be waved through as
+    # if it were a repairable weight problem. Callers use this field to decide
+    # whether to withhold the interface, so conflating the two would open a
+    # broken UI instead of reporting the real blocker.
+    if error is not None:
+        merged["model"]["status"] = "selection_required"
+    elif merged["issues"]:
+        merged["model"]["status"] = "blocked"
+    else:
+        merged["model"]["status"] = "ready"
+    merged["recommendations"] = list(dict.fromkeys(merged["recommendations"]))
+    return merged
