@@ -629,6 +629,12 @@ def build_traditional_app(
                     type="numpy",
                     format="png",
                     interactive=True,
+                    # Only file upload is meaningful here: the source image is
+                    # chosen earlier, and this canvas receives patch clicks. The
+                    # default also offers a webcam and a clipboard paste, neither
+                    # of which has a coherent meaning for a click-to-annotate
+                    # canvas.
+                    sources=["upload"],
                     buttons=["fullscreen"],
                     value=initial_annotation,
                     height=720,
@@ -640,6 +646,7 @@ def build_traditional_app(
                     type="numpy",
                     interactive=False,
                     height=260,
+                    buttons=["fullscreen"],
                 )
                 support_table = gr.Dataframe(
                     headers=["Class", "Count", "Source coordinates (x, y)"],
@@ -679,17 +686,22 @@ def build_traditional_app(
         gr.Markdown(f"## {SECTION_TITLES[8]}")
         with gr.Row():
             prediction_overlay = gr.Image(
-                label="Prediction overlay", type="numpy", interactive=False
+                label="Prediction overlay",
+                type="numpy",
+                interactive=False,
+                buttons=["fullscreen"],
             )
             confidence_image = gr.Image(
                 label="Confidence — maximum class probability",
                 type="numpy",
                 interactive=False,
+                buttons=["fullscreen"],
             )
             entropy_image = gr.Image(
                 label="Predictive entropy — higher means more ambiguous",
                 type="numpy",
                 interactive=False,
+                buttons=["fullscreen"],
             )
         result_json = gr.JSON(label="Run summary")
         summary_table = gr.Dataframe(

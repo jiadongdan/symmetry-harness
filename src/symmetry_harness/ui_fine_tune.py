@@ -1273,6 +1273,12 @@ def build_fine_tune_workspace(
                             type="numpy",
                             format="png",
                             interactive=True,
+                            # Only file upload is meaningful here: the source image
+                            # is chosen in stage 1, and this canvas receives
+                            # support-point clicks. The default also offers a
+                            # webcam and a clipboard paste, neither of which has a
+                            # coherent meaning for a click-to-annotate canvas.
+                            sources=["upload"],
                             buttons=["fullscreen"],
                             value=initial_annotation,
                             height=720,
@@ -1284,6 +1290,7 @@ def build_fine_tune_workspace(
                             type="numpy",
                             interactive=False,
                             height=260,
+                            buttons=["fullscreen"],
                         )
                         support_table = gr.Dataframe(
                             headers=["Class", "Count", "Source coordinates (x, y)"],
@@ -1374,18 +1381,21 @@ def build_fine_tune_workspace(
                             type="numpy",
                             interactive=False,
                             height=480,
+                            buttons=["fullscreen"],
                         )
                         confidence_image = gr.Image(
                             label="Confidence — maximum class probability (0 to 1)",
                             type="numpy",
                             interactive=False,
                             height=480,
+                            buttons=["fullscreen"],
                         )
                         entropy_image = gr.Image(
                             label="Predictive entropy — higher means more ambiguous (0 to ln N)",
                             type="numpy",
                             interactive=False,
                             height=480,
+                            buttons=["fullscreen"],
                         )
                     # The colour and alpha controls sit directly beneath the maps
                     # and above every result artefact, so a rerender happens next

@@ -206,6 +206,55 @@ def test_all_stage_blocks_are_present_before_prerequisites(config) -> None:
     assert buttons["Prepare selected export"]["interactive"] is False
 
 
+def test_no_image_offers_a_share_button(config) -> None:
+    """Every image must declare its toolbar explicitly.
+
+    Gradio's default toolbar is ``["download", "share", "fullscreen"]``. The
+    share button posts to Hugging Face Spaces Discussions, and this application
+    runs locally with ``share=False``, so clicking it always errors. It is
+    therefore never acceptable to let an image fall through to the default.
+
+    Downloads are intentionally not offered per-image either: the durable
+    artefacts are exported through the dedicated DownloadButtons.
+    """
+    pytest.importorskip("gradio")
+    app = _build_ft(config, _capabilities())
+    offenders = []
+    for component in _components(app):
+        if component.get("type") not in {"image", "gallery"}:
+            continue
+        props = component.get("props", {})
+        buttons = props.get("buttons")
+        if buttons is None or "share" in buttons:
+            offenders.append((props.get("label"), buttons))
+    assert offenders == []
+
+
+def test_only_the_annotation_canvas_accepts_input(config) -> None:
+    """The click-to-annotate canvas uploads files; nothing else takes input.
+
+    ``sources`` is inert on a non-interactive image, so this pins the other half
+    of the contract: the annotation canvas drops the webcam and clipboard
+    sources, which have no meaning for a click-to-annotate canvas.
+    """
+    pytest.importorskip("gradio")
+    app = _build_ft(config, _capabilities())
+    by_label = {
+        c["props"].get("label"): c["props"]
+        for c in _components(app)
+        if c.get("type") == "image"
+    }
+    annotation = by_label["Click support points"]
+    assert annotation["interactive"] is True
+    assert annotation["sources"] == ["upload"]
+    assert annotation["buttons"] == ["fullscreen"]
+
+    for label, props in by_label.items():
+        if label == "Click support points":
+            continue
+        assert props.get("interactive") is False, label
+
+
 def test_results_are_an_always_mounted_block_not_a_workflow_stage(config) -> None:
     """The results block stays mounted and folded, and is never a fifth stage.
 

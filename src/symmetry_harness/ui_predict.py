@@ -680,12 +680,14 @@ def build_prediction_workspace(
                         type="numpy",
                         interactive=False,
                         height=480,
+                        buttons=["fullscreen"],
                     )
                     result_overlay = gr.Image(
                         label="Prediction overlay",
                         type="numpy",
                         interactive=False,
                         height=480,
+                        buttons=["fullscreen"],
                     )
                 with gr.Row():
                     result_confidence = gr.Image(
@@ -693,12 +695,14 @@ def build_prediction_workspace(
                         type="numpy",
                         interactive=False,
                         height=480,
+                        buttons=["fullscreen"],
                     )
                     result_entropy = gr.Image(
                         label="Predictive entropy (fixed 0-ln(N) colorbar)",
                         type="numpy",
                         interactive=False,
                         height=480,
+                        buttons=["fullscreen"],
                     )
             with gr.Column(scale=1, min_width=260):
                 presentation_message = gr.Markdown("")
