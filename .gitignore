@@ -8,3 +8,7 @@ dist/
 symmetry-harness.json
 symmetry-runs/
 
+# Local agent workspace: memory notes and scratch state. Never a deliverable.
+.workbuddy/
+.pytest_tmp/
+
