@@ -81,8 +81,34 @@ from .ui_shared import (
     INVALID_SUPPORT_POINT_MESSAGE,
     class_statistics_html,
     progress_bar_html,
+    results_placeholder_html,
 )
 from .workflow import build_run_options, run_analysis
+
+# The results block is mounted for the whole session, so its empty state is
+# normal UI rather than an error condition. The two empty wordings are distinct
+# on purpose: losing a result to a settings change and never having run at all
+# are different situations, and the first one needs to say so or the user is left
+# wondering where their maps went.
+AWAITING_RESULTS_MESSAGE = (
+    "No prediction results yet. After you run “Fine-tune and predict”, the "
+    "prediction overlay, the confidence map and the predictive entropy map will "
+    "appear here."
+)
+INVALIDATED_RESULTS_MESSAGE = (
+    "The previous result was cleared because a model, image or run setting "
+    "changed. It is still on disk in its run directory. Run “Fine-tune and "
+    "predict” again to produce a new one."
+)
+# Shown between "the Provider finished predicting" and "the maps are ready". The
+# Harness still renders overlays, statistics and downloads in this window, so the
+# user is waiting on the interface rather than on the model. Clipped to a
+# fragment on purpose: this whole string becomes an accordion label.
+RESULTS_RENDERING_MESSAGE = "Rendering prediction results…"
+RESULTS_FAILED_MESSAGE = (
+    "The run did not finish, so there are no results to show. The error is "
+    "reported above; adjust the settings or inputs and run again."
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1019,8 +1045,23 @@ def build_fine_tune_workspace(
     # between refreshes is preserved).
     last_stage = gr.State(None)
 
-    def _cleared_result_updates() -> tuple[Any, ...]:
-        """Every result-derived output, hidden and cleared (no stale downloads)."""
+    def _cleared_result_updates(*, invalidated: bool = False) -> tuple[Any, ...]:
+        """Every result-derived output, emptied (no stale downloads).
+
+        ``results_group`` is the always-mounted "Prediction results" block. It is
+        never hidden: it holds either a placeholder notice or the maps, so the
+        user can always see where results will appear. Because it never
+        disappears, its *wording* carries the state, which is why this helper
+        needs to know whether the call is discarding a real result
+        (``invalidated=True``, e.g. a run setting changed) or merely establishing
+        an empty block (``invalidated=False``, e.g. switching the base model
+        before anything has run).
+
+        ``RESULT_OUTPUTS`` in ``build_fine_tune_workspace`` must stay in the same
+        order; ``test_result_outputs_match_the_cleared_update_contract`` pins the
+        correspondence so a mismatch fails loudly instead of silently writing a
+        value into the wrong component.
+        """
         return (
             None,  # prediction_overlay
             None,  # confidence_image
@@ -1034,7 +1075,18 @@ def build_fine_tune_workspace(
             DEFAULT_OVERLAY_ALPHA,  # alpha_slider
             gr.update(value=None, visible=False),  # result_exports_files
             None,  # result_json
-            gr.update(visible=False),  # results_group
+            gr.update(
+                visible=True,
+                open=False,
+                value=results_placeholder_html(
+                    INVALIDATED_RESULTS_MESSAGE
+                    if invalidated
+                    else AWAITING_RESULTS_MESSAGE
+                ),
+            ),  # results_group
+            results_placeholder_html(
+                INVALIDATED_RESULTS_MESSAGE if invalidated else AWAITING_RESULTS_MESSAGE
+            ),  # results_status
             PresentationState(),  # presentation_state
         )
 
@@ -1289,8 +1341,33 @@ def build_fine_tune_workspace(
                     progress_bar_html("Prediction", 0, 1, "Waiting for fine-tuning.")
                 )
 
-                with gr.Column(visible=False) as results_group:
-                    gr.Markdown("### Prediction results")
+                # An always-mounted block, not a hidden column and not a
+                # revealed-on-completion panel. Two problems are solved by
+                # keeping it mounted:
+                #
+                # 1. the user can always see *where* results will appear, so a
+                #    run in progress has a destination on screen;
+                # 2. it survives the collapse of stage 4 above it, so the block
+                #    is still reachable when the user folds the stage they were
+                #    working in -- the stage-4 progress bars are not.
+                #
+                # It holds three states, and only the *content* changes between
+                # them: `results_status` carries the empty and rendering
+                # wordings, and the map widgets below carry the finished result.
+                # Its label is deliberately static; Gradio component labels
+                # cannot be pushed through an update, so any dynamic hint lives
+                # in `results_status` (and mirrors onto the label while the run
+                # handler still has it in scope -- see `on_run`).
+                #
+                # This is a local presentation block and must never become a
+                # workflow stage: `_stage_visibility` and `_current_stage` do not
+                # know about it.
+                with gr.Accordion(
+                    "Prediction results", open=False, visible=True
+                ) as results_group:
+                    results_status = gr.HTML(
+                        results_placeholder_html(AWAITING_RESULTS_MESSAGE)
+                    )
                     with gr.Row():
                         prediction_overlay = gr.Image(
                             label="Prediction overlay (class legend below)",
@@ -1381,6 +1458,7 @@ def build_fine_tune_workspace(
         result_exports_files,
         result_json,
         results_group,
+        results_status,
         presentation_state,
     ]
     REFRESH_INPUTS = [
@@ -1547,7 +1625,7 @@ def build_fine_tune_workspace(
         )
         snapshot["has_result"] = False
         return (
-            *_cleared_result_updates(),
+            *_cleared_result_updates(invalidated=True),
             "Run settings changed; any previous result and downloads were cleared.",
             *_refresh_updates(snapshot, announced_stage),
         )
@@ -1609,7 +1687,7 @@ def build_fine_tune_workspace(
                 config.fine_tuning.learning_rate,  # learning_rate
                 config.prediction.stride,  # stride
                 config.prediction.batch_size,  # batch_size
-                *_cleared_result_updates(),
+                *_cleared_result_updates(invalidated=True),
                 failure,  # status
             )
 
@@ -1683,7 +1761,7 @@ def build_fine_tune_workspace(
             float(defaults.get("learning_rate", contract.fine_tuning.learning_rate)),  # learning_rate
             int(defaults.get("stride", contract.prediction.stride)),  # stride
             int(defaults.get("batch_size", contract.prediction.batch_size)),  # batch_size
-            *_cleared_result_updates(),
+            *_cleared_result_updates(invalidated=True),
             status_text,  # status
         )
 
@@ -1824,7 +1902,7 @@ def build_fine_tune_workspace(
                 gr.update(value=None, visible=False),
                 gr.update(value=None, visible=False),
                 gr.update(interactive=False),
-                *_cleared_result_updates(),
+                *_cleared_result_updates(invalidated=True),
             )
         return (
             annotated,
@@ -1845,7 +1923,7 @@ def build_fine_tune_workspace(
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
             gr.update(interactive=True),
-            *_cleared_result_updates(),
+            *_cleared_result_updates(invalidated=True),
         )
 
     input_file.change(
@@ -1878,8 +1956,15 @@ def build_fine_tune_workspace(
             message,
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
-            *_cleared_result_updates(),
+            *_cleared_result_updates(invalidated=True),
         )
+
+    # Stage 3 support-point edits do NOT invalidate a result: the numerical
+    # result, the .symmodel package and the run directory stay exactly as they
+    # were trained. What is now stale is the *support summary versus the
+    # result's training inputs*, which is a different statement from "your
+    # result is gone". So these handlers keep the neutral wording rather than
+    # claiming an invalidation that never happened.
 
     symmetry_patch_size.change(
         on_feature_setting_change,
@@ -2011,7 +2096,7 @@ def build_fine_tune_workspace(
             feature_message,
             gr.update(value=None, visible=False),
             gr.update(value=None, visible=False),
-            *_cleared_result_updates(),
+            *_cleared_result_updates(invalidated=True),
             *_refresh_updates(snapshot, announced_stage),
         )
 
@@ -2411,13 +2496,40 @@ def build_fine_tune_workspace(
                 fine_html = progress_bar_html("Fine-tuning", 0, 1, "Run failed.")
                 prediction_html = progress_bar_html("Prediction", 0, 1, "Run failed.")
                 yield (
-                    *[gr.skip()] * (len(RESULT_OUTPUTS) + 1),
+                    *[gr.skip()] * (len(RESULT_OUTPUTS) - 3),
+                    gr.update(label=RESULTS_FAILED_MESSAGE),  # results_group
+                    results_placeholder_html(RESULTS_FAILED_MESSAGE),  # results_status
+                    gr.skip(),  # presentation_state
+                    gr.skip(),  # status
                     fine_html,
                     prediction_html,
                 )
                 raise payload
             elif event == "result":
                 result = payload
+
+        # The Provider has finished, but the interface has not: the result still
+        # has to be loaded from disk, rendered into three maps and summarized
+        # into per-class statistics, and that work happens with no progress
+        # events of its own. Announce it before starting, so "Prediction
+        # complete." is never the last thing on screen while the page is in fact
+        # still working. The status also mirrors onto the block label, which is
+        # the only way to reach a user who collapsed the stage-4 accordion.
+        yield (
+            *[gr.skip()] * (len(RESULT_OUTPUTS) - 3),
+            gr.update(
+                visible=True,
+                open=True,
+                label=RESULTS_RENDERING_MESSAGE,
+            ),  # results_group
+            results_placeholder_html(RESULTS_RENDERING_MESSAGE),  # results_status
+            gr.skip(),  # presentation_state
+            "Prediction complete. Rendering result maps…",  # status
+            progress_bar_html(
+                "Fine-tuning", resolved_epochs, resolved_epochs, "Fine-tuning complete."
+            ),
+            progress_bar_html("Prediction", 1, 1, "Prediction complete."),
+        )
 
         reference = {
             "run_id": str(result["run_id"]),
@@ -2505,7 +2617,10 @@ def build_fine_tune_workspace(
             DEFAULT_OVERLAY_ALPHA,  # alpha_slider
             gr.update(value=None, visible=False),  # result_exports_files
             result,  # result_json
-            gr.update(visible=True),  # results_group
+            gr.update(
+                visible=True, open=True, label="Prediction results"
+            ),  # results_group
+            "",  # results_status (the maps replace the placeholder wording)
             presentation,  # presentation_state
             message,  # status
             fine_html,

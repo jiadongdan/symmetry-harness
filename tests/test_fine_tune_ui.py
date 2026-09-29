@@ -10,6 +10,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import tempfile
 
 import numpy as np
 from PIL import Image
@@ -205,12 +206,383 @@ def test_all_stage_blocks_are_present_before_prerequisites(config) -> None:
     assert buttons["Prepare selected export"]["interactive"] is False
 
 
+def test_results_are_an_always_mounted_block_not_a_workflow_stage(config) -> None:
+    """The results block stays mounted and folded, and is never a fifth stage.
+
+    It must be present before any run: that is what gives an in-progress run a
+    visible destination and what keeps the block reachable when the user folds
+    stage 4. It must also stay out of the stage protocol -- every stage header is
+    revealed by ``_stage_visibility`` and opened by ``_current_stage``, and this
+    local block must be neither.
+    """
+    pytest.importorskip("gradio")
+    app = _build_ft(config, _capabilities())
+    accordions = {c["props"].get("label"): c["props"] for c in _by_type(app, "accordion")}
+
+    results = accordions["Prediction results"]
+    assert results["visible"] is True
+    assert results["open"] is False
+    assert "Prediction results" not in STAGE_LABELS
+    assert "Prediction results" not in _stage_visibility({"image_valid": True})
+
+
+def test_results_block_starts_with_the_awaiting_placeholder(config) -> None:
+    """Before any run the block explains what will appear, in place."""
+    pytest.importorskip("gradio")
+    app = _build_ft(config, _capabilities())
+    running = [
+        c["props"].get("value", "")
+        for c in _by_type(app, "html")
+        if isinstance(c["props"].get("value"), str)
+        and "results-placeholder" in c["props"].get("value", "")
+    ]
+    assert len(running) == 1, running
+    assert ft.AWAITING_RESULTS_MESSAGE in running[0]
+
+
+def test_completed_run_opens_and_unhides_the_result_block(config, monkeypatch) -> None:
+    """A finished run must both reveal the block and unfold it.
+
+    Reopening matters because the user may have folded the block while waiting:
+    pushing ``open=True`` with the result is what makes the revealed block
+    actually show the maps instead of a bare header.
+    """
+    pytest.importorskip("gradio")
+    app = _build_ft(config, _capabilities())
+    block_fn = _handler(app, "on_run")
+
+    # The support-point validation rejects an image smaller than the classifier
+    # patch, so this fixture has to be comfortably larger than one patch.
+    size = max(config.model.classifier_patch_size * 2, 128)
+    run_dir, reference = _make_run(Path(tempfile.mkdtemp()))
+    result = {
+        "run_id": "symmetry-run",
+        "run_directory": str(run_dir),
+        "prediction": reference["prediction"],
+        "input_array": reference["input_array"],
+        "input_preview": reference["input_preview"],
+        "fine_tuned_model": reference["fine_tuned_model"],
+        "full_run_zip": reference["full_run_zip"],
+        "stride": "4",
+        "classes": [
+            {"index": 0, "name": "Class A", "color": CLASS_COLORS[0]},
+            {"index": 1, "name": "Class B", "color": CLASS_COLORS[1]},
+        ],
+        "warnings": [],
+    }
+
+    def _fake_run_analysis(*_args, progress_callback=None, **_kwargs):
+        if progress_callback is not None:
+            progress_callback("fine_tuning", 1, 1)
+            progress_callback("prediction", 1, 1)
+        return result
+
+    monkeypatch.setattr(ft, "run_analysis", _fake_run_analysis)
+    image = np.linspace(0.0, 1.0, size * size, dtype=np.float32).reshape(size, size)
+    source = run_dir / "source.npy"
+    np.save(source, image)
+    # Both support points need a full patch around them, so they stay well clear
+    # of the border.
+    margin = config.model.classifier_patch_size // 2 + 1
+    state = {
+        "image": image,
+        "image_path": str(source),
+        "image_sha256": "a" * 64,
+        "normalized_image_sha256": "b" * 64,
+        "image_shape": [size, size],
+        "class_names": ["Class A", "Class B"],
+        "colors": CLASS_COLORS,
+        "points": [
+            [(margin, margin)],
+            [(size - margin, size - margin)],
+        ],
+        "classifier_patch_size": config.model.classifier_patch_size,
+    }
+    _, _, _, cache_key = ft._feature_request(
+        config,
+        _capabilities(),
+        state,
+        model_identifier="cnn_8ch_pg17",
+        symmetry_patch_size=51,
+        device="cpu",
+    )
+    features_path = run_dir / "features.npz"
+    record_path = run_dir / "features.json"
+    np.savez_compressed(
+        features_path,
+        features=np.zeros((8, size, size), np.float32),
+        channel_names=np.array([f"ch{index}" for index in range(8)]),
+    )
+    record_path.write_text("{}", encoding="utf-8")
+    feature_state = {
+        "cache_key": cache_key,
+        "features_path": str(features_path),
+        "record_path": str(record_path),
+        "fingerprint": {},
+        "feature_shape": [8, size, size],
+    }
+
+    updates = list(
+        block_fn.fn(
+            state,
+            feature_state,
+            "cnn_8ch_pg17",
+            None,
+            _capabilities(),
+            51,
+            1,
+            0.0005,
+            4,
+            512,
+            "cpu",
+        )
+    )
+    results_index = next(
+        index
+        for index, component in enumerate(block_fn.outputs)
+        if getattr(component, "label", None) == "Prediction results"
+    )
+    final = updates[-1]
+    assert final[results_index]["visible"] is True
+    assert final[results_index]["open"] is True
+    assert final[results_index]["label"] == "Prediction results"
+
+    # The maps replace the placeholder wording, and the block never disappears.
+    status_index = next(
+        index
+        for index, component in enumerate(block_fn.outputs)
+        if component is not None and component.__class__.__name__ == "HTML"
+        and getattr(component, "elem_id", None) is None
+        and index > results_index
+        and index < results_index + 3
+    )
+    assert final[status_index] == ""
+
+    # The Provider finishing is not the last thing the user sees: the run
+    # announces "rendering" before it starts loading and rendering, so a slow
+    # render never looks like a finished run.
+    rendering = [
+        update
+        for update in updates
+        if isinstance(update[results_index], dict)
+        and update[results_index].get("label") == ft.RESULTS_RENDERING_MESSAGE
+    ]
+    assert rendering, "on_run must announce result rendering before rendering"
+    assert rendering[-1][status_index] == ft.results_placeholder_html(
+        ft.RESULTS_RENDERING_MESSAGE
+    )
+
+
+def test_on_run_announces_rendering_before_loading_the_result(
+    config, monkeypatch
+) -> None:
+    """The rendering notice must precede the slow work, not follow it.
+
+    Ordering is the whole point: a notice emitted after ``load_fine_tune_result``
+    and ``render_result_variants`` would arrive at the same time as the result
+    and tell the user nothing.
+    """
+    pytest.importorskip("gradio")
+    app = _build_ft(config, _capabilities())
+    block_fn = _handler(app, "on_run")
+
+    size = max(config.model.classifier_patch_size * 2, 128)
+    run_dir, reference = _make_run(Path(tempfile.mkdtemp()))
+    result = {
+        "run_id": "symmetry-run",
+        "run_directory": str(run_dir),
+        "prediction": reference["prediction"],
+        "input_array": reference["input_array"],
+        "input_preview": reference["input_preview"],
+        "fine_tuned_model": reference["fine_tuned_model"],
+        "full_run_zip": reference["full_run_zip"],
+        "stride": "4",
+        "classes": [
+            {"index": 0, "name": "Class A", "color": CLASS_COLORS[0]},
+            {"index": 1, "name": "Class B", "color": CLASS_COLORS[1]},
+        ],
+        "warnings": [],
+    }
+
+    def _fake_run_analysis(*_args, progress_callback=None, **_kwargs):
+        if progress_callback is not None:
+            progress_callback("fine_tuning", 1, 1)
+            progress_callback("prediction", 1, 1)
+        return result
+
+    # Record the order in which announcements and the slow load happen.
+    order: list[str] = []
+    real_load = ft.load_fine_tune_result
+
+    def _spy_load(reference_arg):
+        order.append("load")
+        return real_load(reference_arg)
+
+    monkeypatch.setattr(ft, "run_analysis", _fake_run_analysis)
+    monkeypatch.setattr(ft, "load_fine_tune_result", _spy_load)
+
+    image = np.linspace(0.0, 1.0, size * size, dtype=np.float32).reshape(size, size)
+    source = run_dir / "source.npy"
+    np.save(source, image)
+    margin = config.model.classifier_patch_size // 2 + 1
+    state = {
+        "image": image,
+        "image_path": str(source),
+        "image_sha256": "a" * 64,
+        "normalized_image_sha256": "b" * 64,
+        "image_shape": [size, size],
+        "class_names": ["Class A", "Class B"],
+        "colors": CLASS_COLORS,
+        "points": [[(margin, margin)], [(size - margin, size - margin)]],
+        "classifier_patch_size": config.model.classifier_patch_size,
+    }
+    _, _, _, cache_key = ft._feature_request(
+        config,
+        _capabilities(),
+        state,
+        model_identifier="cnn_8ch_pg17",
+        symmetry_patch_size=51,
+        device="cpu",
+    )
+    features_path = run_dir / "features.npz"
+    record_path = run_dir / "features.json"
+    np.savez_compressed(
+        features_path,
+        features=np.zeros((8, size, size), np.float32),
+        channel_names=np.array([f"ch{index}" for index in range(8)]),
+    )
+    record_path.write_text("{}", encoding="utf-8")
+    feature_state = {
+        "cache_key": cache_key,
+        "features_path": str(features_path),
+        "record_path": str(record_path),
+        "fingerprint": {},
+        "feature_shape": [8, size, size],
+    }
+
+    results_index = next(
+        index
+        for index, component in enumerate(block_fn.outputs)
+        if getattr(component, "label", None) == "Prediction results"
+    )
+    for update in block_fn.fn(
+        state,
+        feature_state,
+        "cnn_8ch_pg17",
+        None,
+        _capabilities(),
+        51,
+        1,
+        0.0005,
+        4,
+        512,
+        "cpu",
+    ):
+        if (
+            isinstance(update[results_index], dict)
+            and update[results_index].get("label") == ft.RESULTS_RENDERING_MESSAGE
+        ):
+            order.append("announce")
+
+    assert order[:2] == ["announce", "load"], order
+    assert order.count("announce") == 1, order
+
+
+def test_clearing_a_result_keeps_the_block_mounted_and_explains_it(config) -> None:
+    """Clearing empties the block; it never removes it.
+
+    A user who has just lost a result to a settings change must be told that
+    explicitly -- otherwise the first-run wording ("no results yet") contradicts
+    the result they remember seeing.
+    """
+    pytest.importorskip("gradio")
+    app = _build_ft(config, _capabilities())
+    block_fn = _handler(app, "on_run_setting_change")
+    result = block_fn.fn(
+        {},
+        {},
+        "cnn_8ch_pg17",
+        None,
+        _capabilities(),
+        51,
+        0,
+        0.0005,
+        4,
+        512,
+        "cpu",
+        None,
+    )
+    results_index = next(
+        index
+        for index, component in enumerate(block_fn.outputs)
+        if getattr(component, "label", None) == "Prediction results"
+    )
+    assert result[results_index]["visible"] is True
+    assert result[results_index]["open"] is False
+    assert ft.INVALIDATED_RESULTS_MESSAGE in result[results_index]["value"]
+
+
+def test_result_outputs_match_the_cleared_update_contract(config) -> None:
+    """Guard the positional coupling between RESULT_OUTPUTS and its updater.
+
+    ``_cleared_result_updates`` returns a bare tuple that is splatted into the
+    outputs of roughly a dozen handlers. If the two fall out of step, Gradio
+    writes values into the wrong components and nothing raises -- the failure is
+    silent. This pins every entry by final value or by label, so a mismatch fails
+    loudly and says which slot moved.
+    """
+    pytest.importorskip("gradio")
+    app = _build_ft(config, _capabilities())
+    block_fn = _handler(app, "on_run_setting_change")
+
+    outputs = list(block_fn.outputs)
+    # Everything after RESULT_OUTPUTS is REFRESH_OUTPUTS plus status; the cleared
+    # tuple covers exactly the leading RESULT_OUTPUTS entries.
+    #
+    # The observable signature of the tuple, by slot label. Entries whose cleared
+    # value is None are identified by label/type instead.
+    observed = block_fn.fn(
+        {}, {}, "cnn_8ch_pg17", None, _capabilities(), 51, 0, 0.0005, 4, 512, "cpu", None
+    )
+    by_label = {
+        getattr(component, "label", None): observed[index]
+        for index, component in enumerate(outputs)
+    }
+
+    # Images are emptied.
+    for label in (
+        "Prediction overlay (class legend below)",
+        "Confidence — maximum class probability (0 to 1)",
+        "Predictive entropy — higher means more ambiguous (0 to ln N)",
+    ):
+        assert by_label[label] is None, label
+
+    # Downloads are cleared and hidden, not merely emptied.
+    for label in ("Download model (.symmodel)", "Download complete run (.zip)"):
+        assert by_label[label]["value"] is None
+        assert by_label[label]["visible"] is False
+
+    # Textual outputs reset.
+    assert by_label["Result class colors (#RRGGBB, comma-separated)"] == ""
+    assert by_label["Run directory"] == ""
+    assert by_label["Overlay alpha"] == ft.DEFAULT_OVERLAY_ALPHA
+    assert by_label["Run result"] is None
+    assert by_label["Prepared PNG exports"]["visible"] is False
+
+    # The block itself is emptied and folded, never hidden.
+    assert by_label["Prediction results"]["visible"] is True
+    assert by_label["Prediction results"]["open"] is False
+    assert ft.INVALIDATED_RESULTS_MESSAGE in by_label["Prediction results"]["value"]
+
+
 def test_result_controls_and_downloads_are_hidden_before_completion(config) -> None:
     pytest.importorskip("gradio")
     app = _build_ft(config, _capabilities())
     downloads = {
         c["props"].get("label"): c["props"] for c in _by_type(app, "downloadbutton")
     }
+
+    # The whole result block, downloads included, is absent until a run lands.
     assert downloads["Download model (.symmodel)"]["visible"] is False
     assert downloads["Download complete run (.zip)"]["visible"] is False
     # The result images start empty.
@@ -245,6 +617,7 @@ def test_advanced_sections_default_closed(config) -> None:
     for label in (
         "Advanced: custom checkpoint",
         "Advanced: training and prediction settings",
+        "Prediction results",
         "Technical details",
     ):
         assert accordions.get(label) is False

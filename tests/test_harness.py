@@ -80,6 +80,12 @@ TEXT_SUFFIXES = {
     ".yml",
 }
 TEXT_FILENAMES = {".gitattributes", ".gitignore", "LICENSE"}
+# Local, untracked working state that is not part of the shipped repository.
+# ``.workbuddy`` holds this agent's workspace memory, which is written in the
+# user's own language by design; ``.pytest_tmp`` is a scratch base directory some
+# invocations pass to ``--basetemp``. Scanning either one makes the shipped-text
+# guards report the developer's workspace rather than the repository.
+UNTRACKED_STATE_NAMES = {".workbuddy", ".pytest_tmp"}
 
 
 def _source_environment() -> dict[str, str]:
@@ -195,6 +201,8 @@ def test_repository_contains_no_cjk_text() -> None:
     violations = []
     for path in REPOSITORY_ROOT.rglob("*"):
         if ".git" in path.parts or not path.is_file():
+            continue
+        if UNTRACKED_STATE_NAMES.intersection(path.parts):
             continue
         if path.suffix.lower() not in TEXT_SUFFIXES and path.name not in TEXT_FILENAMES:
             continue

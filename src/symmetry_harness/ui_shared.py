@@ -79,6 +79,15 @@ APP_CSS = (
     "transition: width 0.15s ease;} "
     ".phase-progress-status {font-size: 13px; line-height: 18px; "
     "color: var(--body-text-color-subdued); margin-top: 4px;} "
+    # The results block is always mounted, so it needs a state of its own for
+    # "no result yet". A dashed border reads as an empty frame rather than as a
+    # box that failed to load, and it collapses to nothing once the maps land.
+    ".results-placeholder {min-height: 120px; display: flex; align-items: center; "
+    "justify-content: center; padding: 24px 16px; text-align: center; "
+    "border: 1px dashed var(--border-color-primary); "
+    "border-radius: var(--radius-lg); color: var(--body-text-color-subdued); "
+    "font-size: 14px; line-height: 20px; margin-bottom: 8px;} "
+    ".results-placeholder p {margin: 0; max-width: 46ch;} "
     # Sticky has to *not* be stretched: a full-height grid/flex item has no room
     # left to travel, so ``position: sticky`` silently degenerates to static and
     # the panel scrolls out of view. ``align-self: start`` works for both flex and
@@ -137,6 +146,19 @@ def progress_bar_html(label: str, current: int, total: int, status: str) -> str:
         f'<div class="phase-progress-fill" style="width: {percent}%"></div></div>'
         f'<div class="phase-progress-status">{escape(status)}</div></div>'
     )
+
+
+def results_placeholder_html(message: str) -> str:
+    """Render the empty state of the always-mounted results block.
+
+    The results block is present before any run has happened, so it needs a
+    state that reads as "the maps will appear here" rather than as an error or a
+    control that failed to render. Callers pass the wording, because the empty
+    state distinguishes "never run" from "run, then invalidated" -- a user who
+    just lost a result to a settings change needs to be told that, not shown a
+    first-run message.
+    """
+    return f'<div class="results-placeholder"><p>{escape(message)}</p></div>'
 
 
 def parse_class_names(value: str) -> list[str]:
