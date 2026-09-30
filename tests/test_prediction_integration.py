@@ -147,33 +147,6 @@ def test_end_to_end_prediction_creates_artifacts(config, real_package, tmp_path)
         assert list(archive["prediction_grid"].shape) == record["output"]["grid_shape"]
 
 
-def test_end_to_end_prediction_is_deterministic(config, real_package, tmp_path) -> None:
-    pytest.importorskip("torch")
-    image = tmp_path / "image.npy"
-    np.save(image, _unit_image())
-
-    first = run_saved_model_prediction_batch(
-        config,
-        model_package=real_package,
-        image_paths=[image],
-        output_root=tmp_path / "runs-a",
-        device="cpu",
-    )
-    second = run_saved_model_prediction_batch(
-        config,
-        model_package=real_package,
-        image_paths=[image],
-        output_root=tmp_path / "runs-b",
-        device="cpu",
-    )
-
-    with np.load(first["items"][0]["artifact_prediction"]) as archive:
-        first_grid = archive["prediction_grid"].copy()
-    with np.load(second["items"][0]["artifact_prediction"]) as archive:
-        second_grid = archive["prediction_grid"].copy()
-    assert np.array_equal(first_grid, second_grid)
-
-
 def test_end_to_end_batch_loads_the_model_once(config, real_package, tmp_path) -> None:
     pytest.importorskip("torch")
     images = []

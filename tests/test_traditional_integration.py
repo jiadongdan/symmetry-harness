@@ -69,13 +69,8 @@ def _unit_image(size: int = IMAGE_SIZE) -> np.ndarray:
     return ((values - values.min()) / np.ptp(values)).astype(np.float32)
 
 
-def _harness_config(tmp_path: Path, *, orphan_checkpoint: bool = False):
-    """Write a portable harness config that uses the running interpreter.
-
-    ``orphan_checkpoint`` points the model section at a checkpoint path that does
-    not exist and clears the registered weight, so a successful run proves the
-    traditional path resolved no pretrained checkpoint at all.
-    """
+def _harness_config(tmp_path: Path):
+    """Write a portable harness config that uses the running interpreter."""
     payload = json.loads(
         (REPOSITORY_ROOT / "configs" / "config.example.json").read_text(
             encoding="utf-8"
@@ -84,10 +79,6 @@ def _harness_config(tmp_path: Path, *, orphan_checkpoint: bool = False):
     payload["project_root"] = "."
     payload["output_root"] = "runs"
     payload["model"]["python_executable"] = sys.executable
-    if orphan_checkpoint:
-        payload["model"]["weight_identifier"] = None
-        payload["model"]["checkpoint_path"] = str(tmp_path / "unreachable.pt")
-        payload["model"]["checkpoint_sha256"] = None
     path = tmp_path / "harness_config.json"
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
     return load_harness_config(path)
@@ -116,24 +107,32 @@ def _assert_provider_is_ready(config) -> dict:
     return capabilities
 
 
-@pytest.fixture()
-def validation_setup(tmp_path):
-    """Return a ready-to-run traditional validation harness configuration."""
-    config = _harness_config(tmp_path)
+@pytest.fixture(scope="module")
+def validation_setup(tmp_path_factory):
+    """Return a ready-to-run traditional validation harness configuration.
+
+    Module-scoped on purpose: building the configuration pays for a real
+    ``compute_features`` Provider call (tens of seconds), and every test in this
+    module consumes the exact same prepared inputs read-only. Only the run
+    output directory differs per test, and that comes from the test's own
+    ``tmp_path`` (see :func:`_run`).
+    """
+    base = tmp_path_factory.mktemp("traditional-validation")
+    config = _harness_config(base)
     _assert_provider_is_ready(config)
 
     image = _unit_image()
-    image_path = tmp_path / "input.npy"
+    image_path = base / "input.npy"
     np.save(image_path, image)
 
     features = run_provider_features(config, image, options=dict(FEATURE_OPTIONS))
-    features_path = tmp_path / "features.npz"
+    features_path = base / "features.npz"
     np.savez_compressed(
         features_path,
         features=np.asarray(features.features, dtype=np.float32),
         channel_names=np.asarray(features.channel_names),
     )
-    features_record_path = tmp_path / "features_record.json"
+    features_record_path = base / "features_record.json"
     features_record_path.write_text(
         json.dumps(features.record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -157,11 +156,18 @@ def validation_setup(tmp_path):
         "features_record_path": features_record_path,
         "session": session,
         "settings": settings,
-        "tmp_path": tmp_path,
+        "base": base,
     }
 
 
-def _run(setup: dict, classifier: str, output_name: str, *, feature_mode: str):
+def _run(
+    setup: dict,
+    classifier: str,
+    output_name: str,
+    *,
+    feature_mode: str,
+    output_root: Path,
+):
     return run_traditional_validation(
         setup["config"],
         image_path=setup["image_path"],
@@ -171,7 +177,7 @@ def _run(setup: dict, classifier: str, output_name: str, *, feature_mode: str):
         settings=setup["settings"],
         features_path=setup["features_path"],
         features_record_path=setup["features_record_path"],
-        output_root=setup["tmp_path"] / output_name,
+        output_root=output_root,
     )
 
 
@@ -209,12 +215,15 @@ def _assert_completed_run(result: dict, classifier: str) -> dict:
     return record
 
 
-def test_logistic_regression_runs_through_the_real_provider(validation_setup) -> None:
+def test_logistic_regression_runs_through_the_real_provider(
+    validation_setup, tmp_path
+) -> None:
     result = _run(
         validation_setup,
         "logistic_regression",
         "runs-lr",
         feature_mode="image_plus_symmetry_maps",
+        output_root=tmp_path / "runs-lr",
     )
     record = _assert_completed_run(result, "logistic_regression")
     assert record["traditional_ml"]["feature_mode"] == "image_plus_symmetry_maps"
@@ -228,14 +237,40 @@ def test_logistic_regression_runs_through_the_real_provider(validation_setup) ->
     assert prediction_grid.size == int(np.prod(record["traditional_ml"]["grid_shape"]))
 
 
-def test_random_forest_runs_through_the_real_provider(validation_setup) -> None:
+def test_raw_image_mode_delegates_channel_zero(validation_setup, tmp_path) -> None:
     result = _run(
         validation_setup,
-        "random_forest",
-        "runs-rf",
-        feature_mode="image_plus_symmetry_maps",
+        "logistic_regression",
+        "runs-raw",
+        feature_mode="raw_image",
+        output_root=tmp_path / "runs-raw",
     )
-    record = _assert_completed_run(result, "random_forest")
+    record = _assert_completed_run(result, "logistic_regression")
+    assert record["traditional_ml"]["feature_mode"] == "raw_image"
+    assert record["traditional_ml"]["channel_count"] == 1
+
+
+def test_repeated_runs_with_one_seed_are_reproducible(
+    validation_setup, tmp_path
+) -> None:
+    first = _run(
+        validation_setup,
+        "random_forest",
+        "runs-rf-a",
+        feature_mode="image_plus_symmetry_maps",
+        output_root=tmp_path / "runs-rf-a",
+    )
+    second = _run(
+        validation_setup,
+        "random_forest",
+        "runs-rf-b",
+        feature_mode="image_plus_symmetry_maps",
+        output_root=tmp_path / "runs-rf-b",
+    )
+    # The first run also carries the random-forest parameter contract, so this
+    # single pair of runs covers both "the RF classifier runs for real" and
+    # "one seed makes it reproducible".
+    record = _assert_completed_run(first, "random_forest")
     parameters = record["traditional_ml"]["classifier"]["parameters"]
     assert parameters["n_jobs"] == 1
     assert parameters["n_estimators"] == 300
@@ -244,32 +279,6 @@ def test_random_forest_runs_through_the_real_provider(validation_setup) -> None:
     assert "random_state" not in parameters
     assert record["traditional_ml"]["seed"] == 42
 
-
-def test_raw_image_mode_delegates_channel_zero(validation_setup) -> None:
-    result = _run(
-        validation_setup,
-        "logistic_regression",
-        "runs-raw",
-        feature_mode="raw_image",
-    )
-    record = _assert_completed_run(result, "logistic_regression")
-    assert record["traditional_ml"]["feature_mode"] == "raw_image"
-    assert record["traditional_ml"]["channel_count"] == 1
-
-
-def test_repeated_runs_with_one_seed_are_reproducible(validation_setup) -> None:
-    first = _run(
-        validation_setup,
-        "random_forest",
-        "runs-rf-a",
-        feature_mode="image_plus_symmetry_maps",
-    )
-    second = _run(
-        validation_setup,
-        "random_forest",
-        "runs-rf-b",
-        feature_mode="image_plus_symmetry_maps",
-    )
     assert np.array_equal(_prediction_grid(first), _prediction_grid(second))
     with np.load(first["traditional_prediction"], allow_pickle=False) as archive:
         first_probabilities = np.asarray(archive["probabilities"])
@@ -282,73 +291,16 @@ def test_repeated_runs_with_one_seed_are_reproducible(validation_setup) -> None:
         "logistic_regression",
         "runs-lr-a",
         feature_mode="image_plus_symmetry_maps",
+        output_root=tmp_path / "runs-lr-a",
     )
     logistic_b = _run(
         validation_setup,
         "logistic_regression",
         "runs-lr-b",
         feature_mode="image_plus_symmetry_maps",
+        output_root=tmp_path / "runs-lr-b",
     )
     assert np.array_equal(_prediction_grid(logistic_a), _prediction_grid(logistic_b))
-
-
-def test_workflow_never_resolves_a_pretrained_checkpoint(tmp_path) -> None:
-    config = _harness_config(tmp_path, orphan_checkpoint=True)
-    assert config.model.checkpoint_path == (tmp_path / "unreachable.pt").resolve()
-    assert not config.model.checkpoint_path.exists()
-    _assert_provider_is_ready(config)
-
-    image = _unit_image()
-    image_path = tmp_path / "input.npy"
-    np.save(image_path, image)
-    features = run_provider_features(config, image, options=dict(FEATURE_OPTIONS))
-    features_path = tmp_path / "features.npz"
-    np.savez_compressed(
-        features_path,
-        features=np.asarray(features.features, dtype=np.float32),
-        channel_names=np.asarray(features.channel_names),
-    )
-    features_record_path = tmp_path / "features_record.json"
-    features_record_path.write_text(
-        json.dumps(features.record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    session = create_annotation_session(
-        image_path=str(image_path),
-        image_sha256=file_sha256(image_path),
-        image_shape=(image.shape[0], image.shape[1]),
-        classifier_patch_size=PATCH_SIZE,
-        class_names=CLASS_NAMES,
-        points_by_class=SUPPORT_POINTS,
-    )
-
-    result = run_traditional_validation(
-        config,
-        image_path=image_path,
-        annotation_session=session,
-        classifier="logistic_regression",
-        feature_mode="image_plus_symmetry_maps",
-        settings=TraditionalMLSettings(
-            classifier_patch_size=PATCH_SIZE, stride=STRIDE, batch_size=BATCH_SIZE
-        ),
-        features_path=features_path,
-        features_record_path=features_record_path,
-        output_root=tmp_path / "runs-orphan",
-    )
-    record = _assert_completed_run(result, "logistic_regression")
-    assert record["pretrained_checkpoint_accessed"] is False
-
-    provider_record = json.loads(
-        Path(result["provider_record"]).read_text(encoding="utf-8")
-    )
-    serialized = json.dumps(provider_record).lower()
-    for forbidden in ("checkpoint", "weight_identifier", "model_state", "adapter"):
-        assert forbidden not in serialized
-    checkpoint_like = [
-        artifact
-        for artifact in Path(result["run_directory"]).rglob("*")
-        if artifact.suffix in {".pt", ".pth", ".ckpt", ".symmodel"}
-    ]
-    assert checkpoint_like == []
 
 
 def test_headless_readiness_does_not_require_the_ui_extra(validation_setup) -> None:

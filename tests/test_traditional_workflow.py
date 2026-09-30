@@ -373,6 +373,21 @@ def test_completed_run_writes_every_artifact_and_archive_member(
     # The Provider job must never carry a weight, checkpoint, or model state.
     assert "checkpoint_path" not in captured
     assert "weight_identifier" not in captured
+
+    # ...and neither the provider record nor any emitted artifact may mention
+    # one. The traditional path resolves no pretrained checkpoint at all, so a
+    # run must never leave a checkpoint-like file behind.
+    serialized = json.dumps(
+        json.loads(Path(result["provider_record"]).read_text(encoding="utf-8"))
+    ).lower()
+    for forbidden in ("checkpoint", "weight_identifier", "model_state", "adapter"):
+        assert forbidden not in serialized
+    checkpoint_like = [
+        artifact
+        for artifact in run_directory.rglob("*")
+        if artifact.suffix in {".pt", ".pth", ".ckpt", ".symmodel"}
+    ]
+    assert checkpoint_like == []
     assert captured["feature_mode"] == "image_plus_symmetry_maps"
     assert captured["classifier"] == "logistic_regression"
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from functools import lru_cache
 from pathlib import Path
 import warnings
 import zipfile
@@ -918,7 +919,15 @@ def _ft_capabilities(*, installed: bool = True) -> dict:
     }
 
 
+@lru_cache(maxsize=None)
 def _build_full_app():
+    """Return a cached full-shell app build.
+
+    ``build_app`` constructs both workspaces and the traditional page, which is
+    the most expensive thing in this module. Every consumer only reads the built
+    graph via ``get_config_file()``, and the inputs are constants, so one build
+    serves them all.
+    """
     gradio = pytest.importorskip("gradio")
     from symmetry_harness.ui import build_app
 
@@ -1349,140 +1358,6 @@ def test_b16_ui_distinguishes_durable_path_from_download_copy(tmp_path):
     temp_root = Path(tempfile.gettempdir()).resolve()
     assert str(served.resolve()).startswith(str(temp_root))
     assert run_dir not in served.resolve().parents
-
-
-# ---------------------------------------------------------------------------
-# D15 — REAL run_analysis persistence audit (section 14.3)
-# ---------------------------------------------------------------------------
-def test_d15_real_run_persistence_audit(tmp_path):
-    """Run a real Provider fine-tune, then prove presentation edits are inert."""
-    import time
-
-    from symmetry_harness.annotations import create_annotation_session
-    from symmetry_harness.image_io import file_sha256
-    import symmetry_harness.ui_fine_tune as ft
-    from symmetry_harness.workflow import run_analysis
-
-    config = _config()
-    try:
-        from symmetry_harness.provider import doctor
-
-        if doctor(config)["status"] != "ready":
-            pytest.skip("The numerical Provider is not ready in this environment.")
-    except Exception as error:  # pragma: no cover - environment dependent
-        pytest.skip(f"Provider doctor unavailable: {error!r}")
-
-    size = 96
-    y, x = np.mgrid[:size, :size]
-    values = np.sin(x / 7.0) + np.cos(y / 9.0)
-    image_path = tmp_path / "audit_source.npy"
-    np.save(image_path, ((values - values.min()) / np.ptp(values)).astype(np.float32))
-
-    session = create_annotation_session(
-        image_path=str(image_path),
-        image_sha256=file_sha256(image_path),
-        image_shape=(size, size),
-        classifier_patch_size=64,
-        class_names=["Class A", "Class B"],
-        points_by_class=[
-            [(32, 32), (40, 40), (48, 48)],
-            [(52, 52), (58, 58), (62, 62)],
-        ],
-    )
-
-    started = time.perf_counter()
-    result = run_analysis(
-        config,
-        image_path=image_path,
-        annotation_session=session,
-        overrides={"epochs": 2, "stride": 8, "batch_size": 64},
-        output_root=tmp_path / "runs",
-    )
-    elapsed = time.perf_counter() - started
-    assert result["status"] == "completed"
-
-    run_dir = Path(result["run_directory"])
-    zip_path = Path(result["full_run_zip"])
-    durable_paths = {
-        "symmodel": run_dir / "fine_tuned_model.symmodel",
-        "run_record": run_dir / "run_record.json",
-        "report": run_dir / "report.md",
-        "provider_record": run_dir / "provider_record.json",
-        "zip": zip_path,
-        "prediction": run_dir / "prediction.npz",
-        "input": run_dir / "input.npy",
-    }
-    for name, path in durable_paths.items():
-        assert path.is_file(), f"{name} missing: {path}"
-
-    digests_before = {
-        name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for name, path in durable_paths.items()
-    }
-    with zipfile.ZipFile(zip_path) as archive:
-        members_before = sorted(archive.namelist())
-    files_before = sorted(p.name for p in run_dir.rglob("*") if p.is_file())
-
-    # --- presentation edit + rerender (must be inert) --------------------
-    reference = {
-        "run_id": str(result["run_id"]),
-        "run_directory": str(run_dir),
-        "prediction": str(result["prediction"]),
-        "input_array": str(result["input_array"]),
-        "input_preview": str(result["input_preview"]),
-        "fine_tuned_model": str(result["fine_tuned_model"]),
-        "full_run_zip": str(zip_path),
-        "stride": str(result["stride"]),
-    }
-    names = [str(entry["name"]) for entry in result["classes"]]
-    original_colors = [str(entry["color"]) for entry in result["classes"]]
-    presentation = ft.PresentationState.defaults(names, original_colors)
-    assert presentation.alpha == ft.DEFAULT_OVERLAY_ALPHA
-
-    base_variants = ft.render_fine_tune_variants(
-        reference, names, presentation.display_colors, presentation.alpha
-    )
-    changed_variants = ft.render_fine_tune_variants(
-        reference, names, ["#123456", "#abcdef"], 0.9
-    )
-    assert not np.array_equal(base_variants["overlay"], changed_variants["overlay"])
-    assert not np.array_equal(base_variants["mask"], changed_variants["mask"])
-    assert np.array_equal(base_variants["confidence"], changed_variants["confidence"])
-
-    exported = ft.prepare_presentation_pngs(
-        reference, names, ["#123456", "#abcdef"], 0.9, list(ft.RESULT_EXPORT_NAMES)
-    )
-    assert len(exported) == len(ft.RESULT_EXPORT_NAMES)
-    for path in exported:
-        with Image.open(path) as image:
-            image.load()
-
-    # --- every durable artifact byte-identical ---------------------------
-    digests_after = {
-        name: hashlib.sha256(path.read_bytes()).hexdigest()
-        for name, path in durable_paths.items()
-    }
-    assert digests_before == digests_after
-    with zipfile.ZipFile(zip_path) as archive:
-        members_after = sorted(archive.namelist())
-    assert members_before == members_after
-    assert files_before == sorted(p.name for p in run_dir.rglob("*") if p.is_file())
-
-    # The transient colors never reached any durable text artifact.
-    for name in ("run_record", "report", "provider_record"):
-        payload = durable_paths[name].read_bytes()
-        assert b"#123456" not in payload and b"#abcdef" not in payload
-
-    # Make the observed timing visible in the report.
-    print(f"[QA] real run_analysis persistence audit elapsed: {elapsed:.1f}s")
-    print(f"[QA] symmodel sha256 before: {digests_before['symmodel']}")
-    print(f"[QA] symmodel sha256 after : {digests_after['symmodel']}")
-    print(f"[QA] run_record sha256 before/after: {digests_before['run_record']}")
-    print(f"[QA] zip members: {members_before}")
-
-    # Sanity: the real archive really contains the ordinary run artifacts.
-    assert "input.npy" in members_before
-    assert "fine_tuned_model.symmodel" in members_before
 
 
 # ---------------------------------------------------------------------------

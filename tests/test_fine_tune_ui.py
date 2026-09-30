@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+from functools import lru_cache
 from pathlib import Path
 import tempfile
 
@@ -104,6 +105,23 @@ def _build_ft(config, capabilities):
     return app
 
 
+def build_fine_tune_app(*, installed: bool = True):
+    """Return a cached fine-tune workspace build.
+
+    Building the workspace is the dominant cost of this module (dozens of call
+    sites across the file), and every resulting app is inspected read-only via
+    ``get_config_file`` / ``.fns``. The cache key is the single thing that
+    actually varies: whether the registered weight is installed.
+    """
+    return _cached_ft_app(json.dumps(_capabilities(installed=installed), sort_keys=True))
+
+
+@lru_cache(maxsize=None)
+def _cached_ft_app(capabilities_json: str):
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    return _build_ft(config, json.loads(capabilities_json))
+
+
 def _components(app) -> list[dict]:
     return app.get_config_file()["components"]
 
@@ -183,7 +201,7 @@ def _make_run(tmp_path: Path) -> tuple[Path, dict[str, str]]:
 # ---------------------------------------------------------------------------
 def test_four_stage_headers_are_present(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     labels = [c["props"].get("label") for c in _by_type(app, "accordion")]
     for header in (
         "1. Model and image",
@@ -196,7 +214,7 @@ def test_four_stage_headers_are_present(config) -> None:
 
 def test_all_stage_blocks_are_present_before_prerequisites(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     stages = {c["props"].get("label"): c["props"] for c in _by_type(app, "accordion")}
     assert all(stages[label]["visible"] is True for label in STAGE_LABELS)
     buttons = {
@@ -218,7 +236,7 @@ def test_no_image_offers_a_share_button(config) -> None:
     artefacts are exported through the dedicated DownloadButtons.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     offenders = []
     for component in _components(app):
         if component.get("type") not in {"image", "gallery"}:
@@ -238,7 +256,7 @@ def test_only_the_annotation_canvas_accepts_input(config) -> None:
     sources, which have no meaning for a click-to-annotate canvas.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     by_label = {
         c["props"].get("label"): c["props"]
         for c in _components(app)
@@ -265,7 +283,7 @@ def test_results_are_an_always_mounted_block_not_a_workflow_stage(config) -> Non
     local block must be neither.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     accordions = {c["props"].get("label"): c["props"] for c in _by_type(app, "accordion")}
 
     results = accordions["Prediction results"]
@@ -278,7 +296,7 @@ def test_results_are_an_always_mounted_block_not_a_workflow_stage(config) -> Non
 def test_results_block_starts_with_the_awaiting_placeholder(config) -> None:
     """Before any run the block explains what will appear, in place."""
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     running = [
         c["props"].get("value", "")
         for c in _by_type(app, "html")
@@ -297,7 +315,7 @@ def test_completed_run_opens_and_unhides_the_result_block(config, monkeypatch) -
     actually show the maps instead of a bare header.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_run")
 
     # The support-point validation rejects an image smaller than the classifier
@@ -432,7 +450,7 @@ def test_on_run_announces_rendering_before_loading_the_result(
     and tell the user nothing.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_run")
 
     size = max(config.model.classifier_patch_size * 2, 128)
@@ -545,7 +563,7 @@ def test_clearing_a_result_keeps_the_block_mounted_and_explains_it(config) -> No
     the result they remember seeing.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_run_setting_change")
     result = block_fn.fn(
         {},
@@ -581,7 +599,7 @@ def test_result_outputs_match_the_cleared_update_contract(config) -> None:
     loudly and says which slot moved.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_run_setting_change")
 
     outputs = list(block_fn.outputs)
@@ -626,7 +644,7 @@ def test_result_outputs_match_the_cleared_update_contract(config) -> None:
 
 def test_result_controls_and_downloads_are_hidden_before_completion(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     downloads = {
         c["props"].get("label"): c["props"] for c in _by_type(app, "downloadbutton")
     }
@@ -641,7 +659,7 @@ def test_result_controls_and_downloads_are_hidden_before_completion(config) -> N
 
 def test_fine_tune_result_images_use_one_fixed_height(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     labels = {
         "Prediction overlay (class legend below)",
         "Confidence — maximum class probability (0 to 1)",
@@ -658,7 +676,7 @@ def test_fine_tune_result_images_use_one_fixed_height(config) -> None:
 
 def test_advanced_sections_default_closed(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     accordions = {
         c["props"].get("label"): c["props"].get("open")
         for c in _by_type(app, "accordion")
@@ -683,7 +701,7 @@ def test_symmetry_map_settings_stay_expanded_and_above_the_compute_action(
     tucked below the gallery.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     accordions = {c["props"].get("label"): c["props"] for c in _by_type(app, "accordion")}
 
     settings = accordions["Symmetry map settings"]
@@ -703,7 +721,7 @@ def test_symmetry_map_settings_stay_expanded_and_above_the_compute_action(
 
 def test_raw_json_is_under_a_default_closed_technical_details_accordion(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     accordions = [c["props"] for c in _by_type(app, "accordion")]
     technical = [a for a in accordions if a.get("label") == "Technical details"]
     assert technical and technical[0].get("open") is False
@@ -785,7 +803,7 @@ def test_current_stage_advances_monotonically_with_readiness() -> None:
 
 def test_stage_accordions_default_open_only_for_stage_one(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     stages = {c["props"].get("label"): c["props"] for c in _by_type(app, "accordion")}
     opens = [stages[label]["open"] for label in STAGE_LABELS]
     assert opens == [True, False, False, False]
@@ -793,7 +811,7 @@ def test_stage_accordions_default_open_only_for_stage_one(config) -> None:
 
 def test_refresh_is_additive_and_never_collapses_a_revealed_stage(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_refresh")
 
     def _refresh(announced):
@@ -847,7 +865,7 @@ def test_stage_three_is_revealed_once_the_symmetry_maps_are_current(
     left no obvious way forward.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_refresh")
 
     state = {
@@ -924,7 +942,7 @@ def test_presentation_rerender_works_when_the_run_recorded_its_result(config, tm
     Gradio turned every result image into an error box.
     """
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_update_presentation")
 
     image_path = tmp_path / "input.npy"
@@ -979,7 +997,7 @@ def test_fine_tune_reuses_the_shared_readiness_renderer(config) -> None:
     assert not hasattr(ft, "_readiness_items_html")
     assert ft.readiness_panel_html is readiness_panel_html
 
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     values = [
         c["props"].get("value", "")
         for c in _by_type(app, "html")
@@ -997,7 +1015,7 @@ def test_fine_tune_reuses_the_shared_readiness_renderer(config) -> None:
 # ---------------------------------------------------------------------------
 def test_one_model_selector_and_no_official_weight_dropdown(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     dropdowns = _by_type(app, "dropdown")
     assert sum(1 for c in dropdowns if c["props"].get("label") == "Model") == 1
     labels = [c["props"].get("label", "") for c in _components(app)]
@@ -1007,7 +1025,7 @@ def test_one_model_selector_and_no_official_weight_dropdown(config) -> None:
 
 def test_installed_checkpoint_hides_install_action(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities(installed=True))
+    app = build_fine_tune_app(installed=True)
     buttons = [
         c["props"]
         for c in _by_type(app, "button")
@@ -1019,7 +1037,7 @@ def test_installed_checkpoint_hides_install_action(config) -> None:
 
 def test_missing_checkpoint_requires_explicit_install(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities(installed=False))
+    app = build_fine_tune_app(installed=False)
     buttons = [
         c["props"]
         for c in _by_type(app, "button")
@@ -1048,7 +1066,7 @@ def test_missing_checkpoint_requires_explicit_install(config) -> None:
 
 def test_custom_checkpoint_lives_under_advanced_and_targets_the_model(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     accordions = {c["props"].get("label"): c["props"] for c in _by_type(app, "accordion")}
     assert accordions["Advanced: custom checkpoint"]["open"] is False
     files = [c["props"] for c in _by_type(app, "file")]
@@ -1057,7 +1075,7 @@ def test_custom_checkpoint_lives_under_advanced_and_targets_the_model(config) ->
 
 def test_custom_checkpoint_change_auto_computes_sha256(config, tmp_path) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     handler = _handler(app, "on_custom_checkpoint_change")
     checkpoint = tmp_path / "weights.pt"
     checkpoint.write_bytes(b"custom-checkpoint-bytes")
@@ -1074,7 +1092,7 @@ def test_custom_checkpoint_change_auto_computes_sha256(config, tmp_path) -> None
 def test_model_change_clears_model_state_and_stale_downloads(config, tmp_path) -> None:
     pytest.importorskip("gradio")
     capabilities = _capabilities()
-    app = _build_ft(config, capabilities)
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_model_change")
     source = tmp_path / "source.npy"
     np.save(source, np.linspace(0.0, 1.0, 96 * 96, dtype=np.float32).reshape(96, 96))
@@ -1160,7 +1178,7 @@ def test_model_change_refreshes_locked_patch_size_and_class_text(config, tmp_pat
 def test_run_setting_change_clears_results_and_refreshes_readiness(config) -> None:
     pytest.importorskip("gradio")
     capabilities = _capabilities()
-    app = _build_ft(config, capabilities)
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_run_setting_change")
 
     result = block_fn.fn(
@@ -1192,7 +1210,7 @@ def test_run_setting_change_clears_results_and_refreshes_readiness(config) -> No
 def test_image_change_clears_stale_downloads(config, tmp_path) -> None:
     pytest.importorskip("gradio")
     capabilities = _capabilities()
-    app = _build_ft(config, capabilities)
+    app = build_fine_tune_app()
     block_fn = _handler(app, "on_image_change")
     source = tmp_path / "source.npy"
     np.save(source, np.linspace(0.0, 1.0, 96 * 96, dtype=np.float32).reshape(96, 96))
@@ -1287,7 +1305,7 @@ def test_three_points_per_class_is_runnable(config) -> None:
 # ---------------------------------------------------------------------------
 def test_no_cells_terminology_in_user_facing_components(config) -> None:
     pytest.importorskip("gradio")
-    app = _build_ft(config, _capabilities())
+    app = build_fine_tune_app()
     for component in _components(app):
         assert "Cells" not in str(component.get("props", {}))
 
