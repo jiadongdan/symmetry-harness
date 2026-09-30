@@ -1,6 +1,9 @@
 """End-to-end saved-model prediction through the real Provider worker.
 
-These tests use a small CPU model and skip cleanly when torch is unavailable.
+These tests build a real fine-tuned model state with torch and run a real
+prediction batch, so they are marked ``prediction_integration`` and deselected
+from the default ``pytest`` run (see ``[tool.pytest.ini_options]``). Run them
+explicitly with ``python -m pytest -m prediction_integration``.
 """
 
 from __future__ import annotations
@@ -15,6 +18,8 @@ from symmetry_harness.contracts import FINE_TUNED_MODEL_PACKAGE_SCHEMA_VERSION
 from symmetry_harness.config import load_harness_config
 from symmetry_harness.prediction_workflow import run_saved_model_prediction_batch
 
+
+pytestmark = pytest.mark.prediction_integration
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 

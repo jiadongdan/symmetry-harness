@@ -33,6 +33,15 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+# The default run is the fast unit suite. The two real-Provider integration
+# suites cost several minutes each (they spawn the Provider subprocess, compute
+# real features, and fit real scikit-learn / torch models), so they are
+# deselected here and run explicitly:
+#   python -m pytest -m traditional_integration
+#   python -m pytest -m prediction_integration
+# CI runs both in dedicated jobs; see .github/workflows/ci.yml.
+addopts = "-m 'not traditional_integration and not prediction_integration'"
 markers = [
     "traditional_integration: real cross-repository Provider traditional ML tests (must never be skipped)",
+    "prediction_integration: real fine-tuned-model prediction through the Provider worker (uses torch, CPU-only)",
 ]

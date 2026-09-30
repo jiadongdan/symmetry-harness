@@ -353,6 +353,18 @@ python -m pip install -e ".[ui,dev]"
 python -m pytest -q
 ```
 
+The default run is the fast unit suite. Two integration suites drive the real
+Provider over its subprocess contract -- they spawn a Provider process, compute
+real features, and fit real scikit-learn or torch models, so they take several
+minutes each and are **deselected by default**. Run them explicitly when you
+touch the Provider contract or the model package:
+
+```bash
+python -m pytest -q -m traditional_integration   # conventional ML classifiers
+python -m pytest -q -m prediction_integration    # saved fine-tuned model prediction
+python -m pytest -q -m ""                        # everything, including both
+```
+
 Unit tests do not require symmetry-learn, a checkpoint, or a GPU. Optional
 integration checks can use a locally configured runtime.
 
