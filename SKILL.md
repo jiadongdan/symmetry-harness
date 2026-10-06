@@ -33,26 +33,29 @@ Export .symmodel
 
 For a request to start or open the interactive interface, follow only this path:
 
-1. Run exactly one bundled script relative to this `SKILL.md` file. On Windows,
-   run:
+1. Run exactly one bundled fast-open script relative to this `SKILL.md` file.
+   It starts the long-lived UI process independently, waits for an
+   identity-checked ready state on the fixed local port, and reuses an existing
+   matching instance. On Windows, run:
 
    ```powershell
-   & "<skill-directory>\scripts\launch.ps1"
+   & "<skill-directory>\scripts\open.ps1"
    ```
 
    On macOS or Linux, run:
 
    ```bash
-   "<skill-directory>/scripts/launch.sh"
+   "<skill-directory>/scripts/open.sh"
    ```
 
    Resolve `<skill-directory>` only from the location of this loaded Skill. Do not
    search for it. Append `--input <path>` only when the user explicitly asks to
    preload an image. Append `--mode predict` only when the user explicitly asks
-   for the saved-model prediction workspace. Waiting for or reading more output
-   from this same process remains part of the single launch invocation.
+   for the saved-model prediction workspace.
 
-2. Read stdout until the first JSON object whose `status` is `ready` or `blocked`.
+2. Read the script's single JSON result. `ready` means the Harness-owned process
+   and socket both passed the identity check; `blocked` contains the authoritative
+   failure guidance.
 
 3. If `status` is `ready`, return the reported URL immediately and stop using
    tools. The ready result is authoritative evidence that startup succeeded. Do
@@ -65,27 +68,30 @@ For a request to start or open the interactive interface, follow only this path:
    recommendations, then stop using tools. Do not troubleshoot unless the user
    explicitly asks for troubleshooting.
 
-5. If the bundled launcher is missing or reports that the runtime has not been
+5. If the bundled script is missing or reports that the runtime has not been
    installed, report its recommendation and stop. Do not search Conda
    environments, Python installations, repositories, or PATH entries.
 
 For a startup-only request, do not read any supporting reference.
 
-Startup is not instantaneous and the launchers print nothing before the final
-JSON. Readiness probes the Provider (capability discovery plus a model probe),
-which commonly takes one to two minutes where `import torch` is slow and is much
-faster where it is cheap. Silence is not failure: while the launched process is
-alive, keep reading and do not restart the launcher or report `blocked`.
+Do not start the blocking `launch.ps1` or `launch.sh` scripts for an ordinary
+agent request. They remain low-level debugging entry points. Do not launch a
+background task and then wait for that permanent task to finish; `open.*`
+already owns process detachment and readiness waiting. The installer also writes
+the same machine-readable protocol to
+`~/.symmetry-harness/agent-launch.json` so another agent platform can cache the
+exact command in its cross-project memory without encoding a repository path.
 
-The strict model probe starts a second Provider process and is overlapped with
-UI construction instead of being paid first, so the ready JSON arrives as soon
-as the interface is up. The payload reports the outcome under `model_probe`:
+Startup is not instantaneous. The script waits for the Harness itself, so
+silence before its final JSON is not a reason to add checks or restart it. The
+ready payload reports the strict model probe outcome under `model_probe` when a
+new instance was started:
 
 ```json
 "model_probe": {"status": "ready", "issues": [], "recommendations": []}
 ```
 
-Any status other than `ready` means the configured weight could not be strictly
+Any model-probe status other than `ready` means the configured weight could not be strictly
 loaded. The interface still opened, because the user can select another weight
 there, so report the issue and do not treat it as a launch failure. Do not run
 `doctor` yourself to re-check it; the payload already carries the answer.

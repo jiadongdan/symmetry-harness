@@ -430,8 +430,12 @@ def test_skill_resources_are_portable() -> None:
     """The bundled Skill must not encode host paths or a fixed Python."""
     for relative in (
         "SKILL.md",
+        "scripts/open.ps1",
+        "scripts/open.sh",
         "scripts/launch.ps1",
         "scripts/launch.sh",
+        "scripts/wait.ps1",
+        "scripts/wait.sh",
         "scripts/launch-traditional.ps1",
         "scripts/launch-traditional.sh",
         "scripts/stop.ps1",
@@ -468,13 +472,31 @@ def test_installer_persists_runtime_and_copies_skill_resources(tmp_path) -> None
     assert Path(runtime["harness_python"]) == Path(sys.executable).resolve()
     assert Path(runtime["config_path"]) == config_path.resolve()
 
+    runtime_scripts = installer.install_runtime_scripts(
+        REPOSITORY_ROOT, state_directory
+    )
+    contract_path = installer.write_agent_launch_contract(
+        state_directory,
+        script_directory=runtime_scripts,
+    )
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    assert contract["schema_version"] == "symmetry-harness-agent-launch-v1"
+    assert contract["default_port"] == 7860
+    assert Path(contract["fast_path"]["windows"]["arguments"][-1]).is_file()
+    assert Path(contract["fast_path"]["posix"]["program"]).is_file()
+    assert (runtime_scripts / "wait.ps1").is_file()
+
     skill_path = installer.install_codex_skill(
         REPOSITORY_ROOT, tmp_path / "codex"
     )
     assert (skill_path / "SKILL.md").is_file()
     assert (skill_path / "agents" / "openai.yaml").is_file()
+    assert (skill_path / "scripts" / "open.ps1").is_file()
+    assert (skill_path / "scripts" / "open.sh").is_file()
     assert (skill_path / "scripts" / "launch.ps1").is_file()
     assert (skill_path / "scripts" / "launch.sh").is_file()
+    assert (skill_path / "scripts" / "wait.ps1").is_file()
+    assert (skill_path / "scripts" / "wait.sh").is_file()
     assert (skill_path / "scripts" / "launch-traditional.ps1").is_file()
     assert (skill_path / "scripts" / "launch-traditional.sh").is_file()
     assert (skill_path / "scripts" / "stop.ps1").is_file()
@@ -1555,6 +1577,48 @@ def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> Non
     assert payload["model_probe"]["issues"] == []
 
 
+def test_launch_reuses_a_verified_fixed_port_instance(monkeypatch) -> None:
+    config_path = REPOSITORY_ROOT / "configs" / "config.example.json"
+    calls = {"doctor": 0}
+
+    def fake_ready_server(port, *, config_path=None):
+        assert port == 7860
+        assert config_path == (
+            REPOSITORY_ROOT / "configs" / "config.example.json"
+        ).resolve()
+        return {
+            "url": "http://127.0.0.1:7860/",
+            "mode": "fine-tune",
+            "config_path": str(config_path),
+            "pid": 1234,
+            "instance_id": "existing-instance",
+        }
+
+    def fake_doctor(*args, **kwargs):  # pragma: no cover - reuse must return first
+        calls["doctor"] += 1
+        raise AssertionError("doctor must not run for a verified existing instance")
+
+    monkeypatch.setattr(cli, "ready_server", fake_ready_server)
+    monkeypatch.setattr(cli, "doctor", fake_doctor)
+    arguments = cli._parser().parse_args(
+        [
+            "launch",
+            "--config",
+            str(config_path),
+            "--server-port",
+            "7860",
+            "--no-inbrowser",
+        ]
+    )
+
+    result = cli._execute(arguments)
+    assert result is not None
+    assert result["status"] == "ready"
+    assert result["reused"] is True
+    assert result["url"] == "http://127.0.0.1:7860/"
+    assert calls["doctor"] == 0
+
+
 def test_launch_reports_a_failed_probe_but_still_opens_the_interface(
     monkeypatch, capsys
 ) -> None:
@@ -1721,6 +1785,7 @@ def test_cli_exposes_public_workflow_commands() -> None:
     assert completed.returncode == 0
     for command in (
         "init",
+        "wait",
         "doctor",
         "models",
         "inspect",

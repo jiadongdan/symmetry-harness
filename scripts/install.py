@@ -14,11 +14,14 @@ from typing import Any, Sequence
 
 
 RUNTIME_SCHEMA_VERSION = "symmetry-harness-runtime-v1"
+AGENT_LAUNCH_SCHEMA_VERSION = "symmetry-harness-agent-launch-v1"
 STATE_DIRECTORY_NAME = ".symmetry-harness"
 CONFIG_NAME = "symmetry-harness.json"
 RUNTIME_NAME = "runtime.json"
+AGENT_LAUNCH_NAME = "agent-launch.json"
 PYTHON_PATH_NAME = "python-path.txt"
 CONFIG_PATH_NAME = "config-path.txt"
+DEFAULT_AGENT_PORT = 7860
 
 
 def _run(command: Sequence[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
@@ -78,6 +81,72 @@ def write_runtime_state(
     return runtime_path
 
 
+def install_runtime_scripts(repository_root: Path, state_directory: Path) -> Path:
+    """Install shell-neutral entry points outside any agent-specific directory."""
+    source_root = repository_root.expanduser().resolve()
+    destination = state_directory.expanduser().resolve() / "scripts"
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "open.ps1",
+        "open.sh",
+        "launch.ps1",
+        "launch.sh",
+        "wait.ps1",
+        "wait.sh",
+        "stop.ps1",
+        "stop.sh",
+    ):
+        target = destination / name
+        shutil.copy2(source_root / "scripts" / name, target)
+        if name.endswith(".sh"):
+            target.chmod(target.stat().st_mode | 0o111)
+    return destination
+
+
+def write_agent_launch_contract(
+    state_directory: Path,
+    *,
+    script_directory: Path,
+) -> Path:
+    """Write the exact, reusable fast path for any shell-capable agent."""
+    state_directory = state_directory.expanduser().resolve()
+    scripts = script_directory.expanduser().resolve()
+    payload = {
+        "schema_version": AGENT_LAUNCH_SCHEMA_VERSION,
+        "default_port": DEFAULT_AGENT_PORT,
+        "expected_url": f"http://127.0.0.1:{DEFAULT_AGENT_PORT}/",
+        "fast_path": {
+            "windows": {
+                "program": "powershell",
+                "arguments": [
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(scripts / "open.ps1"),
+                ],
+            },
+            "posix": {
+                "program": str(scripts / "open.sh"),
+                "arguments": [],
+            },
+        },
+        "protocol": [
+            "Run exactly one fast_path command.",
+            "Treat its first ready or blocked JSON result as authoritative.",
+            "Do not run environment discovery, doctor, model, port, or browser checks.",
+            "Stop using tools after reporting the ready URL or blocked guidance.",
+        ],
+        "runtime_state": str(state_directory / RUNTIME_NAME),
+    }
+    contract_path = state_directory / AGENT_LAUNCH_NAME
+    _write_text_atomic(
+        contract_path,
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+    )
+    return contract_path
+
+
 def install_codex_skill(repository_root: Path, codex_home: Path) -> Path:
     """Copy only the maintained Skill resources into the user's Codex directory."""
     source_root = repository_root.expanduser().resolve()
@@ -100,8 +169,12 @@ def install_codex_skill(repository_root: Path, codex_home: Path) -> Path:
     script_destination = destination / "scripts"
     script_destination.mkdir(parents=True, exist_ok=True)
     for name in (
+        "open.ps1",
+        "open.sh",
         "launch.ps1",
         "launch.sh",
+        "wait.ps1",
+        "wait.sh",
         "launch-traditional.ps1",
         "launch-traditional.sh",
         "stop.ps1",
@@ -249,6 +322,11 @@ def main() -> None:
         harness_python=harness_python,
         config_path=config_path,
     )
+    runtime_script_path = install_runtime_scripts(repository_root, state_directory)
+    agent_launch_path = write_agent_launch_contract(
+        state_directory,
+        script_directory=runtime_script_path,
+    )
 
     skill_path = None
     if not arguments.skip_codex_skill:
@@ -266,6 +344,7 @@ def main() -> None:
                 "harness_python": str(harness_python),
                 "config_path": str(config_path),
                 "runtime_path": str(runtime_path),
+                "agent_launch_path": str(agent_launch_path),
                 "codex_skill_path": None if skill_path is None else str(skill_path),
                 "next_prompt": "$symmetry-harness launch",
             },

@@ -23,6 +23,14 @@ from .provider import (
     probe_model,
     traditional_readiness,
 )
+from .runtime_state import (
+    DEFAULT_AGENT_PORT,
+    clear_ready_server,
+    new_instance_id,
+    ready_server,
+    wait_for_ready_server,
+    write_ready_server,
+)
 
 
 DEFAULT_CONFIG_NAME = "symmetry-harness.json"
@@ -93,6 +101,17 @@ def _parser() -> argparse.ArgumentParser:
     initialize.add_argument("--provider-python", default=sys.executable)
     initialize.add_argument("--provider-source-root", type=Path)
     initialize.add_argument("--force", action="store_true")
+
+    wait = commands.add_parser(
+        "wait",
+        help="Wait for an identity-checked local Harness instance.",
+    )
+    wait.add_argument("--server-port", type=int, default=DEFAULT_AGENT_PORT)
+    wait.add_argument("--timeout-seconds", type=float, default=180.0)
+    wait.add_argument("--poll-seconds", type=float, default=0.25)
+    wait.add_argument("--launch-pid", type=int)
+    wait.add_argument("--launch-output", type=Path)
+    wait.add_argument("--launch-error", type=Path)
 
     doctor_parser = commands.add_parser(
         "doctor", help="Check dependencies, device, and selected model weight."
@@ -292,6 +311,15 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             weight_identifier=arguments.weight,
             force=bool(arguments.force),
         )
+    if arguments.command == "wait":
+        return wait_for_ready_server(
+            arguments.server_port,
+            timeout_seconds=arguments.timeout_seconds,
+            poll_seconds=arguments.poll_seconds,
+            launch_pid=arguments.launch_pid,
+            launch_output=arguments.launch_output,
+            launch_error=arguments.launch_error,
+        )
     launch_started = (
         perf_counter()
         if arguments.command in {"launch", "validate-traditional"}
@@ -322,6 +350,22 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
         return {"status": "ok", "input": record}
     if arguments.command == "launch":
         timings = {"config_load": config_seconds}
+        if arguments.server_port > 0 and arguments.input is None:
+            existing = ready_server(arguments.server_port, config_path=config_path)
+            if existing is not None:
+                return {
+                    "status": "ready",
+                    "url": existing["url"],
+                    "mode": existing["mode"],
+                    "config_path": existing["config_path"],
+                    "pid": existing["pid"],
+                    "instance_id": existing["instance_id"],
+                    "reused": True,
+                    "timings_seconds": {
+                        **timings,
+                        "total": round(perf_counter() - launch_started, 6),
+                    },
+                }
         doctor_started = perf_counter()
 
         # Three things must happen before a URL can be printed: the readiness
@@ -385,12 +429,26 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
 
         ui_started = perf_counter()
 
+        instance_id = new_instance_id()
+        active_port: int | None = None
+
         def emit_ready(local_url: str) -> None:
+            nonlocal active_port
             timings["ui_startup"] = round(perf_counter() - ui_started, 6)
             timings["total"] = round(perf_counter() - launch_started, 6)
+            server = write_ready_server(
+                url=local_url,
+                config_path=config_path,
+                mode=str(arguments.mode),
+                instance_id=instance_id,
+            )
+            active_port = int(server["port"])
             payload = {
                 "status": "ready",
                 "url": local_url,
+                "pid": server["pid"],
+                "instance_id": instance_id,
+                "reused": False,
                 "mode": str(arguments.mode),
                 "config_path": str(config_path),
                 "output_root": str(config.output_root),
@@ -419,16 +477,20 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             }
             print(json.dumps(payload, indent=2, sort_keys=True), flush=True)
 
-        launch_ui(
-            config,
-            server_name=arguments.server_name,
-            server_port=arguments.server_port,
-            inbrowser=bool(arguments.inbrowser),
-            prepared_input=prepared_input,
-            capabilities=capabilities,
-            mode=str(arguments.mode),
-            on_ready=emit_ready,
-        )
+        try:
+            launch_ui(
+                config,
+                server_name=arguments.server_name,
+                server_port=arguments.server_port,
+                inbrowser=bool(arguments.inbrowser),
+                prepared_input=prepared_input,
+                capabilities=capabilities,
+                mode=str(arguments.mode),
+                on_ready=emit_ready,
+            )
+        finally:
+            if active_port is not None:
+                clear_ready_server(active_port, instance_id)
         return None
     if arguments.command == "validate-traditional":
         timings = {"config_load": config_seconds}
@@ -598,7 +660,7 @@ def main() -> None:
     if result is not None:
         print(json.dumps(result, indent=2, sort_keys=True))
         if (
-            arguments.command in {"launch", "validate-traditional"}
+            arguments.command in {"launch", "validate-traditional", "wait"}
             and result.get("status") == "blocked"
         ):
             raise SystemExit(2)

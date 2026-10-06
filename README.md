@@ -83,7 +83,9 @@ python scripts/install.py
 The installer performs the editable package installation, creates and validates
 the default Harness configuration, records the exact Python and configuration
 paths under `~/.symmetry-harness`, and installs the maintained Skill resources
-under `~/.codex/skills/symmetry-harness`. It does not require `conda` or the
+under `~/.codex/skills/symmetry-harness`. It also writes
+`~/.symmetry-harness/agent-launch.json`: a machine-readable, cross-agent launch
+contract with exact local script paths. It does not require `conda` or the
 `symmetry` entry point to be available on PATH after installation.
 
 To use an existing package installation without reinstalling dependencies:
@@ -98,9 +100,12 @@ After installation, start a new Codex task and invoke:
 $symmetry-harness launch
 ```
 
-The Skill runs its bundled launcher once and returns the first ready URL. The
-launcher uses the recorded absolute Python executable and configuration path, so
-the command works from any project directory.
+The Skill runs its bundled fast-open script once and returns the first ready
+URL. The script uses the recorded absolute Python executable and configuration
+path, starts the long-lived server independently of the calling agent, verifies
+the server identity on port 7860, and reuses an existing matching instance. The
+command therefore works from any project directory without environment, port,
+browser, or repository checks.
 
 The Python packages are installed in editable mode, so pulling source changes
 updates their active code after running processes are restarted. The Codex Skill
@@ -215,6 +220,7 @@ The `symmetry ui` compatibility command launches the same browser-first workflow
 
 ```text
 symmetry init        discover the Provider and create configuration
+symmetry wait        wait for a verified local Harness instance
 symmetry doctor      validate Provider, model, selected weight, and device
 symmetry models      report the complete model and weight catalog
 symmetry inspect     inspect and normalize an input without running the model
