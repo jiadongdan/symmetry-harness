@@ -131,6 +131,7 @@ def launch_ui(
     prepared_input: tuple[np.ndarray, dict[str, Any]] | None = None,
     capabilities: dict[str, Any] | None = None,
     mode: str = FINE_TUNE_MODE,
+    before_server_start: Callable[[], None] | None = None,
     on_ready: Callable[[str], None] | None = None,
 ) -> None:
     """Launch a local-only interface without public sharing."""
@@ -144,6 +145,8 @@ def launch_ui(
         capabilities=capabilities,
         mode=mode,
     )
+    if before_server_start is not None:
+        before_server_start()
     _, local_url, _ = app.launch(
         server_name=server_name,
         server_port=resolved_port,

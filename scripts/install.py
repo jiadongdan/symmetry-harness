@@ -22,13 +22,23 @@ AGENT_LAUNCH_NAME = "agent-launch.json"
 PYTHON_PATH_NAME = "python-path.txt"
 CONFIG_PATH_NAME = "config-path.txt"
 DEFAULT_AGENT_PORT = 7860
+PROVIDER_CACHE_NAMES = (
+    "provider-capabilities.json",
+    "provider-model-probe.json",
+)
 
 
-def _run(command: Sequence[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+def _run(
+    command: Sequence[str],
+    *,
+    capture: bool = False,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
         list(command),
         text=True,
         capture_output=capture,
+        env=env,
         check=False,
     )
     if completed.returncode != 0:
@@ -79,6 +89,16 @@ def write_runtime_state(
     _write_text_atomic(state_directory / PYTHON_PATH_NAME, f"{python_path}\n")
     _write_text_atomic(state_directory / CONFIG_PATH_NAME, f"{resolved_config}\n")
     return runtime_path
+
+
+def clear_provider_caches(state_directory: Path) -> None:
+    """Force installation to validate and prime the current Provider runtime."""
+    state_directory = state_directory.expanduser().resolve()
+    for name in PROVIDER_CACHE_NAMES:
+        try:
+            (state_directory / name).unlink()
+        except FileNotFoundError:
+            pass
 
 
 def install_runtime_scripts(repository_root: Path, state_directory: Path) -> Path:
@@ -187,8 +207,12 @@ def install_codex_skill(repository_root: Path, codex_home: Path) -> Path:
     return destination
 
 
-def _json_result(command: Sequence[str]) -> dict[str, Any]:
-    completed = _run(command, capture=True)
+def _json_result(
+    command: Sequence[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    completed = _run(command, capture=True, env=env)
     try:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as error:
@@ -257,6 +281,8 @@ def main() -> None:
         else arguments.config
     ).expanduser().resolve()
     harness_python = Path(sys.executable).resolve()
+    runtime_environment = os.environ.copy()
+    runtime_environment["SYMMETRY_HARNESS_HOME"] = str(state_directory)
 
     if not learn_root.is_dir():
         raise FileNotFoundError(
@@ -283,6 +309,7 @@ def main() -> None:
                 ]
             )
 
+    clear_provider_caches(state_directory)
     if arguments.reset_config or not config_path.is_file():
         command = [
             str(harness_python),
@@ -298,7 +325,7 @@ def main() -> None:
         ]
         if config_path.exists():
             command.append("--force")
-        initialized = _json_result(command)
+        initialized = _json_result(command, env=runtime_environment)
         if initialized.get("status") != "configured":
             raise RuntimeError("Harness configuration was not created successfully.")
 
@@ -311,7 +338,8 @@ def main() -> None:
             "--config",
             str(config_path),
             "--require-ui",
-        ]
+        ],
+        env=runtime_environment,
     )
     if readiness.get("status") != "ready":
         issues = "; ".join(str(item) for item in readiness.get("issues", []))

@@ -107,6 +107,12 @@ the server identity on port 7860, and reuses an existing matching instance. The
 command therefore works from any project directory without environment, port,
 browser, or repository checks.
 
+The install-time readiness check also primes a fingerprinted strict-model-probe
+cache. Later launches reuse it only while the Provider identity and editable
+source, selected model and device, configuration, and weight-file signature
+still match. A cache miss is recomputed while the Gradio application is being
+built, rather than as a separate serial startup phase.
+
 The Python packages are installed in editable mode, so pulling source changes
 updates their active code after running processes are restarted. The Codex Skill
 resources are copied rather than linked; after changes to `SKILL.md`, `agents/`,

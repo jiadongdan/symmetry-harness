@@ -367,30 +367,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
                     },
                 }
         doctor_started = perf_counter()
-
-        # Three things must happen before a URL can be printed: the readiness
-        # probe, the UI import, and the model contract. They are independent, so
-        # they run at the same time and the launch pays the slowest instead of
-        # the sum. Two of them are dominated by a fresh interpreter importing a
-        # numerical runtime, which is why overlapping matters here.
-        #
-        # The strict model probe is deliberately excluded: it is the single most
-        # expensive step and it starts its own Provider process. Deferring it lets
-        # the URL be printed as soon as the UI is up. That is safe only because
-        # the interface can repair an unusable weight -- the deferred result is
-        # reported on the ready payload, and a non-interactive caller that needs
-        # the strict answer keeps calling `doctor`.
-        with ThreadPoolExecutor(max_workers=1) as executor:
-            probe_future = executor.submit(probe_model, config)
-            readiness = doctor(config, require_ui=True, probe=False)
-            from .ui import launch_ui
-
-            try:
-                probe_result = probe_future.result()
-            except Exception as error:  # noqa: BLE001 - reported, never raised
-                readiness = apply_model_probe(readiness, None, error=error)
-            else:
-                readiness = apply_model_probe(readiness, probe_result)
+        readiness = doctor(config, require_ui=True, probe=False)
         timings["doctor"] = round(perf_counter() - doctor_started, 6)
         # Only a blocker that the interface cannot repair stops the launch. A
         # failed weight load is repairable there (select another weight), and
@@ -410,10 +387,29 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
                 "timings_seconds": timings,
             }
 
-        model_started = perf_counter()
-        model_report = _model_report(config, probe=False, readiness=readiness)
         capabilities = readiness["environment"]["capabilities"]
-        timings["model_contract"] = round(perf_counter() - model_started, 6)
+
+        # The installer primes a fingerprinted strict-load cache, so the common
+        # launch resolves this future in milliseconds. On a cache miss, keep the
+        # Provider process running while both the UI modules and the complete
+        # Gradio application are constructed. The callback below joins it only
+        # after build_app returns and immediately before the socket is opened.
+        probe_executor: ThreadPoolExecutor | None = None
+        probe_future = None
+        if readiness["model"]["status"] != "selection_required":
+            probe_executor = ThreadPoolExecutor(max_workers=1)
+
+            def timed_model_probe():
+                started = perf_counter()
+                result = probe_model(config)
+                return result, round(perf_counter() - started, 6)
+
+            probe_future = probe_executor.submit(timed_model_probe)
+
+        ui_import_started = perf_counter()
+        from .ui import launch_ui
+
+        timings["ui_import"] = round(perf_counter() - ui_import_started, 6)
 
         prepared_input = None
         input_record = None
@@ -429,11 +425,43 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
 
         ui_started = perf_counter()
 
+        model_report: dict[str, Any] | None = None
+        probe_finished = False
+
+        def finish_model_probe() -> None:
+            nonlocal model_report, probe_finished, readiness
+            if probe_finished:
+                return
+            wait_started = perf_counter()
+            if probe_future is not None:
+                try:
+                    probe_result, probe_seconds = probe_future.result()
+                except Exception as error:  # noqa: BLE001 - reported, never raised
+                    readiness = apply_model_probe(readiness, None, error=error)
+                else:
+                    readiness = apply_model_probe(readiness, probe_result)
+                    timings["model_probe"] = probe_seconds
+            timings["model_probe_wait_after_ui_build"] = round(
+                perf_counter() - wait_started, 6
+            )
+            model_started = perf_counter()
+            model_report = _model_report(
+                config,
+                probe=False,
+                readiness=readiness,
+            )
+            timings["model_contract"] = round(
+                perf_counter() - model_started, 6
+            )
+            probe_finished = True
+
         instance_id = new_instance_id()
         active_port: int | None = None
 
         def emit_ready(local_url: str) -> None:
             nonlocal active_port
+            finish_model_probe()
+            assert model_report is not None
             timings["ui_startup"] = round(perf_counter() - ui_started, 6)
             timings["total"] = round(perf_counter() - launch_started, 6)
             server = write_ready_server(
@@ -463,6 +491,11 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
                 "fine_tuning": model_report["fine_tuning"],
                 "model_probe": {
                     "status": readiness["model"]["status"],
+                    "cache": dict(
+                        (readiness["model"].get("probe") or {}).get(
+                            "_harness_cache", {"status": "unavailable"}
+                        )
+                    ),
                     "issues": [
                         issue
                         for issue in readiness["issues"]
@@ -486,9 +519,12 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
                 prepared_input=prepared_input,
                 capabilities=capabilities,
                 mode=str(arguments.mode),
+                before_server_start=finish_model_probe,
                 on_ready=emit_ready,
             )
         finally:
+            if probe_executor is not None:
+                probe_executor.shutdown(wait=False, cancel_futures=True)
             if active_port is not None:
                 clear_ready_server(active_port, instance_id)
         return None

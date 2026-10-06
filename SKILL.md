@@ -2,7 +2,7 @@
 name: symmetry-harness
 description: Run local few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to launch the local interface, fine-tune adapters on representative points, inspect confidence or entropy, or apply a saved .symmodel package to new images without re-training. Requires the local symmetry-harness runtime and the symmetry-learn Provider. Do not use for foundation-model training, silent weight installation, or unattended label selection.
 metadata:
-  version: "0.2.2"
+  version: "0.2.3"
   product: "symmetry-harness"
 ---
 
@@ -84,17 +84,26 @@ exact command in its cross-project memory without encoding a repository path.
 
 Startup is not instantaneous. The script waits for the Harness itself, so
 silence before its final JSON is not a reason to add checks or restart it. The
-ready payload reports the strict model probe outcome under `model_probe` when a
-new instance was started:
+installer primes a fingerprinted strict-model-probe cache. A launch reuses that
+result only while the Provider identity and source, selected model and device,
+configuration, and weight-file signature still match. A cache miss runs in
+parallel with UI construction. The ready payload reports the outcome and cache
+status under `model_probe` when a new instance was started:
 
 ```json
-"model_probe": {"status": "ready", "issues": [], "recommendations": []}
+"model_probe": {
+  "status": "ready",
+  "cache": {"status": "hit", "schema_version": 1},
+  "issues": [],
+  "recommendations": []
+}
 ```
 
-Any model-probe status other than `ready` means the configured weight could not be strictly
-loaded. The interface still opened, because the user can select another weight
-there, so report the issue and do not treat it as a launch failure. Do not run
-`doctor` yourself to re-check it; the payload already carries the answer.
+Any model-probe status other than `ready` means the configured weight could not
+be strictly loaded. The interface still opened, because the user can select
+another weight there, so report the issue and do not treat it as a launch
+failure. Do not run `doctor` yourself to re-check it; the payload already
+carries the answer.
 
 ## Traditional ML Validation (explicit request only)
 

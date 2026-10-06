@@ -311,13 +311,8 @@ def test_a_failed_deferred_probe_blocks_and_asks_for_a_selection() -> None:
     assert merged["recommendations"] == ["Pick another weight."]
 
 
-def test_the_launch_command_defers_and_then_reports_the_model_probe() -> None:
-    """Pin the launch wiring: the probe runs alongside the UI, never before it.
-
-    The contract is (1) readiness is requested with ``probe=False``, (2) the
-    probe is started before that call so both overlap, and (3) its result is
-    merged into the report that gates the launch.
-    """
+def test_the_launch_command_overlaps_the_model_probe_with_ui_construction() -> None:
+    """Pin the launch wiring so cache misses do not serialize UI construction."""
     source = (REPOSITORY_ROOT / "src" / "symmetry_harness" / "cli.py").read_text(
         encoding="utf-8"
     )
@@ -325,11 +320,16 @@ def test_the_launch_command_defers_and_then_reports_the_model_probe() -> None:
     launch_block = launch_block.split('if arguments.command == "validate-traditional":', 1)[0]
 
     assert "doctor(config, require_ui=True, probe=False)" in launch_block
-    assert "executor.submit(probe_model, config)" in launch_block
+    assert "probe_executor.submit(timed_model_probe)" in launch_block
     assert "apply_model_probe(" in launch_block
-    # The probe must be submitted before the blocking readiness call starts.
-    assert launch_block.index("executor.submit(probe_model, config)") < launch_block.index(
-        "doctor(config, require_ui=True, probe=False)"
+    assert "before_server_start=finish_model_probe" in launch_block
+    # Compatibility is gated first. The expensive probe then overlaps UI import
+    # and build_app, and is joined only immediately before the socket opens.
+    assert launch_block.index("doctor(config, require_ui=True, probe=False)") < (
+        launch_block.index("probe_executor.submit(timed_model_probe)")
+    )
+    assert launch_block.index("probe_executor.submit(timed_model_probe)") < (
+        launch_block.index("from .ui import launch_ui")
     )
 
 
@@ -471,6 +471,14 @@ def test_installer_persists_runtime_and_copies_skill_resources(tmp_path) -> None
     assert runtime["schema_version"] == "symmetry-harness-runtime-v1"
     assert Path(runtime["harness_python"]) == Path(sys.executable).resolve()
     assert Path(runtime["config_path"]) == config_path.resolve()
+
+    for name in installer.PROVIDER_CACHE_NAMES:
+        (state_directory / name).write_text("stale\n", encoding="utf-8")
+    installer.clear_provider_caches(state_directory)
+    assert all(
+        not (state_directory / name).exists()
+        for name in installer.PROVIDER_CACHE_NAMES
+    )
 
     runtime_scripts = installer.install_runtime_scripts(
         REPOSITORY_ROOT, state_directory
@@ -901,6 +909,73 @@ def test_doctor_accepts_an_installed_registered_default_weight(monkeypatch) -> N
     assert report["checkpoint"]["kind"] == "registered"
     assert report["checkpoint"]["bundled"] is True
     assert report["checkpoint"]["strict_load"] is True
+
+
+def test_model_probe_cache_reuses_a_matching_strict_load(monkeypatch) -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    actions: list[str] = []
+
+    def fake_invoke(current, action, path=None, *, timeout_seconds):
+        actions.append(action)
+        if action == "--capabilities":
+            return _capabilities()
+        assert action == "--probe"
+        return {
+            "provider_contract_version": PROVIDER_CONTRACT_VERSION,
+            "provider": "symmetry-learn",
+            "identifier": "cnn_8ch_pg17",
+            "details": {
+                "checkpoint": {
+                    "path": "/models/pg17-symmetry-v1.pth",
+                    "sha256": "c" * 64,
+                    "strict_load": True,
+                    "weight_identifier": "pg17-symmetry-v1",
+                }
+            },
+        }
+
+    monkeypatch.setattr(provider_module, "_invoke_provider_json", fake_invoke)
+    provider_module.provider_capabilities(config)
+    first = provider_module.probe_model(config)
+    second = provider_module.probe_model(config)
+
+    assert actions == ["--capabilities", "--probe"]
+    assert first["_harness_cache"]["status"] == "miss"
+    assert second["_harness_cache"]["status"] == "hit"
+
+
+def test_model_probe_cache_invalidates_when_a_weight_file_changes(
+    monkeypatch, tmp_path
+) -> None:
+    config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
+    weight_path = tmp_path / "weight.pth"
+    weight_path.write_bytes(b"first")
+    capabilities = _capabilities()
+    model = capabilities["models"][0]
+    model["default_weight"]["installed_path"] = str(weight_path)
+    model["weights"][0]["installed_path"] = str(weight_path)
+    probes = {"count": 0}
+
+    def fake_invoke(current, action, path=None, *, timeout_seconds):
+        if action == "--capabilities":
+            return capabilities
+        probes["count"] += 1
+        return {
+            "provider_contract_version": PROVIDER_CONTRACT_VERSION,
+            "provider": "symmetry-learn",
+            "identifier": "cnn_8ch_pg17",
+            "details": {"checkpoint": {"path": str(weight_path)}},
+        }
+
+    monkeypatch.setattr(provider_module, "_invoke_provider_json", fake_invoke)
+    provider_module.provider_capabilities(config)
+    provider_module.probe_model(config)
+    assert provider_module.probe_model(config)["_harness_cache"]["status"] == "hit"
+
+    weight_path.write_bytes(b"second version")
+    refreshed = provider_module.probe_model(config)
+    assert probes["count"] == 2
+    assert refreshed["_harness_cache"]["status"] == "miss"
 
 
 def test_doctor_blocks_a_missing_registered_weight_with_install_guidance(
@@ -1467,6 +1542,7 @@ def test_launch_ui_blocks_until_the_server_stops(monkeypatch) -> None:
         server_port=0,
         inbrowser=False,
         capabilities=_capabilities(),
+        before_server_start=lambda: events.append("before_server_start"),
         on_ready=lambda url: events.append(f"ready:{url}"),
     )
 
@@ -1474,6 +1550,7 @@ def test_launch_ui_blocks_until_the_server_stops(monkeypatch) -> None:
     # end the process and close the pipe an orchestrator is still reading.
     assert events == [
         "build",
+        "before_server_start",
         "launch",
         "ready:http://127.0.0.1:54321",
         "block_thread",
@@ -1489,7 +1566,7 @@ def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> Non
         "model": {
             "identifier": "cnn_8ch_pg17",
             "weight_identifier": "pg17-symmetry-v1",
-            "status": "selection_required",
+            "status": "ready",
             "probe": None,
         },
         "checkpoint": {},
@@ -1548,6 +1625,7 @@ def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> Non
         prepared_image, prepared_record = kwargs["prepared_input"]
         assert prepared_image is image
         assert prepared_record is input_record
+        kwargs["before_server_start"]()
         kwargs["on_ready"]("http://127.0.0.1:54321")
 
     monkeypatch.setattr(cli, "doctor", fake_doctor)
@@ -1572,8 +1650,11 @@ def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> Non
     assert payload["url"] == "http://127.0.0.1:54321"
     assert payload["input"]["sha256"] == "b" * 64
     assert payload["timings_seconds"]["total"] >= 0
+    assert payload["timings_seconds"]["model_probe"] >= 0
+    assert payload["timings_seconds"]["model_probe_wait_after_ui_build"] >= 0
     # The deferred result is reported, not silently dropped.
     assert payload["model_probe"]["status"] == "ready"
+    assert payload["model_probe"]["cache"]["status"] == "unavailable"
     assert payload["model_probe"]["issues"] == []
 
 
@@ -1630,7 +1711,7 @@ def test_launch_reports_a_failed_probe_but_still_opens_the_interface(
         "model": {
             "identifier": "cnn_8ch_pg17",
             "weight_identifier": "pg17-symmetry-v1",
-            "status": "selection_required",
+            "status": "ready",
             "probe": None,
         },
         "checkpoint": {"kind": "registered", "exists": True},
@@ -1652,6 +1733,7 @@ def test_launch_reports_a_failed_probe_but_still_opens_the_interface(
     monkeypatch.setattr(cli, "probe_model", fake_probe_model)
 
     def fake_launch_ui(config, **kwargs):
+        kwargs["before_server_start"]()
         kwargs["on_ready"]("http://127.0.0.1:54323")
 
     monkeypatch.setattr(ui_module, "launch_ui", fake_launch_ui)
@@ -1737,7 +1819,7 @@ def test_launch_without_input_waits_for_gradio_selection(monkeypatch, capsys) ->
         "model": {
             "identifier": "cnn_8ch_pg17",
             "weight_identifier": "pg17-symmetry-v1",
-            "status": "selection_required",
+            "status": "ready",
             "probe": None,
         },
         "checkpoint": {},
@@ -1755,6 +1837,7 @@ def test_launch_without_input_waits_for_gradio_selection(monkeypatch, capsys) ->
     def fake_launch_ui(config, **kwargs):
         assert kwargs["prepared_input"] is None
         assert kwargs["capabilities"] == _capabilities()
+        kwargs["before_server_start"]()
         kwargs["on_ready"]("http://127.0.0.1:54322")
 
     monkeypatch.setattr(ui_module, "launch_ui", fake_launch_ui)

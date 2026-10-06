@@ -43,6 +43,9 @@ TRADITIONAL_ML_RECORD_SCHEMA_VERSION = "symmetry-traditional-ml-run-v1"
 CAPABILITIES_CACHE_SCHEMA_VERSION = 1
 CAPABILITIES_CACHE_NAME = "provider-capabilities.json"
 CAPABILITIES_CACHE_DISABLE_ENV = "SYMMETRY_HARNESS_DISABLE_CAPABILITIES_CACHE"
+MODEL_PROBE_CACHE_SCHEMA_VERSION = 1
+MODEL_PROBE_CACHE_NAME = "provider-model-probe.json"
+MODEL_PROBE_CACHE_DISABLE_ENV = "SYMMETRY_HARNESS_DISABLE_MODEL_PROBE_CACHE"
 
 
 @dataclass(frozen=True)
@@ -499,6 +502,7 @@ def install_registered_weight(
         if completed.returncode != 0:
             detail = completed.stderr.strip() or completed.stdout.strip()
             raise RuntimeError(f"Registered weight installation failed: {detail}")
+        invalidate_provider_caches()
     refreshed = provider_capabilities(config)
     refreshed_weight = weight_capability(
         model_capability(refreshed, model_identifier), weight_identifier
@@ -620,6 +624,7 @@ def _capabilities_cache_key(config: HarnessConfig) -> dict[str, Any]:
         "provider_module": config.provider.module,
         "python_executable": str(config.model.python_executable),
         "source_root": None if source_root is None else str(source_root),
+        "provider_source_signature": _provider_source_signature(config),
     }
 
 
@@ -649,6 +654,115 @@ def _weight_signatures(capabilities: dict[str, Any]) -> dict[str, Any]:
                 continue
             signatures[str(raw_path)] = [stat.st_size, stat.st_mtime_ns]
     return signatures
+
+
+def _path_signature(path: Path | None) -> list[int] | None:
+    """Return a cheap invalidation signature without reading a large weight."""
+    if path is None:
+        return None
+    try:
+        stat = path.expanduser().stat()
+    except OSError:
+        return None
+    return [stat.st_size, stat.st_mtime_ns]
+
+
+def _provider_source_signature(config: HarnessConfig) -> dict[str, list[int]] | None:
+    """Track editable Provider source changes that may affect strict loading."""
+    source_root = config.provider.source_root
+    if source_root is None:
+        return None
+    root = source_root.expanduser()
+    top_level_package = config.provider.module.split(".", 1)[0]
+    package_root = root / top_level_package
+    candidates = list(package_root.rglob("*.py")) if package_root.is_dir() else []
+    project_file = root / "pyproject.toml"
+    if project_file.is_file():
+        candidates.append(project_file)
+    signatures: dict[str, list[int]] = {}
+    for path in sorted(set(candidates)):
+        signature = _path_signature(path)
+        if signature is not None:
+            signatures[str(path.relative_to(root))] = signature
+    return signatures
+
+
+def _model_probe_cache_key(
+    config: HarnessConfig,
+    capabilities: dict[str, Any],
+) -> dict[str, Any]:
+    """Identify everything that can change a strict model-load result."""
+    capability_digest = sha256(
+        json.dumps(capabilities, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        "cache_schema_version": MODEL_PROBE_CACHE_SCHEMA_VERSION,
+        "provider": _capabilities_cache_key(config),
+        "provider_source_signature": _provider_source_signature(config),
+        "capabilities_sha256": capability_digest,
+        "weight_signatures": _weight_signatures(capabilities),
+        "method": _method_payload(config),
+        "device": config.model.device,
+        "custom_checkpoint_signature": _path_signature(config.model.checkpoint_path),
+    }
+
+
+def _read_cached_model_probe(
+    config: HarnessConfig,
+    capabilities: dict[str, Any],
+) -> dict[str, Any] | None:
+    path = _state_directory() / MODEL_PROBE_CACHE_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("key") != _model_probe_cache_key(config, capabilities):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        return None
+    if result.get("provider_contract_version") != PROVIDER_CONTRACT_VERSION:
+        return None
+    if result.get("provider") != config.provider.name:
+        return None
+    if result.get("identifier") != config.model.identifier:
+        return None
+    return dict(result)
+
+
+def _write_cached_model_probe(
+    config: HarnessConfig,
+    capabilities: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    """Persist a successful strict-load result for later local launches."""
+    path = _state_directory() / MODEL_PROBE_CACHE_NAME
+    payload = {
+        "key": _model_probe_cache_key(config, capabilities),
+        "result": result,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.tmp")
+        temporary.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        temporary.replace(path)
+    except OSError:
+        return
+
+
+def invalidate_provider_caches() -> None:
+    """Remove Provider-derived state after an explicit runtime mutation."""
+    for name in (CAPABILITIES_CACHE_NAME, MODEL_PROBE_CACHE_NAME):
+        try:
+            (_state_directory() / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
 
 
 def _read_cached_capabilities(config: HarnessConfig) -> dict[str, Any] | None:
@@ -717,7 +831,7 @@ def _method_payload(config: HarnessConfig) -> dict[str, Any]:
     return payload
 
 
-def probe_model(config: HarnessConfig) -> dict[str, Any]:
+def _probe_model_uncached(config: HarnessConfig) -> dict[str, Any]:
     """Ask the Provider to strictly load the selected model weight and device."""
     with tempfile.TemporaryDirectory(prefix="symmetry-harness-probe-") as temporary:
         job_path = Path(temporary) / "probe.json"
@@ -742,6 +856,31 @@ def probe_model(config: HarnessConfig) -> dict[str, Any]:
     if result.get("identifier") != config.model.identifier:
         raise RuntimeError("Provider probe model identity mismatch.")
     return result
+
+
+def probe_model(config: HarnessConfig) -> dict[str, Any]:
+    """Return a fingerprinted strict-load result, probing only when stale."""
+    cache_enabled = not _truthy_environment(MODEL_PROBE_CACHE_DISABLE_ENV)
+    capabilities = _read_cached_capabilities(config) if cache_enabled else None
+    if capabilities is not None:
+        cached = _read_cached_model_probe(config, capabilities)
+        if cached is not None:
+            cached["_harness_cache"] = {
+                "status": "hit",
+                "schema_version": MODEL_PROBE_CACHE_SCHEMA_VERSION,
+            }
+            return cached
+
+    result = _probe_model_uncached(config)
+    capabilities = _read_cached_capabilities(config) if cache_enabled else None
+    if capabilities is not None:
+        _write_cached_model_probe(config, capabilities, result)
+    resolved = dict(result)
+    resolved["_harness_cache"] = {
+        "status": "miss" if cache_enabled else "disabled",
+        "schema_version": MODEL_PROBE_CACHE_SCHEMA_VERSION,
+    }
+    return resolved
 
 
 def run_provider_features(
