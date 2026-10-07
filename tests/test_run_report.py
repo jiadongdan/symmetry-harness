@@ -301,7 +301,39 @@ def test_fine_tune_report_has_every_section_and_figure(tmp_path: Path) -> None:
     for path in result.figure_paths:
         assert path.is_file()
         assert path.parent == run / rr.FIGURES_DIRNAME
-        assert f"]({path.name})" in text
+        # The link must carry the figures/ sub-directory, not a bare basename.
+        assert f"](figures/{path.name})" in text
+        assert (result.report_path.parent / "figures" / path.name).is_file()
+
+
+def test_every_embedded_figure_link_resolves(tmp_path: Path) -> None:
+    """Regression: links used to be bare basenames and missed ``figures/``."""
+    import re
+
+    run = _write_fine_tune_run(tmp_path)
+    result = rr.build_run_report(run)
+    text = result.report_path.read_text(encoding="utf-8")
+
+    links = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", text)
+    assert links, "report embeds no figures"
+    for link in links:
+        assert link.startswith("figures/"), link
+        assert (result.report_path.parent / link).is_file(), link
+
+
+def test_figure_links_resolve_when_report_is_relocated(tmp_path: Path) -> None:
+    """``--output`` may move the report; the links must still resolve."""
+    import re
+
+    run = _write_fine_tune_run(tmp_path)
+    target = tmp_path / "elsewhere" / "custom.md"
+    rr.build_run_report(run, output=target)
+
+    text = target.read_text(encoding="utf-8")
+    links = re.findall(r"!\[[^\]]*\]\(([^)]+)\)", text)
+    assert links
+    for link in links:
+        assert (target.parent / link).resolve().is_file(), link
 
 
 def test_fine_tune_report_notes_default_placeholder(tmp_path: Path) -> None:

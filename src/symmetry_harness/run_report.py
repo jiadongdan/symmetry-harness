@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from importlib import resources
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -675,17 +676,32 @@ def _figure_markdown(
     written: Mapping[str, Path],
     key: str,
     caption: str,
+    *,
+    report_dir: Path,
 ) -> str:
+    """Render one embedded figure as Markdown.
+
+    The link is relative to the directory holding the report, because figures
+    live in a ``figures/`` sub-directory beside it. A bare basename would
+    resolve against the report directory and miss that sub-directory, leaving
+    every image broken. ``--output`` may place the report outside the run
+    directory, so the offset is computed rather than hard-coded.
+    """
     path = written.get(key)
-    return f"![{caption}]({path.name})" if path is not None else ""
+    if path is None:
+        return ""
+    link = Path(os.path.relpath(path, report_dir)).as_posix()
+    return f"![{caption}]({link})"
 
 
 def _figure_block(
     written: Mapping[str, Path],
     lines: Sequence[tuple[str, str]],
+    *,
+    report_dir: Path,
 ) -> str:
     blocks = [
-        _figure_markdown(written, key, caption)
+        _figure_markdown(written, key, caption, report_dir=report_dir)
         for key, caption in lines
     ]
     return "\n\n".join(block for block in blocks if block)
@@ -924,6 +940,10 @@ def _build_fine_tune_report(
     )
 
     record_path = (run_dir / "run_record.json").resolve()
+    # The report sits beside ``figures/``, so its own directory is the base the
+    # image links must be relative to.
+    target = output or (run_dir / REPORT_FILENAME)
+    report_dir = target.parent
     context = {
         "run_id": str(record.get("run_id", run_dir.name)),
         "kind": KIND_FINE_TUNE,
@@ -933,27 +953,38 @@ def _build_fine_tune_report(
         "summary": summary,
         "workflow": workflow,
         "notes": notes.strip() if notes and notes.strip() else "_Not provided._",
-        "fig_input": _figure_markdown(written, "fig_input", "Normalized input image"),
+        "fig_input": _figure_markdown(
+            written, "fig_input", "Normalized input image", report_dir=report_dir
+        ),
         "fig_support": _figure_markdown(
-            written, "fig_support", "Support points by class"
+            written, "fig_support", "Support points by class", report_dir=report_dir
         ),
         "fig_symmetry": _figure_markdown(
-            written, "fig_symmetry", "Eight-channel symmetry representation"
+            written,
+            "fig_symmetry",
+            "Eight-channel symmetry representation",
+            report_dir=report_dir,
         ),
         "fig_training": _figure_markdown(
-            written, "fig_training", "Training diagnostics"
+            written, "fig_training", "Training diagnostics", report_dir=report_dir
         ),
         "fig_mask": _figure_markdown(
-            written, "fig_mask", "Predicted class mask"
+            written, "fig_mask", "Predicted class mask", report_dir=report_dir
         ),
         "fig_overlay": _figure_markdown(
-            written, "fig_overlay", "Prediction overlay on the source image"
+            written,
+            "fig_overlay",
+            "Prediction overlay on the source image",
+            report_dir=report_dir,
         ),
         "fig_confidence": _figure_markdown(
-            written, "fig_confidence", "Confidence map (viridis, 0-1)"
+            written,
+            "fig_confidence",
+            "Confidence map (viridis, 0-1)",
+            report_dir=report_dir,
         ),
         "fig_entropy": _figure_markdown(
-            written, "fig_entropy", "Entropy map (magma)"
+            written, "fig_entropy", "Entropy map (magma)", report_dir=report_dir
         ),
         "annotation_table": _annotation_table(classes),
         "feature_table": _feature_table(_load_npz(run_dir / "features.npz"))
@@ -967,7 +998,6 @@ def _build_fine_tune_report(
         "record_path": str(record_path),
     }
 
-    target = output or (run_dir / REPORT_FILENAME)
     report_path = _write_report(
         target, template=_template(_TEMPLATE_IMAGE), context=context
     )
@@ -1079,19 +1109,32 @@ def _build_prediction_item_report(
         "summary": summary,
         "workflow": workflow,
         "notes": notes.strip() if notes and notes.strip() else "_Not provided._",
-        "fig_input": _figure_markdown(written, "fig_input", "Normalized input image"),
-        "fig_symmetry": _figure_markdown(
-            written, "fig_symmetry", "Eight-channel symmetry representation"
+        "fig_input": _figure_markdown(
+            written, "fig_input", "Normalized input image", report_dir=item_dir
         ),
-        "fig_mask": _figure_markdown(written, "fig_mask", "Predicted class mask"),
+        "fig_symmetry": _figure_markdown(
+            written,
+            "fig_symmetry",
+            "Eight-channel symmetry representation",
+            report_dir=item_dir,
+        ),
+        "fig_mask": _figure_markdown(
+            written, "fig_mask", "Predicted class mask", report_dir=item_dir
+        ),
         "fig_overlay": _figure_markdown(
-            written, "fig_overlay", "Prediction overlay on the source image"
+            written,
+            "fig_overlay",
+            "Prediction overlay on the source image",
+            report_dir=item_dir,
         ),
         "fig_confidence": _figure_markdown(
-            written, "fig_confidence", "Confidence map (viridis, 0-1)"
+            written,
+            "fig_confidence",
+            "Confidence map (viridis, 0-1)",
+            report_dir=item_dir,
         ),
         "fig_entropy": _figure_markdown(
-            written, "fig_entropy", "Entropy map (magma)"
+            written, "fig_entropy", "Entropy map (magma)", report_dir=item_dir
         ),
         "class_table": _md_table(
             ["Index", "Class", "Color"],
