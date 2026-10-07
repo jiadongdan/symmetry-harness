@@ -26,6 +26,7 @@ from .provider import (
 from .runtime_state import (
     DEFAULT_AGENT_PORT,
     clear_ready_server,
+    installed_config_path,
     new_instance_id,
     ready_server,
     wait_for_ready_server,
@@ -37,12 +38,24 @@ DEFAULT_CONFIG_NAME = "symmetry-harness.json"
 
 
 def _config_path(value: Path | None) -> Path:
+    """Resolve the configuration path with the same precedence the launchers use.
+
+    An explicit argument wins, then ``SYMMETRY_HARNESS_CONFIG``, then a
+    ``symmetry-harness.json`` in the working directory, and finally the path the
+    one-time installer recorded in user-local state. Without that last fallback
+    a command run from an arbitrary directory could not find the installed
+    configuration, while the launchers could.
+    """
     if value is not None:
         return value.expanduser().resolve()
     configured = os.environ.get("SYMMETRY_HARNESS_CONFIG")
     if configured:
         return Path(configured).expanduser().resolve()
-    return (Path.cwd() / DEFAULT_CONFIG_NAME).resolve()
+    local = (Path.cwd() / DEFAULT_CONFIG_NAME).resolve()
+    if local.is_file():
+        return local
+    installed = installed_config_path()
+    return installed if installed is not None else local
 
 
 def _add_config_argument(parser: argparse.ArgumentParser) -> None:
@@ -205,6 +218,51 @@ def _parser() -> argparse.ArgumentParser:
         help="Workspace opened when the interface starts.",
     )
 
+    report = commands.add_parser(
+        "report",
+        help="Write the fixed-template Markdown report for a completed run.",
+    )
+    _add_config_argument(report)
+    report.add_argument(
+        "--run",
+        default="latest",
+        help=(
+            "Run directory, run id, or 'latest' (the default). 'latest' picks "
+            "the newest run under --output-root matching --prefix."
+        ),
+    )
+    report.add_argument(
+        "--output-root",
+        type=Path,
+        help="Directory holding run folders. Defaults to the configured output root.",
+    )
+    report.add_argument(
+        "--prefix",
+        choices=["symmetry", "prediction", "any"],
+        default="symmetry",
+        help="Which run family 'latest' considers. Defaults to fine-tune runs.",
+    )
+    report.add_argument(
+        "--notes",
+        type=Path,
+        help="Markdown or text file whose contents fill the Session Notes section.",
+    )
+    report.add_argument(
+        "--notes-text",
+        help="Inline Session Notes text. Overrides --notes when both are given.",
+    )
+    report.add_argument(
+        "--output",
+        type=Path,
+        help="Report path. Defaults to <run>/report_summary.md.",
+    )
+    report.add_argument(
+        "--figures",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Render and embed PNG figures. Use --no-figures for a text-only report.",
+    )
+
     validate_traditional = commands.add_parser(
         "validate-traditional",
         help=(
@@ -320,6 +378,45 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             launch_output=arguments.launch_output,
             launch_error=arguments.launch_error,
         )
+    if arguments.command == "report":
+        from .run_report import (
+            FINE_TUNE_PREFIX,
+            PREDICTION_PREFIX,
+            build_run_report,
+            resolve_run,
+        )
+
+        run_value = str(arguments.run)
+        explicit = Path(run_value).expanduser()
+        if explicit.is_dir():
+            run_dir = explicit
+        else:
+            output_root = arguments.output_root
+            if output_root is None:
+                config_path = _config_path(arguments.config)
+                if not config_path.is_file():
+                    return _missing_config_report(config_path)
+                output_root = load_harness_config(config_path).output_root
+            prefix = {
+                "symmetry": FINE_TUNE_PREFIX,
+                "prediction": PREDICTION_PREFIX,
+                "any": None,
+            }[str(arguments.prefix)]
+            run_dir = resolve_run(run_value, output_root, prefix=prefix)
+
+        notes = arguments.notes_text
+        if notes is None and arguments.notes is not None:
+            notes = (
+                Path(arguments.notes)
+                .expanduser()
+                .read_text(encoding="utf-8")
+            )
+        return build_run_report(
+            run_dir,
+            notes=notes,
+            figures=bool(arguments.figures),
+            output=arguments.output,
+        ).as_dict()
     launch_started = (
         perf_counter()
         if arguments.command in {"launch", "validate-traditional"}

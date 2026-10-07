@@ -14,6 +14,7 @@ from uuid import uuid4
 
 SERVER_STATE_SCHEMA_VERSION = "symmetry-harness-server-v1"
 DEFAULT_AGENT_PORT = 7860
+CONFIG_PATH_NAME = "config-path.txt"
 
 
 def state_directory() -> Path:
@@ -22,6 +23,30 @@ def state_directory() -> Path:
     if configured:
         return Path(configured).expanduser().resolve()
     return (Path.home() / ".symmetry-harness").resolve()
+
+
+def installed_config_path() -> Path | None:
+    """Return the Harness configuration recorded by the one-time installer.
+
+    The bundled launchers read the same ``config-path.txt`` file, so any command
+    that needs the installed configuration resolves it identically instead of
+    guessing a working directory. Returns ``None`` when the installer never ran
+    or the recorded file no longer exists.
+
+    The recorded text is read as bytes and decoded with ``utf-8-sig``: older
+    installers wrote it in text mode, which produced a UTF-8 BOM and CRLF line
+    endings on Windows, and either artifact would otherwise make an existing
+    path look missing. ``str.strip`` alone is not enough -- U+FEFF is not
+    whitespace to Python -- so the BOM is removed by the codec.
+    """
+    pointer = state_directory() / CONFIG_PATH_NAME
+    if not pointer.is_file():
+        return None
+    text = pointer.read_bytes().decode("utf-8-sig", errors="ignore").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    return path if path.is_file() else None
 
 
 def server_state_path(port: int) -> Path:

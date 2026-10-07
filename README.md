@@ -234,6 +234,7 @@ symmetry launch      preflight the runtime and launch the local UI
 symmetry run         execute a saved annotation session
 symmetry predict     predict images with a saved fine-tuned model package
 symmetry reproduce   repeat a prior completed run
+symmetry report      write the fixed-template Markdown report for a completed run
 symmetry ui          launch the local point-annotation interface
 ```
 
@@ -252,6 +253,8 @@ symmetry predict --model fine_tuned_model.symmodel --input image.npy
 symmetry predict --model fine_tuned_model.symmodel \
   --input one.tif --input two.tif --device cuda
 symmetry reproduce --record symmetry-runs/<run-id>/run_record.json
+symmetry report --run latest
+symmetry report --run symmetry-runs/<run-id> --notes session-notes.md
 ```
 
 `--mode fine-tune|predict` opens the requested workspace when the interface
@@ -280,7 +283,13 @@ confidence.png
 entropy.png
 run_record.json
 report.md
+report_summary.md
+figures/
 ```
+
+`report.md` is the automatic minimal summary written by every run.
+`report_summary.md` and `figures/` are the fixed-template report produced on
+demand by `symmetry report`; see [Run Reports](#run-reports).
 
 `fine_tuned_model.symmodel` is the portable inference artifact. It is a ZIP-based
 single-file package containing the complete fine-tuned model state, a versioned
@@ -309,6 +318,69 @@ and is rendered against the fixed interval `0..1`. Predictive entropy is
 probabilities are; it is rendered against `0..log(N)` for `N` local classes.
 Both use a blue-to-green-to-red scale from low to high.
 
+## Run Reports
+
+`symmetry report` turns a completed run directory into a fixed-template
+Markdown report plus the PNG figures it embeds. It is a presentation layer: it
+reads artifacts that already exist on disk and never recomputes features, never
+re-runs fine-tuning, and never runs dense prediction. Re-running it only
+re-renders pixels and re-emits prose.
+
+```bash
+# newest fine-tune run under the configured output root
+symmetry report --run latest
+
+# an explicit run directory, with session notes supplied by an agent
+symmetry report --run symmetry-runs/symmetry-<UTC>-<hash> --notes notes.md
+
+# newest prediction batch instead, and a text-only report
+symmetry report --run latest --prefix prediction --no-figures
+```
+
+Every report follows the same section order, so reports are comparable across
+runs:
+
+```text
+1. Summary                        7. Dense Prediction
+2. Workflow Overview              8. Configuration & Provenance
+3. Session Notes                  9. Caveats
+4. Input & Annotation            10. Artifacts
+5. Symmetry Features
+6. Fine-tuning
+```
+
+Only the values change. `Session Notes` is the single free-form slot: pass
+`--notes <file>` or `--notes-text "<text>"` to record what the interactive
+session actually did. Prediction-batch runs use a shorter variant of the same
+template, and each item gets its own report under `items/<item-id>/`.
+
+The report is written into the run directory it describes:
+
+```text
+symmetry-runs/<run-id>/
+├── report_summary.md
+└── figures/
+    ├── 01_input.png
+    ├── 02_support_points.png
+    ├── 03_symmetry_maps.png
+    ├── 04_training.png
+    ├── 05_prediction_mask.png
+    ├── 06_prediction_overlay.png
+    ├── 07_confidence.png
+    └── 08_entropy.png
+```
+
+Figure numbering is stable: `03_symmetry_maps.png` is always the eight-channel
+montage and `05_prediction_mask.png` is always the categorical mask, whichever
+run kind produced them. The symmetry montage and the feature table reuse the
+fixed per-channel display range the annotation UI uses, so a signed channel and
+an unsigned channel are never compared on a shared scale. The prediction figures
+reuse the same mask/overlay/confidence/entropy renderers as the UI.
+
+Loss curves are drawn on a base-10 log axis: an adapter loss routinely falls
+from `O(1)` to `O(1e-6)` within the first epochs, and a linear axis would
+collapse the entire useful range onto the baseline.
+
 ## Predicting With a Saved Model
 
 The prediction workflow applies a `fine_tuned_model.symmodel` package to new
@@ -335,6 +407,7 @@ symmetry-prediction-runs/
 └── prediction-<UTC>-<id>/
     ├── batch_record.json
     ├── report.md
+    ├── report_summary.md
     ├── results.zip
     └── items/
         └── image-0001/
@@ -345,7 +418,9 @@ symmetry-prediction-runs/
             ├── prediction_overlay.png
             ├── confidence.png
             ├── entropy.png
-            └── prediction_record.json
+            ├── prediction_record.json
+            ├── report_summary.md
+            └── figures/
 ```
 
 The source package is read-only. It is never modified, renamed, or copied into

@@ -154,6 +154,32 @@ with `launch`), so they work whether the interface was started via
 kill command that matches a single argument position; `-m` shifts the module
 name and such a match silently finds nothing.
 
+## Run Reports
+
+When the user asks for a report, a summary, or a write-up of a completed run,
+generate it with the built-in command instead of writing the document yourself.
+Run exactly one command, then return the reported `report` path:
+
+```bash
+symmetry report --run latest --notes-text "<what the session did>"
+```
+
+- `--run` accepts `latest` (default), a run id, or a run directory. `latest`
+  picks the newest run under the configured output root; use
+  `--prefix prediction` to target a prediction batch instead of a fine-tune run.
+- Always pass the session narrative through `--notes-text` or `--notes <file>`.
+  It is the only free-form section; every other section is derived from the run
+  record.
+- The command writes `report_summary.md` plus `figures/` **inside the run
+  directory** and prints JSON containing `report`, `figures`, and `item_reports`.
+  Return that path to the user; do not copy or reshape the file.
+- Add `--no-figures` only when the user explicitly asks for text without images.
+- Do not summarize a run from `report.md` alone: that file is the minimal
+  automatic record and carries no figures.
+
+See [references/run-report.md](references/run-report.md) for the section list,
+the figure set, and the degradation rules.
+
 ## Other Modes
 
 - When the user explicitly asks for traditional machine-learning validation — a
@@ -171,6 +197,8 @@ name and such a match silently finds nothing.
   [references/prediction.md](references/prediction.md).
 - For a saved annotation session or completed-run reproduction, read
   [references/reproduction.md](references/reproduction.md).
+- When the user asks for a report or summary of a completed run, read
+  [references/run-report.md](references/run-report.md).
 
 ## Compatibility
 
