@@ -1,23 +1,28 @@
 # Symmetry Analysis Run Report
 
-- **Run ID:** `{run_id}`
-- **Kind:** {kind}
-- **Status:** `{status}`
-- **Generated:** {generated_utc} by `symmetry report` (symmetry-harness {harness_version})
+**Run:** `{run_id}` | **Technical status:** `{status}` | **Analysis type:** {kind}
 
-## 1. Summary
+_Report generated {generated_utc} by symmetry-harness {harness_version}._
+
+## 1. Result at a Glance
 
 {summary}
 
-## 2. Workflow Overview
+{evidence_status}
 
-{workflow}
+{class_distribution_table}
 
-## 3. Session Notes
+## 2. Main Visual Evidence
+
+{fig_overview}
+
+{result_readout}
+
+## 3. Analysis Context
 
 {notes}
 
-## 4. Input & Annotation
+## 4. Input and Support Annotations
 
 {fig_input}
 
@@ -25,36 +30,47 @@
 
 {annotation_table}
 
-## 5. Symmetry Features
+{annotation_details}
+
+## 5. Prediction Certainty and Fine-tuning
+
+### Where the model is less certain
+
+{uncertainty_table}
+
+### Fit to the selected support points
+
+{training_interpretation}
+
+{fig_training}
+
+<details>
+<summary>Fine-tuning settings and numerical diagnostics</summary>
+
+{training_table}
+
+</details>
+
+## 6. Symmetry Representation
 
 The eight channels are a fixed representation: the source image plus one
 reflection-strength map, two signed reflection-orientation maps, and one
-rotation map per fold. Every tile is rendered against a fixed cross-image colour
-range, so tiles are comparable across runs and never renormalized per image.
+signed rotation-response map per fold. Source intensity and reflection strength
+use `[0, 1]`; all orientation and rotation-response channels use `[-1, 1]`.
+These fixed ranges make maps comparable across runs without per-image
+renormalization.
 
 {fig_symmetry}
 
 {feature_table}
 
-## 6. Fine-tuning
+## 7. Interpretation Boundaries
 
-{fig_training}
+{caveats}
 
-{training_table}
+## 8. Reproducibility
 
-## 7. Dense Prediction
-
-{fig_mask}
-
-{fig_overlay}
-
-{fig_confidence}
-
-{fig_entropy}
-
-{prediction_table}
-
-## 8. Configuration & Provenance
+{workflow}
 
 {configuration_table}
 
@@ -64,10 +80,6 @@ Reproduce this run from its versioned record:
 symmetry reproduce --record "{record_path}"
 ```
 
-## 9. Caveats
-
-{caveats}
-
-## 10. Artifacts
+## Appendix A. Artifacts
 
 {artifact_list}

@@ -28,8 +28,8 @@ Two run kinds are supported:
 
 The report is intentionally *fixed*: the section order, the figure set and the
 caveats do not vary with the data. Only the values and the figures do. The one
-free-form slot is ``Session Notes``, which the caller supplies (typically an
-agent summarising the interactive session that produced the run).
+free-form slot is ``Analysis Context``, which the caller supplies (typically an
+agent summarising the scientific context of the interactive session).
 """
 
 from __future__ import annotations
@@ -64,13 +64,21 @@ FINE_TUNE_PREFIX = "symmetry-"
 PREDICTION_PREFIX = "prediction-"
 
 KIND_FINE_TUNE = "fine-tune"
+KIND_FINE_TUNE_SESSION = "fine-tune-session"
 KIND_PREDICTION = "prediction-batch"
 
-#: Feature channels stored as signed values on ``[-1, 1]``; every other channel
-#: is unsigned on ``[0, 1]``. This mirrors the fixed ranges the annotation UI
-#: uses, so a report figure and the live UI never disagree about a channel.
+#: Orientation and rotation-response channels are displayed on ``[-1, 1]``;
+#: the source image and reflection strength use ``[0, 1]``. This mirrors the
+#: annotation UI so a report figure and the live UI never disagree.
 _SIGNED_FEATURE_CHANNELS = frozenset(
-    {"reflection_sin_2theta", "reflection_cos_2theta"}
+    {
+        "reflection_sin_2theta",
+        "reflection_cos_2theta",
+        "rotation_2_fold",
+        "rotation_3_fold",
+        "rotation_4_fold",
+        "rotation_6_fold",
+    }
 )
 
 _CONFIDENCE_COLORMAP = "viridis"
@@ -79,8 +87,11 @@ _ENTROPY_COLORMAP = "magma"
 _TEMPLATE_IMAGE = "run_report_image.md"
 _TEMPLATE_ITEM = "run_report_item.md"
 _TEMPLATE_BATCH = "run_report_batch.md"
+_TEMPLATE_SESSION = "run_report_session.md"
 
-# Figure basenames, in the order the single-image report embeds them.
+# Figure basenames. ``00`` is the human-facing overview; the stable ``01`` to
+# ``08`` files remain the inspectable source figures used to build it.
+FIG_OVERVIEW = "00_results_overview.png"
 FIG_INPUT = "01_input.png"
 FIG_SUPPORT = "02_support_points.png"
 FIG_SYMMETRY = "03_symmetry_maps.png"
@@ -101,6 +112,11 @@ _TRAINING_GAP = 56
 _TRAINING_MARGIN = 72
 
 _SUPPORT_MARKER_RADIUS = 7
+
+_OVERVIEW_PANEL_WIDTH = 520
+_OVERVIEW_PANEL_HEIGHT = 520
+_OVERVIEW_LABEL_HEIGHT = 34
+_OVERVIEW_GAP = 18
 
 
 class ReportError(ValueError):
@@ -301,6 +317,51 @@ def resolve_run(
             return run
 
     raise ReportError(f"Run directory not found: {value}")
+
+
+def resolve_fine_tune_session(
+    output_root: str | Path, session: str = "latest"
+) -> tuple[str, list[Path]]:
+    """Resolve all fine-tune runs belonging to one recorded UI session.
+
+    Older runs have no ``session_id``. For ``latest`` they degrade to a
+    one-run session so the agent command remains useful across upgrades.
+    """
+    runs = discover_runs(output_root, prefix=FINE_TUNE_PREFIX)
+    records: list[tuple[Path, Mapping[str, Any]]] = []
+    for run in runs:
+        try:
+            record = _read_json(run / "run_record.json")
+        except ReportError:
+            continue
+        records.append((run, record))
+    if not records:
+        raise ReportError(f"No fine-tune runs found under {Path(output_root).expanduser()}.")
+
+    requested = str(session).strip()
+    if requested.casefold() == "latest":
+        selected_id = next(
+            (
+                str(record.get("session_id"))
+                for _, record in records
+                if record.get("session_id")
+            ),
+            None,
+        )
+        if selected_id is None:
+            newest = records[0][0]
+            return f"legacy-{newest.name}", [newest]
+    else:
+        selected_id = requested
+
+    matching = [
+        run
+        for run, record in records
+        if str(record.get("session_id") or "") == selected_id
+    ]
+    if not matching:
+        raise ReportError(f"Fine-tuning session not found: {session}")
+    return selected_id, sorted(matching, key=lambda path: path.name)
 
 
 def detect_kind(run_dir: str | Path) -> str:
@@ -543,6 +604,48 @@ def build_training_figure(
     return np.asarray(canvas, dtype=np.uint8)
 
 
+def build_results_overview_figure(
+    panels: Sequence[tuple[str, np.ndarray]],
+) -> np.ndarray:
+    """Compose the four most useful result views into a compact 2x2 summary."""
+    selected = list(panels[:4])
+    if not selected:
+        raise ReportError("A results overview requires at least one panel.")
+    columns = 2
+    rows = (len(selected) + columns - 1) // columns
+    cell_width = _OVERVIEW_PANEL_WIDTH
+    cell_height = _OVERVIEW_PANEL_HEIGHT + _OVERVIEW_LABEL_HEIGHT
+    canvas = Image.new(
+        "RGB",
+        (
+            columns * cell_width + (columns - 1) * _OVERVIEW_GAP,
+            rows * cell_height + (rows - 1) * _OVERVIEW_GAP,
+        ),
+        (255, 255, 255),
+    )
+    draw = ImageDraw.Draw(canvas)
+    font = _font(16)
+    for position, (title, array) in enumerate(selected):
+        row, column = divmod(position, columns)
+        x = column * (cell_width + _OVERVIEW_GAP)
+        y = row * (cell_height + _OVERVIEW_GAP)
+        draw.text((x + 6, y + 6), title, fill=(0, 0, 0), font=font)
+        image = Image.fromarray(_rgb(array))
+        image.thumbnail(
+            (cell_width, _OVERVIEW_PANEL_HEIGHT), Image.Resampling.LANCZOS
+        )
+        image_x = x + (cell_width - image.width) // 2
+        image_y = y + _OVERVIEW_LABEL_HEIGHT + (
+            _OVERVIEW_PANEL_HEIGHT - image.height
+        ) // 2
+        canvas.paste(image, (image_x, image_y))
+        draw.rectangle(
+            [x, y + _OVERVIEW_LABEL_HEIGHT, x + cell_width - 1, y + cell_height - 1],
+            outline=(190, 190, 190),
+        )
+    return np.asarray(canvas, dtype=np.uint8)
+
+
 # ---------------------------------------------------------------------------
 # Record parsing
 # ---------------------------------------------------------------------------
@@ -579,6 +682,11 @@ def _classes_from_names(
 
 def _prediction_from_item(item_dir: Path) -> DensePrediction:
     return dense_prediction_from_arrays(_load_npz(item_dir / "prediction.npz"))
+
+
+def _png_array(path: Path) -> np.ndarray:
+    with Image.open(path) as image:
+        return np.asarray(image.convert("RGB"), dtype=np.uint8)
 
 
 def _item_figures(
@@ -669,6 +777,23 @@ def _item_figures(
             variants["entropy_colorbar"], figures_dir / FIG_ENTROPY
         )
 
+        source_key = "fig_support" if "fig_support" in written else "fig_input"
+        overview_panels = [
+            (
+                "Support annotations"
+                if source_key == "fig_support"
+                else "Normalized input",
+                _png_array(written[source_key]),
+            ),
+            ("Prediction overlay", _png_array(written["fig_overlay"])),
+            ("Model confidence", _png_array(written["fig_confidence"])),
+            ("Prediction entropy", _png_array(written["fig_entropy"])),
+        ]
+        written["fig_overview"] = write_png(
+            build_results_overview_figure(overview_panels),
+            figures_dir / FIG_OVERVIEW,
+        )
+
     return written
 
 
@@ -728,13 +853,219 @@ def _annotation_table(classes: Sequence[_ClassEntry]) -> str:
             entry.name,
             entry.color,
             len(entry.points_xy),
-            ", ".join(f"({x}, {y})" for x, y in entry.points_xy) or "(none)",
         ]
         for entry in classes
     ]
     return _md_table(
-        ["Index", "Class", "Color", "Support points", "Point coordinates (x, y)"],
+        ["Index", "Class", "Color", "Support points"],
         rows,
+    )
+
+
+def _annotation_details(classes: Sequence[_ClassEntry]) -> str:
+    rows = [
+        [
+            entry.name,
+            ", ".join(f"({x}, {y})" for x, y in entry.points_xy) or "(none)",
+        ]
+        for entry in classes
+    ]
+    return (
+        "<details>\n<summary>Support-point coordinates</summary>\n\n"
+        + _md_table(["Class", "Coordinates (x, y)"], rows)
+        + "\n\n</details>"
+    )
+
+
+def _percent(value: float, *, digits: int = 1) -> str:
+    return f"{100.0 * value:.{digits}f}%"
+
+
+def _finite(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float64).reshape(-1)
+    return array[np.isfinite(array)]
+
+
+def _prediction_readout(
+    prediction: DensePrediction | None,
+    classes: Sequence[_ClassEntry],
+    *,
+    include_support: bool,
+) -> tuple[str, str, str]:
+    """Return class distribution, uncertainty table and compact interpretation."""
+    if prediction is None:
+        unavailable = "_(prediction bundle not persisted)_"
+        return unavailable, unavailable, unavailable
+
+    labels = np.asarray(prediction.predictions, dtype=np.int64)
+    total = max(int(labels.size), 1)
+    class_rows: list[list[Any]] = []
+    known_indices = {entry.index for entry in classes}
+    for entry in classes:
+        count = int(np.count_nonzero(labels == entry.index))
+        row: list[Any] = [entry.name, entry.color]
+        if include_support:
+            row.append(len(entry.points_xy))
+        row.extend([count, _percent(count / total)])
+        class_rows.append(row)
+    for index in sorted(set(int(value) for value in np.unique(labels)) - known_indices):
+        count = int(np.count_nonzero(labels == index))
+        row = [f"Unmapped class {index}", "-"]
+        if include_support:
+            row.append(0)
+        row.extend([count, _percent(count / total)])
+        class_rows.append(row)
+    class_header = ["Class", "Color"]
+    if include_support:
+        class_header.append("Support points")
+    class_header.extend(["Predicted grid points", "Grid share"])
+
+    confidence = _finite(prediction.confidence)
+    entropy = _finite(prediction.entropy)
+    class_count = max(len(classes), int(prediction.probabilities.shape[1]), 2)
+    entropy_scale = float(np.log(class_count))
+    normalized_entropy = entropy / entropy_scale if entropy.size else entropy
+
+    low_confidence_fraction = (
+        float(np.mean(confidence < 0.75)) if confidence.size else float("nan")
+    )
+    high_entropy_fraction = (
+        float(np.mean(normalized_entropy > 0.5))
+        if normalized_entropy.size
+        else float("nan")
+    )
+    median_confidence = (
+        float(np.quantile(confidence, 0.50)) if confidence.size else float("nan")
+    )
+    uncertainty_table = _md_table(
+        ["What was checked", "Result", "Practical meaning"],
+        [
+            [
+                "At a typical sampled location",
+                f"{_percent(median_confidence, digits=3)} model confidence"
+                if np.isfinite(median_confidence)
+                else "-",
+                "The model strongly favors one class.",
+            ],
+            [
+                "Locations with weaker predictions",
+                _percent(low_confidence_fraction)
+                if np.isfinite(low_confidence_fraction)
+                else "-",
+                "These locations fall below 75% model confidence and deserve closer visual review.",
+            ],
+            [
+                "Locations with substantial class ambiguity",
+                _percent(high_entropy_fraction)
+                if np.isfinite(high_entropy_fraction)
+                else "-",
+                "The model does not clearly favor a single class at these locations.",
+            ],
+        ],
+    )
+    uncertainty_table += (
+        "\n\n_The two cutoffs are practical flags for reviewing the maps, not "
+        "measurements of prediction accuracy or physical correctness._\n\n"
+        "<details>\n<summary>Technical definition of these checks</summary>\n\n"
+        "A weaker prediction has maximum class probability below 0.75. "
+        "Substantial class ambiguity means normalized prediction entropy "
+        "`H / ln(N)` is above 0.5.\n\n</details>"
+    )
+    readout = (
+        "Most sampled locations received a decisive class assignment. "
+        f"{_percent(low_confidence_fraction)} had weaker predictions and "
+        f"{_percent(high_entropy_fraction)} showed substantial ambiguity between "
+        "classes. Those locations are the most useful places to inspect in the "
+        "confidence and ambiguity maps; they are not automatically incorrect."
+    )
+    return _md_table(class_header, class_rows), uncertainty_table, readout
+
+
+def _compact_prediction_summary(
+    prediction: DensePrediction | None,
+    classes: Sequence[_ClassEntry],
+) -> tuple[str, str]:
+    """Return short class-share and review summaries for a session index."""
+    if prediction is None:
+        return "not available", "not available"
+    labels = np.asarray(prediction.predictions, dtype=np.int64)
+    total = max(int(labels.size), 1)
+    distribution = "; ".join(
+        f"{entry.name} {_percent(int(np.count_nonzero(labels == entry.index)) / total)}"
+        for entry in classes
+    )
+    confidence = _finite(prediction.confidence)
+    entropy = _finite(prediction.entropy)
+    class_count = max(len(classes), int(prediction.probabilities.shape[1]), 2)
+    normalized_entropy = entropy / float(np.log(class_count)) if entropy.size else entropy
+    weaker = float(np.mean(confidence < 0.75)) if confidence.size else float("nan")
+    ambiguous = (
+        float(np.mean(normalized_entropy > 0.5))
+        if normalized_entropy.size
+        else float("nan")
+    )
+    review = (
+        f"{_percent(weaker)} lower confidence; "
+        f"{_percent(ambiguous)} mixed class evidence"
+        if np.isfinite(weaker) and np.isfinite(ambiguous)
+        else "not available"
+    )
+    return distribution or "not available", review
+
+
+def _evidence_status(
+    classes: Sequence[_ClassEntry],
+    *,
+    recommended_shots: int | None = None,
+) -> str:
+    paragraphs = [
+        "> **Evidence status:** exploratory model output. This run contains no "
+        "independent ground truth or held-out evaluation, so support accuracy, "
+        "confidence and entropy must not be read as physical validation."
+    ]
+    if classes and all(entry.name.strip().casefold().startswith("class ") for entry in classes):
+        paragraphs.append(
+            "> **Class semantics:** the classes still use generic names. Rename them "
+            "before sharing if they correspond to phases, domains, defects or other "
+            "material categories."
+        )
+    if recommended_shots is not None:
+        below = [
+            entry.name
+            for entry in classes
+            if len(entry.points_xy) < recommended_shots
+        ]
+        if below:
+            paragraphs.append(
+                "> **Annotation coverage:** "
+                + ", ".join(below)
+                + f" use fewer than the configured recommendation of {recommended_shots} "
+                "support points per class."
+            )
+    return "\n\n".join(paragraphs)
+
+
+def _training_interpretation(
+    loss: Sequence[Any], accuracy: Sequence[Any]
+) -> str:
+    values = np.asarray([float(value) for value in accuracy], dtype=np.float64)
+    perfect = np.flatnonzero(values >= 1.0 - 1e-12)
+    if perfect.size:
+        fit = (
+            "The model matched all selected support points by epoch "
+            f"{int(perfect[0]) + 1}."
+        )
+    elif values.size:
+        fit = (
+            "At the end of fine-tuning, the model matched "
+            f"{_percent(float(values[-1]))} of the selected support points."
+        )
+    else:
+        fit = "The point-by-point fitting history was not persisted."
+    return (
+        fit
+        + " This shows that it learned the selected examples; it does not measure "
+        "performance elsewhere in the image or on independent images."
     )
 
 
@@ -778,13 +1109,31 @@ def _caveats(record: Mapping[str, Any]) -> str:
     return _bullet_list(recorded)
 
 
-def _artifact_list(record: Mapping[str, Any]) -> str:
+def _artifact_list(
+    record: Mapping[str, Any],
+    *,
+    run_dir: Path,
+    report_dir: Path,
+    extras: Mapping[str, Path] | None = None,
+) -> str:
     artifacts = record.get("artifacts", {})
-    if not isinstance(artifacts, Mapping) or not artifacts:
+    merged: dict[str, Any] = dict(artifacts) if isinstance(artifacts, Mapping) else {}
+    if extras:
+        merged.update(extras)
+    if not merged:
         return "- (no artifact map recorded)"
-    return _bullet_list(
-        f"`{name}`: `{value}`" for name, value in sorted(artifacts.items())
-    )
+    rows: list[str] = []
+    for name, value in sorted(merged.items()):
+        path = Path(str(value)).expanduser()
+        if not path.is_absolute():
+            path = run_dir / path
+        try:
+            link = Path(os.path.relpath(path, report_dir)).as_posix()
+        except ValueError:
+            rows.append(f"`{name}`: `{path.name}`")
+            continue
+        rows.append(f"[`{name}`](<{link}>) - `{path.name}`")
+    return _bullet_list(rows)
 
 
 def _latest(record: Mapping[str, Any]) -> float:
@@ -820,36 +1169,24 @@ def _build_fine_tune_report(
         )
 
     prediction = record.get("prediction", {})
-    confidence_range = prediction.get("confidence_range", [None, None])
-    entropy_range = prediction.get("entropy_range", [None, None])
     training = record.get("training", {})
     support_points = sum(len(entry.points_xy) for entry in classes)
     image_shape = record.get("input", {}).get("shape", [None, None])
-
-    def _range(pair: Any) -> str:
-        if not isinstance(pair, Sequence) or len(pair) < 2 or pair[0] is None:
-            return "n/a"
-        return (
-            f"[{_fmt(float(pair[0]), digits=4)}, "
-            f"{_fmt(float(pair[1]), digits=4)}]"
-        )
-
+    input_path = record.get("input", {}).get("path")
+    input_label = Path(str(input_path)).name if input_path else "input image"
     grid_shape = prediction.get("grid_shape", ["?", "?"]) or ["?", "?"]
     summary = (
-        f"A `{record.get('model', {}).get('identifier', 'unknown')}` adapter was "
-        f"fine-tuned for {len(classes)} classes from {support_points} support "
-        f"points on a {image_shape[0]}x{image_shape[1]} single-channel image, then "
-        f"applied as a dense prediction on a {grid_shape[0]}x{grid_shape[1]} grid "
-        f"at stride {stride}. Support-set diagnostics ended at loss "
-        f"{_fmt_any(training.get('final_support_loss'), digits=4)} and accuracy "
-        f"{_fmt_any(training.get('final_support_accuracy'), digits=4)}; confidence "
-        f"spanned {_range(confidence_range)} and entropy "
-        f"{_range(entropy_range)}."
+        f"This run used {support_points} user-selected support points across "
+        f"{len(classes)} classes to adapt `{record.get('model', {}).get('identifier', 'unknown')}` "
+        f"for **{input_label}** ({image_shape[0]} x {image_shape[1]} pixels). "
+        f"The fitted model classified {prediction.get('sample_count', '?')} sampled "
+        f"locations on a {grid_shape[0]} x {grid_shape[1]} grid at stride {stride}. "
+        "The table below reports the distribution of model-assigned classes; it "
+        "does not by itself establish their physical meaning or correctness."
     )
 
     workflow = _bullet_list(
         [
-            "Launched the local Harness interface.",
             f"Loaded and normalized one single-channel image "
             f"({image_shape[0]}x{image_shape[1]}; "
             f"{record.get('input', {}).get('normalization', {}).get('policy', 'minmax_0_1')}).",
@@ -858,16 +1195,39 @@ def _build_fine_tune_report(
             f"patch={options.get('symmetry_patch_size')}, "
             f"folds={options.get('rotation_folds')}).",
             f"Defined {len(classes)} classes and placed {support_points} support points.",
-            f"Fine-tuned the adapter head while the pretrained trunk stayed frozen "
+            f"Fine-tuned the residual adapters and task-specific classification "
+            f"head while the pretrained trunk stayed frozen "
             f"({options.get('epochs')} epochs, lr={options.get('learning_rate')}, "
             f"bottleneck={options.get('adapter_bottleneck')}, "
             f"seed={options.get('seed')}).",
             f"Ran dense prediction at stride {stride} and rendered the class mask, "
             f"confidence and entropy maps.",
-            "Persisted the run record, adapter and (when exported) the portable "
-            "fine-tuned model package.",
-            "Generated this report from the persisted artifacts.",
+            "Persisted the run record and the fitted-model artifacts available for this run.",
         ]
+    )
+
+    history = _read_json_optional(run_dir / "training_history.json") or {}
+    loss_history = history.get("loss") or training.get("loss") or []
+    accuracy_history = (
+        history.get("support_accuracy") or training.get("support_accuracy") or []
+    )
+    persisted_prediction = (
+        _prediction_from_item(run_dir)
+        if (run_dir / "prediction.npz").is_file()
+        else None
+    )
+    class_distribution_table, uncertainty_table, result_readout = (
+        _prediction_readout(persisted_prediction, classes, include_support=True)
+    )
+    recommended_shots_raw = (
+        record.get("configuration", {})
+        .get("fine_tuning", {})
+        .get("recommended_shots_per_class")
+    )
+    recommended_shots = (
+        int(recommended_shots_raw)
+        if isinstance(recommended_shots_raw, (int, float))
+        else None
     )
 
     training_table = _md_table(
@@ -893,8 +1253,8 @@ def _build_fine_tune_report(
             ["Sample count", prediction.get("sample_count")],
             ["Stride", stride],
             ["Batch size", options.get("batch_size")],
-            ["Confidence range", confidence_range],
-            ["Entropy range", entropy_range],
+            ["Confidence range", prediction.get("confidence_range")],
+            ["Entropy range", prediction.get("entropy_range")],
         ],
     )
 
@@ -905,20 +1265,20 @@ def _build_fine_tune_report(
             ["Run ID", record.get("run_id")],
             ["Created (UTC)", record.get("created_utc")],
             ["Status", record.get("status")],
+            ["Input", input_label],
             ["Classifier patch size", options.get("classifier_patch_size")],
             ["Symmetry patch size", options.get("symmetry_patch_size")],
             ["Rotation folds", options.get("rotation_folds")],
             ["Reflection p", options.get("reflection_p")],
             ["N max", options.get("n_max")],
             ["Input normalization", options.get("input_normalization")],
-            [
-                "Checkpoint path",
-                record.get("model", {}).get("checkpoint", {}).get("path"),
-            ],
+            ["Base weight", record.get("model", {}).get("checkpoint", {}).get("weight_identifier")],
+            ["Checkpoint source", record.get("model", {}).get("checkpoint", {}).get("source")],
             [
                 "Checkpoint SHA-256",
                 record.get("model", {}).get("checkpoint", {}).get("sha256"),
             ],
+            ["Run harness version", record.get("symmetry_harness_version", "not recorded")],
             [
                 "Provider",
                 f"{record.get('provider', {}).get('name')} "
@@ -939,11 +1299,11 @@ def _build_fine_tune_report(
         ],
     )
 
-    record_path = (run_dir / "run_record.json").resolve()
     # The report sits beside ``figures/``, so its own directory is the base the
     # image links must be relative to.
     target = output or (run_dir / REPORT_FILENAME)
     report_dir = target.parent
+    record_path = Path(os.path.relpath(run_dir / "run_record.json", report_dir)).as_posix()
     context = {
         "run_id": str(record.get("run_id", run_dir.name)),
         "kind": KIND_FINE_TUNE,
@@ -953,6 +1313,21 @@ def _build_fine_tune_report(
         "summary": summary,
         "workflow": workflow,
         "notes": notes.strip() if notes and notes.strip() else "_Not provided._",
+        "evidence_status": _evidence_status(
+            classes, recommended_shots=recommended_shots
+        ),
+        "class_distribution_table": class_distribution_table,
+        "result_readout": result_readout,
+        "uncertainty_table": uncertainty_table,
+        "training_interpretation": _training_interpretation(
+            loss_history, accuracy_history
+        ),
+        "fig_overview": _figure_markdown(
+            written,
+            "fig_overview",
+            "Annotations, prediction and uncertainty overview",
+            report_dir=report_dir,
+        ),
         "fig_input": _figure_markdown(
             written, "fig_input", "Normalized input image", report_dir=report_dir
         ),
@@ -987,6 +1362,7 @@ def _build_fine_tune_report(
             written, "fig_entropy", "Entropy map (magma)", report_dir=report_dir
         ),
         "annotation_table": _annotation_table(classes),
+        "annotation_details": _annotation_details(classes),
         "feature_table": _feature_table(_load_npz(run_dir / "features.npz"))
         if (run_dir / "features.npz").is_file()
         else "(feature bundle not persisted)",
@@ -994,7 +1370,15 @@ def _build_fine_tune_report(
         "prediction_table": prediction_table,
         "configuration_table": configuration_table,
         "caveats": _caveats(record),
-        "artifact_list": _artifact_list(record),
+        "artifact_list": _artifact_list(
+            record,
+            run_dir=run_dir,
+            report_dir=report_dir,
+            extras={
+                "report_summary": target,
+                **({"report_figures": figures_dir} if figures else {}),
+            },
+        ),
         "record_path": str(record_path),
     }
 
@@ -1036,16 +1420,17 @@ def _build_prediction_item_report(
     image_shape = record.get("input", {}).get("shape", [None, None])
     summary = (
         f"The saved fine-tuned model "
-        f"`{record.get('model', {}).get('identifier', 'unknown')}` was applied to "
-        f"{item_label}, a {image_shape[0]}x{image_shape[1]} single-channel image. "
-        f"Dense prediction covered {output.get('sample_count')} samples on a "
-        f"{output.get('grid_shape', ['?', '?'])[0]}x"
-        f"{output.get('grid_shape', ['?', '?'])[1]} grid at stride {stride}."
+        f"`{record.get('model', {}).get('identifier', 'unknown')}` classified "
+        f"{item_label}, a {image_shape[0]} x {image_shape[1]} single-channel image. "
+        f"The result covers {output.get('sample_count')} sampled locations on a "
+        f"{output.get('grid_shape', ['?', '?'])[0]} x "
+        f"{output.get('grid_shape', ['?', '?'])[1]} grid at stride {stride}. "
+        "The class distribution below describes model assignments, not verified "
+        "material fractions."
     )
 
     workflow = _bullet_list(
         [
-            "Opened the saved-model prediction workspace.",
             f"Imported the fine-tuned package "
             f"`{batch.get('package', {}).get('schema_version', 'symmodel')}` "
             f"(training run "
@@ -1054,8 +1439,16 @@ def _build_prediction_item_report(
             f"({image_shape[0]}x{image_shape[1]}) and computed its eight-channel "
             f"representation.",
             f"Ran dense prediction at stride {stride}.",
-            "Generated this report from the persisted artifacts.",
         ]
+    )
+
+    persisted_prediction = (
+        _prediction_from_item(item_dir)
+        if (item_dir / "prediction.npz").is_file()
+        else None
+    )
+    class_distribution_table, uncertainty_table, result_readout = (
+        _prediction_readout(persisted_prediction, classes, include_support=False)
     )
 
     prediction_table = _md_table(
@@ -1079,7 +1472,12 @@ def _build_prediction_item_report(
             ["Status", record.get("status")],
             ["Class names", [entry.name for entry in classes]],
             ["Class colors", [entry.color for entry in classes]],
-            ["Package path", batch.get("package", {}).get("path")],
+            [
+                "Model package",
+                Path(str(batch.get("package", {}).get("path"))).name
+                if batch.get("package", {}).get("path")
+                else None,
+            ],
             ["Package SHA-256", batch.get("package", {}).get("package_sha256")],
             [
                 "Model state SHA-256",
@@ -1109,6 +1507,16 @@ def _build_prediction_item_report(
         "summary": summary,
         "workflow": workflow,
         "notes": notes.strip() if notes and notes.strip() else "_Not provided._",
+        "evidence_status": _evidence_status(classes),
+        "class_distribution_table": class_distribution_table,
+        "result_readout": result_readout,
+        "uncertainty_table": uncertainty_table,
+        "fig_overview": _figure_markdown(
+            written,
+            "fig_overview",
+            "Input, prediction and uncertainty overview",
+            report_dir=item_dir,
+        ),
         "fig_input": _figure_markdown(
             written, "fig_input", "Normalized input image", report_dir=item_dir
         ),
@@ -1150,7 +1558,15 @@ def _build_prediction_item_report(
                 record.get("warnings", []) or []
             )}
         ),
-        "artifact_list": _artifact_list(record),
+        "artifact_list": _artifact_list(
+            record,
+            run_dir=item_dir,
+            report_dir=item_dir,
+            extras={
+                "report_summary": item_dir / REPORT_FILENAME,
+                **({"report_figures": figures_dir} if figures else {}),
+            },
+        ),
         "record_path": str((item_dir / "prediction_record.json").resolve()),
     }
 
@@ -1175,6 +1591,7 @@ def _build_prediction_batch_report(
     output: Path | None,
 ) -> ReportResult:
     batch = _read_json(run_dir / "batch_record.json")
+    target = output or (run_dir / REPORT_FILENAME)
     model = batch.get("model", {})
     classes = _classes_from_names(
         model.get("class_names", []) or [], model.get("class_colors", []) or []
@@ -1193,7 +1610,7 @@ def _build_prediction_batch_report(
                 batch=batch,
                 classes=classes,
                 stride=stride,
-                notes=notes,
+                notes=None,
                 figures=figures,
                 item_label=f"`{item_id}`",
             )
@@ -1211,7 +1628,9 @@ def _build_prediction_batch_report(
     item_rows = [
         [
             report.report_path.parent.name,
-            f"[report](items/{report.report_path.parent.name}/{REPORT_FILENAME})",
+            "[report](<"
+            + Path(os.path.relpath(report.report_path, target.parent)).as_posix()
+            + ">)",
             len(report.figure_paths),
         ]
         for report in item_reports
@@ -1222,6 +1641,7 @@ def _build_prediction_batch_report(
         "generated_utc": _utc_now_iso(),
         "harness_version": __version__,
         "summary": summary,
+        "evidence_status": _evidence_status(classes),
         "notes": notes.strip() if notes and notes.strip() else "_Not provided._",
         "class_table": _md_table(
             ["Index", "Class", "Color"],
@@ -1246,7 +1666,12 @@ def _build_prediction_batch_report(
                 ["Task classes", model.get("task_classes")],
                 ["Stride", stride],
                 ["Batch size", batch.get("prediction_options", {}).get("batch_size")],
-                ["Package path", batch.get("package", {}).get("path")],
+                [
+                    "Model package",
+                    Path(str(batch.get("package", {}).get("path"))).name
+                    if batch.get("package", {}).get("path")
+                    else None,
+                ],
                 ["Package SHA-256", batch.get("package", {}).get("package_sha256")],
                 [
                     "Training run",
@@ -1265,11 +1690,15 @@ def _build_prediction_batch_report(
             ],
         ),
         "caveats": _caveats(batch),
-        "artifact_list": _artifact_list(batch),
+        "artifact_list": _artifact_list(
+            batch,
+            run_dir=run_dir,
+            report_dir=target.parent,
+            extras={"report_summary": target},
+        ),
         "record_path": str((run_dir / "batch_record.json").resolve()),
     }
 
-    target = output or (run_dir / REPORT_FILENAME)
     report_path = _write_report(
         target, template=_template(_TEMPLATE_BATCH), context=context
     )
@@ -1293,7 +1722,7 @@ def build_run_report(
 ) -> ReportResult:
     """Generate the fixed-template report for one completed run directory.
 
-    ``notes`` is the free-form ``Session Notes`` body. ``figures=False`` skips
+    ``notes`` is the free-form ``Analysis Context`` body. ``figures=False`` skips
     PNG rendering and the report embeds no images. ``output`` overrides the
     default ``<run>/report_summary.md`` location.
     """
@@ -1308,4 +1737,176 @@ def build_run_report(
         )
     return _build_prediction_batch_report(
         directory, notes=notes, figures=figures, output=target
+    )
+
+
+def build_fine_tune_session_report(
+    output_root: str | Path,
+    *,
+    session: str = "latest",
+    notes: str | None = None,
+    figures: bool = True,
+    output: str | Path | None = None,
+) -> ReportResult:
+    """Build one compact index for all fine-tune runs from a UI session.
+
+    A one-run session returns the ordinary image report directly. Multi-run
+    sessions keep those reports independent and add only a lightweight index.
+    """
+    root = Path(output_root).expanduser().resolve()
+    session_id, run_dirs = resolve_fine_tune_session(root, session)
+    if len(run_dirs) == 1:
+        return build_run_report(
+            run_dirs[0], notes=notes, figures=figures, output=output
+        )
+
+    safe_session_id = "".join(
+        character if character.isalnum() or character in "-_" else "_"
+        for character in session_id
+    )[:120]
+    target = (
+        Path(output).expanduser()
+        if output is not None
+        else root / "sessions" / safe_session_id / REPORT_FILENAME
+    )
+    report_dir = target.parent
+
+    child_results: list[ReportResult] = []
+    run_rows: list[list[Any]] = []
+    run_sections: list[str] = []
+    reproduction_rows: list[list[Any]] = []
+    class_signatures: list[tuple[str, ...]] = []
+    setting_signatures: list[tuple[Any, ...]] = []
+
+    for index, run_dir in enumerate(run_dirs, start=1):
+        existing_report = run_dir / REPORT_FILENAME
+        existing_overview = run_dir / FIGURES_DIRNAME / FIG_OVERVIEW
+        if existing_report.is_file() and (not figures or existing_overview.is_file()):
+            figure_paths = (
+                tuple(sorted((run_dir / FIGURES_DIRNAME).glob("*.png")))
+                if figures
+                else ()
+            )
+            child = ReportResult(
+                run_id=run_dir.name,
+                kind=KIND_FINE_TUNE,
+                report_path=existing_report,
+                figure_paths=figure_paths,
+            )
+        else:
+            child = build_run_report(run_dir, figures=figures)
+        child_results.append(child)
+
+        record = _read_json(run_dir / "run_record.json")
+        annotation = _read_json(run_dir / "annotation_session.json")
+        classes = _classes_from_annotations(annotation)
+        prediction = (
+            _prediction_from_item(run_dir)
+            if (run_dir / "prediction.npz").is_file()
+            else None
+        )
+        distribution, review = _compact_prediction_summary(prediction, classes)
+        input_path = record.get("input", {}).get("path")
+        input_label = Path(str(input_path)).name if input_path else run_dir.name
+        support_count = sum(len(entry.points_xy) for entry in classes)
+        report_link = Path(
+            os.path.relpath(child.report_path, report_dir)
+        ).as_posix()
+        overview_path = run_dir / FIGURES_DIRNAME / FIG_OVERVIEW
+        overview_link = Path(
+            os.path.relpath(overview_path, report_dir)
+        ).as_posix()
+        record_link = Path(
+            os.path.relpath(run_dir / "run_record.json", report_dir)
+        ).as_posix()
+
+        run_rows.append(
+            [
+                input_label,
+                ", ".join(entry.name for entry in classes),
+                support_count,
+                distribution,
+                review,
+                f"[open](<{report_link}>)",
+            ]
+        )
+        section_parts = [
+            "<details>",
+            f"<summary>{index}. {input_label} - {run_dir.name}</summary>",
+            "",
+        ]
+        if figures and overview_path.is_file():
+            section_parts.extend(
+                [f"![Results overview for {input_label}]({overview_link})", ""]
+            )
+        section_parts.extend(
+            [f"[Open the complete image report](<{report_link}>)", "", "</details>"]
+        )
+        run_sections.append("\n".join(section_parts))
+        reproduction_rows.append(
+            [
+                run_dir.name,
+                f"[`run_record.json`](<{record_link}>)",
+                f"[image report](<{report_link}>)",
+            ]
+        )
+        class_signatures.append(tuple(entry.name for entry in classes))
+        options = record.get("options", {})
+        setting_signatures.append(
+            (
+                record.get("model", {}).get("identifier"),
+                options.get("classifier_patch_size"),
+                options.get("symmetry_patch_size"),
+                tuple(options.get("rotation_folds", []) or []),
+                options.get("n_max"),
+                options.get("stride"),
+            )
+        )
+
+    structurally_comparable = (
+        len(set(class_signatures)) == 1 and len(set(setting_signatures)) == 1
+    )
+    comparison_status = (
+        "> **Comparison note:** the runs use the same class names and core analysis "
+        "settings, so side-by-side review is structurally consistent. Confirm that "
+        "the class names carry the same material meaning before interpreting changes."
+        if structurally_comparable
+        else "> **Comparison note:** class names or analysis settings differ across "
+        "these runs. Treat them as separate experiments rather than comparing their "
+        "class proportions directly."
+    )
+    context = {
+        "session_id": session_id,
+        "run_count": str(len(run_dirs)),
+        "generated_utc": _utc_now_iso(),
+        "harness_version": __version__,
+        "comparison_status": comparison_status,
+        "run_table": _md_table(
+            [
+                "Image",
+                "Labels used",
+                "Examples used for fine-tuning",
+                "Predicted area by label",
+                "Areas worth checking",
+                "Full report",
+            ],
+            run_rows,
+        ),
+        "run_sections": "\n\n".join(run_sections),
+        "notes": notes.strip() if notes and notes.strip() else "_Not provided._",
+        "reproduction_table": _md_table(
+            ["Run", "Versioned record", "Detailed report"], reproduction_rows
+        ),
+    }
+    report_path = _write_report(
+        target, template=_template(_TEMPLATE_SESSION), context=context
+    )
+    return ReportResult(
+        run_id=session_id,
+        kind=KIND_FINE_TUNE_SESSION,
+        report_path=report_path,
+        figure_paths=tuple(
+            path for child in child_results for path in child.figure_paths
+        ),
+        item_reports=tuple(child.report_path for child in child_results),
     )

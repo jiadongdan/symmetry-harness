@@ -169,6 +169,12 @@ def _new_run_directory(root: Path) -> tuple[str, Path]:
     return run_id, directory
 
 
+def new_fine_tune_session_id() -> str:
+    """Return one stable identifier for all runs from a UI workspace instance."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"fine-tune-session-{timestamp}-{uuid4().hex[:8]}"
+
+
 def _save_prediction(path: Path, prediction) -> None:
     np.savez_compressed(
         path,
@@ -415,6 +421,7 @@ def run_analysis(
     features_path: str | Path | None = None,
     features_record_path: str | Path | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate user input and delegate the complete numerical run to the provider."""
     readiness = doctor(config)
@@ -586,7 +593,9 @@ def run_analysis(
     )
     record = {
         "contract_version": HARNESS_CONTRACT_VERSION,
+        "symmetry_harness_version": harness_version,
         "run_id": run_id,
+        "session_id": session_id,
         "status": "completed",
         "created_utc": datetime.now(timezone.utc).isoformat(),
         "input": input_record,
@@ -639,6 +648,7 @@ def run_analysis(
     return {
         "status": "completed",
         "run_id": run_id,
+        "session_id": session_id,
         "run_directory": str(run_dir),
         "run_record": artifacts["run_record"],
         "fine_tuned_model": artifacts["fine_tuned_model"],

@@ -83,7 +83,7 @@ from .ui_shared import (
     progress_bar_html,
     results_placeholder_html,
 )
-from .workflow import build_run_options, run_analysis
+from .workflow import build_run_options, new_fine_tune_session_id, run_analysis
 
 # The results block is mounted for the whole session, so its empty state is
 # normal UI rather than an error condition. The two empty wordings are distinct
@@ -856,6 +856,10 @@ def _load_cached_features(
 _SIGNED_FEATURE_CHANNELS = {
     "reflection_sin_2theta",
     "reflection_cos_2theta",
+    "rotation_2_fold",
+    "rotation_3_fold",
+    "rotation_4_fold",
+    "rotation_6_fold",
 }
 
 _UNSAFE_FEATURE_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
@@ -985,6 +989,7 @@ def build_fine_tune_workspace(
     """Construct the fine-tuning workspace inside the caller's Blocks."""
     import gradio as gr
 
+    report_session_id = new_fine_tune_session_id()
     catalog = capabilities or _configured_capabilities(config)
     initial_model = model_capability(catalog, config.model.identifier)
     initial_details = _selection_details(
@@ -2444,6 +2449,7 @@ def build_fine_tune_workspace(
                     features_path=features_path,
                     features_record_path=features_record_path,
                     progress_callback=report_progress,
+                    session_id=report_session_id,
                 )
             except Exception as error:
                 progress_events.put(("error", error))

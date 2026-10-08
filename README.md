@@ -53,10 +53,9 @@ in this exact order and the Harness validates the returned contract:
 8. six-fold rotational-symmetry map.
 
 The interface and exported PNG previews use fixed value ranges so maps remain
-visually comparable: `-1..1` for the sine and cosine reflection-orientation
-channels, and `0..1` for the other six channels. Values outside those ranges are
-clipped only for visualization; exported NPY arrays retain the original feature
-values.
+visually comparable: `0..1` for source intensity and reflection strength, and
+`-1..1` for the sine/cosine reflection-orientation and all four rotational
+response channels. Exported NPY arrays retain the original feature values.
 
 The pretrained 17-class head is used only to load the learned representation.
 For a new image, the Provider freezes the pretrained network, inserts residual
@@ -330,6 +329,9 @@ re-renders pixels and re-emits prose.
 # newest fine-tune run under the configured output root
 symmetry report --run latest
 
+# every fine-tune completed in the most recent UI session
+symmetry report --session latest
+
 # an explicit run directory, with session notes supplied by an agent
 symmetry report --run symmetry-runs/symmetry-<UTC>-<hash> --notes notes.md
 
@@ -337,22 +339,27 @@ symmetry report --run symmetry-runs/symmetry-<UTC>-<hash> --notes notes.md
 symmetry report --run latest --prefix prediction --no-figures
 ```
 
-Every report follows the same section order, so reports are comparable across
-runs:
+Every fine-tune report follows the same expert-facing order, with results first
+and reproducibility second, so reports remain easy to compare:
 
 ```text
-1. Summary                        7. Dense Prediction
-2. Workflow Overview              8. Configuration & Provenance
-3. Session Notes                  9. Caveats
-4. Input & Annotation            10. Artifacts
-5. Symmetry Features
-6. Fine-tuning
+1. Result at a Glance             6. Symmetry Representation
+2. Main Visual Evidence           7. Interpretation Boundaries
+3. Analysis Context               8. Reproducibility
+4. Input and Support Annotations  A. Artifacts
+5. Prediction Certainty and Fit
 ```
 
-Only the values change. `Session Notes` is the single free-form slot: pass
-`--notes <file>` or `--notes-text "<text>"` to record what the interactive
-session actually did. Prediction-batch runs use a shorter variant of the same
-template, and each item gets its own report under `items/<item-id>/`.
+Only the values change. `Analysis Context` is the single free-form slot: use it
+for sample purpose, class meanings, annotation rationale, notable observations,
+and unresolved questions. Prediction-batch runs use a shorter variant of the
+same template, and each item gets its own report under `items/<item-id>/`.
+
+When one fine-tuning UI session produces multiple runs, `--session latest`
+writes a compact index under `sessions/<session-id>/`. Each image keeps its own
+complete report and fitted model; the index does not imply joint multi-image
+training. With only one run, the command returns the ordinary image report
+directly.
 
 The report is written into the run directory it describes:
 
@@ -360,6 +367,7 @@ The report is written into the run directory it describes:
 symmetry-runs/<run-id>/
 ├── report_summary.md
 └── figures/
+    ├── 00_results_overview.png
     ├── 01_input.png
     ├── 02_support_points.png
     ├── 03_symmetry_maps.png
@@ -370,12 +378,12 @@ symmetry-runs/<run-id>/
     └── 08_entropy.png
 ```
 
-Figure numbering is stable: `03_symmetry_maps.png` is always the eight-channel
-montage and `05_prediction_mask.png` is always the categorical mask, whichever
-run kind produced them. The symmetry montage and the feature table reuse the
-fixed per-channel display range the annotation UI uses, so a signed channel and
-an unsigned channel are never compared on a shared scale. The prediction figures
-reuse the same mask/overlay/confidence/entropy renderers as the UI.
+Figure numbering is stable: `00_results_overview.png` is the compact human-facing
+summary, `03_symmetry_maps.png` is always the eight-channel montage, and
+`05_prediction_mask.png` is always the categorical mask. The symmetry montage
+and feature table reuse the same fixed display ranges as the annotation UI. The
+prediction figures reuse the same mask/overlay/confidence/entropy renderers as
+the UI.
 
 Loss curves are drawn on a base-10 log axis: an adapter loss routinely falls
 from `O(1)` to `O(1e-6)` within the first epochs, and a linear axis would

@@ -1,55 +1,58 @@
 # Symmetry Prediction Report
 
-- **Run ID:** `{run_id}`
-- **Item:** {item_label}
-- **Kind:** {kind}
-- **Status:** `{status}`
-- **Generated:** {generated_utc} by `symmetry report` (symmetry-harness {harness_version})
+**Run:** `{run_id}` | **Item:** {item_label} | **Technical status:** `{status}`
 
-## 1. Summary
+_Report generated {generated_utc} by symmetry-harness {harness_version}._
+
+## 1. Result at a Glance
 
 {summary}
 
-## 2. Workflow Overview
+{evidence_status}
 
-{workflow}
+{class_distribution_table}
 
-## 3. Session Notes
+## 2. Main Visual Evidence
+
+{fig_overview}
+
+{result_readout}
+
+## 3. Analysis Context
 
 {notes}
 
-## 4. Input & Classes
+## 4. Input and Classes
 
 {fig_input}
 
 {class_table}
 
-## 5. Symmetry Features
+## 5. Where the Model Is Certain or Uncertain
+
+{uncertainty_table}
+
+{prediction_table}
+
+## 6. Symmetry Representation
 
 {fig_symmetry}
 
 {feature_table}
 
-## 6. Dense Prediction
-
-{fig_mask}
-
-{fig_overlay}
-
-{fig_confidence}
-
-{fig_entropy}
-
-{prediction_table}
-
-## 7. Configuration & Provenance
-
-{configuration_table}
-
-## 8. Caveats
+## 7. Interpretation Boundaries
 
 {caveats}
 
-## 9. Artifacts
+## 8. Reproducibility
+
+{workflow}
+
+{configuration_table}
+
+Reproduce the parent training run and apply its saved model using the recorded
+package and configuration below.
+
+## Appendix A. Artifacts
 
 {artifact_list}

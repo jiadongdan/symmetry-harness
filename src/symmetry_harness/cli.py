@@ -225,10 +225,17 @@ def _parser() -> argparse.ArgumentParser:
     _add_config_argument(report)
     report.add_argument(
         "--run",
-        default="latest",
+        default=None,
         help=(
-            "Run directory, run id, or 'latest' (the default). 'latest' picks "
-            "the newest run under --output-root matching --prefix."
+            "Run directory, run id, or 'latest'. When neither --run nor --session "
+            "is given, the newest fine-tune run is used."
+        ),
+    )
+    report.add_argument(
+        "--session",
+        help=(
+            "Fine-tuning UI session id or 'latest'. One run returns its ordinary "
+            "report; multiple runs receive a compact session index."
         ),
     )
     report.add_argument(
@@ -245,11 +252,11 @@ def _parser() -> argparse.ArgumentParser:
     report.add_argument(
         "--notes",
         type=Path,
-        help="Markdown or text file whose contents fill the Session Notes section.",
+        help="Markdown or text file whose contents fill the Analysis Context section.",
     )
     report.add_argument(
         "--notes-text",
-        help="Inline Session Notes text. Overrides --notes when both are given.",
+        help="Inline Analysis Context text. Overrides --notes when both are given.",
     )
     report.add_argument(
         "--output",
@@ -382,11 +389,39 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
         from .run_report import (
             FINE_TUNE_PREFIX,
             PREDICTION_PREFIX,
+            ReportError,
+            build_fine_tune_session_report,
             build_run_report,
             resolve_run,
         )
 
-        run_value = str(arguments.run)
+        if arguments.run is not None and arguments.session is not None:
+            raise ReportError("Use either --run or --session, not both.")
+
+        notes = arguments.notes_text
+        if notes is None and arguments.notes is not None:
+            notes = (
+                Path(arguments.notes)
+                .expanduser()
+                .read_text(encoding="utf-8")
+            )
+
+        if arguments.session is not None:
+            output_root = arguments.output_root
+            if output_root is None:
+                config_path = _config_path(arguments.config)
+                if not config_path.is_file():
+                    return _missing_config_report(config_path)
+                output_root = load_harness_config(config_path).output_root
+            return build_fine_tune_session_report(
+                output_root,
+                session=str(arguments.session),
+                notes=notes,
+                figures=bool(arguments.figures),
+                output=arguments.output,
+            ).as_dict()
+
+        run_value = str(arguments.run or "latest")
         explicit = Path(run_value).expanduser()
         if explicit.is_dir():
             run_dir = explicit
@@ -404,13 +439,6 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             }[str(arguments.prefix)]
             run_dir = resolve_run(run_value, output_root, prefix=prefix)
 
-        notes = arguments.notes_text
-        if notes is None and arguments.notes is not None:
-            notes = (
-                Path(arguments.notes)
-                .expanduser()
-                .read_text(encoding="utf-8")
-            )
         return build_run_report(
             run_dir,
             notes=notes,

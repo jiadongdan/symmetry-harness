@@ -161,18 +161,29 @@ generate it with the built-in command instead of writing the document yourself.
 Run exactly one command, then return the reported `report` path:
 
 ```bash
-symmetry report --run latest --notes-text "<what the session did>"
+symmetry report --session latest --notes-text "<sample and purpose; class meanings; annotation rationale; notable observations; unresolved questions>"
 ```
 
-- `--run` accepts `latest` (default), a run id, or a run directory. `latest`
-  picks the newest run under the configured output root; use
-  `--prefix prediction` to target a prediction batch instead of a fine-tune run.
-- Always pass the session narrative through `--notes-text` or `--notes <file>`.
-  It is the only free-form section; every other section is derived from the run
-  record.
-- The command writes `report_summary.md` plus `figures/` **inside the run
-  directory** and prints JSON containing `report`, `figures`, and `item_reports`.
-  Return that path to the user; do not copy or reshape the file.
+- Use `--session latest` after an interactive fine-tuning session. One completed
+  fine-tune returns its ordinary image report; two or more runs from the same UI
+  session receive a compact session index plus one complete report per image.
+  This prevents the default workflow from silently reporting only the last image.
+- Use `--run` only for one explicitly requested run or prediction batch. It
+  accepts `latest`, a run id, or a run directory; use `--prefix prediction` to
+  target a prediction batch.
+- Always pass useful scientific context through `--notes-text` or `--notes
+  <file>`: the sample and analysis purpose, user-defined class meanings, support
+  point rationale, notable observations, and unresolved questions. Record only
+  facts supplied or confirmed by the user; never invent physical meaning. Avoid
+  operational filler such as merely saying that the UI was launched or a report
+  was requested. This is the only free-form section; every other section is
+  derived from persisted run artifacts. Use context already available in the
+  conversation and run record. Do not pause to ask the user extra questions only
+  to complete a report; mark unavailable context as not recorded instead.
+- Image reports are written inside their run directories. A multi-run session
+  index is written under `<output-root>/sessions/<session-id>/report_summary.md`.
+  The command prints JSON containing `report`, `figures`, and `item_reports`.
+  Return the reported path; do not copy or reshape the files.
 - Add `--no-figures` only when the user explicitly asks for text without images.
 - Do not summarize a run from `report.md` alone: that file is the minimal
   automatic record and carries no figures.

@@ -1,15 +1,16 @@
 # Symmetry Prediction Batch Report
 
-- **Run ID:** `{run_id}`
-- **Kind:** prediction-batch
-- **Status:** `{status}`
-- **Generated:** {generated_utc} by `symmetry report` (symmetry-harness {harness_version})
+**Run:** `{run_id}` | **Technical status:** `{status}` | **Analysis type:** prediction batch
 
-## 1. Summary
+_Report generated {generated_utc} by symmetry-harness {harness_version}._
+
+## 1. Result at a Glance
 
 {summary}
 
-## 2. Session Notes
+{evidence_status}
+
+## 2. Analysis Context
 
 {notes}
 
@@ -24,14 +25,14 @@ symmetry representation, prediction mask, confidence and entropy maps.
 
 {item_table}
 
-## 5. Configuration & Provenance
-
-{configuration_table}
-
-## 6. Caveats
+## 5. Interpretation Boundaries
 
 {caveats}
 
-## 7. Artifacts
+## 6. Reproducibility
+
+{configuration_table}
+
+## Appendix A. Artifacts
 
 {artifact_list}

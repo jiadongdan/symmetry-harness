@@ -143,7 +143,7 @@ def _install_fake_provider(monkeypatch) -> None:
     monkeypatch.setattr(workflow_module, "run_provider_analysis", fake_analysis)
 
 
-def _run(tmp_path: Path, monkeypatch) -> dict:
+def _run(tmp_path: Path, monkeypatch, *, session_id: str | None = None) -> dict:
     _install_fake_provider(monkeypatch)
     config = load_harness_config(REPOSITORY_ROOT / "configs" / "config.example.json")
     image_path = _write_image(tmp_path / "sample.npy")
@@ -153,6 +153,7 @@ def _run(tmp_path: Path, monkeypatch) -> dict:
         image_path=image_path,
         annotation_session=session,
         output_root=tmp_path / "runs",
+        session_id=session_id,
     )
 
 
@@ -233,6 +234,8 @@ def test_run_analysis_returns_extended_keys_and_no_numeric_change(
     assert Path(result["input_array"]).name == "input.npy"
 
     run_dir = Path(result["run_directory"])
+    run_record = json.loads((run_dir / "run_record.json").read_text(encoding="utf-8"))
+    assert run_record["symmetry_harness_version"] == workflow_module.harness_version
     archive = Path(result["full_run_zip"])
     assert archive.parent == run_dir.parent
     with zipfile.ZipFile(archive) as handle:
@@ -241,6 +244,16 @@ def test_run_analysis_returns_extended_keys_and_no_numeric_change(
     # The normalized input is archived; the original external upload is not.
     assert "input.npy" in members
     assert "sample.npy" not in members
+
+
+def test_run_analysis_records_optional_fine_tune_session(
+    tmp_path: Path, monkeypatch
+) -> None:
+    session_id = "fine-tune-session-20260101T000000Z-test"
+    result = _run(tmp_path, monkeypatch, session_id=session_id)
+    record = json.loads(Path(result["run_record"]).read_text(encoding="utf-8"))
+    assert result["session_id"] == session_id
+    assert record["session_id"] == session_id
 
 
 def test_run_analysis_confidence_and_entropy_use_fixed_colormaps(

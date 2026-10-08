@@ -56,7 +56,12 @@ def _image(size: int = 96) -> np.ndarray:
     return ((values - values.min()) / np.ptp(values)).astype(np.float32)
 
 
-def _write_fine_tune_run(root: Path, *, name: str = "symmetry-20260101T000000Z-aaaa") -> Path:
+def _write_fine_tune_run(
+    root: Path,
+    *,
+    name: str = "symmetry-20260101T000000Z-aaaa",
+    session_id: str | None = None,
+) -> Path:
     run = root / name
     run.mkdir(parents=True)
     np.save(run / "input.npy", _image())
@@ -98,7 +103,9 @@ def _write_fine_tune_run(root: Path, *, name: str = "symmetry-20260101T000000Z-a
         json.dumps(
             {
                 "contract_version": "symmetry-harness-run-v1",
+                "symmetry_harness_version": "0.2.3",
                 "run_id": name,
+                "session_id": session_id,
                 "status": "completed",
                 "created_utc": "2026-01-01T00:00:00+00:00",
                 "options": {
@@ -120,7 +127,11 @@ def _write_fine_tune_run(root: Path, *, name: str = "symmetry-20260101T000000Z-a
                     "identifier": "cnn_8ch_pg17",
                     "checkpoint": {"path": "weights.pth", "sha256": "deadbeef"},
                 },
-                "input": {"shape": [96, 96], "normalization": {"policy": "minmax_0_1"}},
+                "input": {
+                    "path": str(root / f"{name}.npy"),
+                    "shape": [96, 96],
+                    "normalization": {"policy": "minmax_0_1"},
+                },
                 "prediction": {
                     "grid_shape": [24, 24],
                     "sample_count": 576,
@@ -257,6 +268,44 @@ def test_detect_kind_and_unknown_directory(tmp_path: Path) -> None:
         rr.detect_kind(empty)
 
 
+def test_latest_fine_tune_session_groups_runs_and_ignores_other_sessions(
+    tmp_path: Path,
+) -> None:
+    older = "fine-tune-session-20260101T000000Z-old"
+    latest = "fine-tune-session-20260202T000000Z-new"
+    _write_fine_tune_run(
+        tmp_path,
+        name="symmetry-20260101T000000Z-aaaa",
+        session_id=older,
+    )
+    expected = [
+        _write_fine_tune_run(
+            tmp_path,
+            name="symmetry-20260202T000000Z-bbbb",
+            session_id=latest,
+        ),
+        _write_fine_tune_run(
+            tmp_path,
+            name="symmetry-20260202T010000Z-cccc",
+            session_id=latest,
+        ),
+    ]
+
+    session_id, runs = rr.resolve_fine_tune_session(tmp_path, "latest")
+    assert session_id == latest
+    assert runs == expected
+
+
+def test_legacy_latest_session_degrades_to_newest_single_run(tmp_path: Path) -> None:
+    _write_fine_tune_run(tmp_path, name="symmetry-20260101T000000Z-aaaa")
+    newest = _write_fine_tune_run(
+        tmp_path, name="symmetry-20260202T000000Z-bbbb"
+    )
+    session_id, runs = rr.resolve_fine_tune_session(tmp_path, "latest")
+    assert session_id == f"legacy-{newest.name}"
+    assert runs == [newest]
+
+
 # ---------------------------------------------------------------------------
 # Fine-tune report
 # ---------------------------------------------------------------------------
@@ -269,26 +318,34 @@ def test_fine_tune_report_has_every_section_and_figure(tmp_path: Path) -> None:
     text = result.report_path.read_text(encoding="utf-8")
 
     for heading in (
-        "## 1. Summary",
-        "## 2. Workflow Overview",
-        "## 3. Session Notes",
-        "## 4. Input & Annotation",
-        "## 5. Symmetry Features",
-        "## 6. Fine-tuning",
-        "## 7. Dense Prediction",
-        "## 8. Configuration & Provenance",
-        "## 9. Caveats",
-        "## 10. Artifacts",
+        "## 1. Result at a Glance",
+        "## 2. Main Visual Evidence",
+        "## 3. Analysis Context",
+        "## 4. Input and Support Annotations",
+        "## 5. Prediction Certainty and Fine-tuning",
+        "## 6. Symmetry Representation",
+        "## 7. Interpretation Boundaries",
+        "## 8. Reproducibility",
+        "## Appendix A. Artifacts",
     ):
         assert heading in text
 
     assert "Session notes body." in text
     assert "Phase A" in text and "Phase B" in text
+    assert "Grid share" in text
+    assert "At a typical sampled location" in text
+    assert "Locations with weaker predictions" in text
+    assert "Locations with substantial class ambiguity" in text
+    assert "Lower-confidence tail" not in text
+    assert "Descriptive review threshold" not in text
+    assert "matched all selected support points by epoch 3" in text
+    assert "Checkpoint path" not in text
     # The workflow must quote the run's actual options, not config defaults.
     assert "patch=31" in text
 
     figures = {path.name for path in result.figure_paths}
     assert figures == {
+        rr.FIG_OVERVIEW,
         rr.FIG_INPUT,
         rr.FIG_SUPPORT,
         rr.FIG_SYMMETRY,
@@ -301,9 +358,18 @@ def test_fine_tune_report_has_every_section_and_figure(tmp_path: Path) -> None:
     for path in result.figure_paths:
         assert path.is_file()
         assert path.parent == run / rr.FIGURES_DIRNAME
-        # The link must carry the figures/ sub-directory, not a bare basename.
-        assert f"](figures/{path.name})" in text
-        assert (result.report_path.parent / "figures" / path.name).is_file()
+    # The human-facing report embeds the compact overview and the diagnostic
+    # source figures relevant to later sections. Mask/overlay/uncertainty source
+    # PNGs remain available as linked artifacts without bloating the body.
+    for name in (
+        rr.FIG_OVERVIEW,
+        rr.FIG_INPUT,
+        rr.FIG_SUPPORT,
+        rr.FIG_SYMMETRY,
+        rr.FIG_TRAINING,
+    ):
+        assert f"](figures/{name})" in text
+        assert (result.report_path.parent / "figures" / name).is_file()
 
 
 def test_every_embedded_figure_link_resolves(tmp_path: Path) -> None:
@@ -342,12 +408,60 @@ def test_fine_tune_report_notes_default_placeholder(tmp_path: Path) -> None:
     assert "_Not provided._" in result.report_path.read_text(encoding="utf-8")
 
 
+def test_multi_run_fine_tune_session_writes_compact_index(tmp_path: Path) -> None:
+    session_id = "fine-tune-session-20260101T000000Z-demo"
+    runs = [
+        _write_fine_tune_run(
+            tmp_path,
+            name="symmetry-20260101T000000Z-aaaa",
+            session_id=session_id,
+        ),
+        _write_fine_tune_run(
+            tmp_path,
+            name="symmetry-20260101T010000Z-bbbb",
+            session_id=session_id,
+        ),
+    ]
+    result = rr.build_fine_tune_session_report(
+        tmp_path, session="latest", notes="Shared session context."
+    )
+
+    assert result.kind == rr.KIND_FINE_TUNE_SESSION
+    assert result.report_path == tmp_path / "sessions" / session_id / rr.REPORT_FILENAME
+    assert result.item_reports == tuple(run / rr.REPORT_FILENAME for run in runs)
+    text = result.report_path.read_text(encoding="utf-8")
+    assert "2 independent fine-tuning results" in text
+    assert "Shared session context." in text
+    assert "not combined into" in text
+    assert "one joint training dataset" in text
+    assert "Predicted area by label" in text
+    assert "Areas worth checking" in text
+    assert text.count("<details>") == 2
+
+    import re
+
+    links = re.findall(r"(?:!\[[^]]*\]|\[[^]]*\])\((?:<)?([^)>]+)(?:>)?\)", text)
+    assert links
+    for link in links:
+        assert (result.report_path.parent / link).resolve().exists(), link
+
+
+def test_single_run_session_returns_ordinary_image_report(tmp_path: Path) -> None:
+    session_id = "fine-tune-session-20260101T000000Z-single"
+    run = _write_fine_tune_run(tmp_path, session_id=session_id)
+    result = rr.build_fine_tune_session_report(tmp_path, session="latest")
+    assert result.kind == rr.KIND_FINE_TUNE
+    assert result.report_path == run / rr.REPORT_FILENAME
+
+
 def test_no_figures_produces_text_only_report(tmp_path: Path) -> None:
     run = _write_fine_tune_run(tmp_path)
     result = rr.build_run_report(run, figures=False)
     assert result.figure_paths == ()
     assert not (run / rr.FIGURES_DIRNAME).exists()
-    assert "![" not in result.report_path.read_text(encoding="utf-8")
+    text = result.report_path.read_text(encoding="utf-8")
+    assert "![" not in text
+    assert "report_figures" not in text
 
 
 def test_missing_optional_artifacts_still_report(tmp_path: Path) -> None:
@@ -395,8 +509,10 @@ def test_prediction_batch_writes_index_and_item_reports(tmp_path: Path) -> None:
     item_text = item_report.read_text(encoding="utf-8")
     assert "Symmetry Prediction Report" in item_text
     assert "Phase A" in item_text
+    assert "Prediction notes." not in item_text
 
     item_figures = {path.name for path in result.figure_paths}
+    assert rr.FIG_OVERVIEW in item_figures
     assert rr.FIG_SUPPORT not in item_figures
     assert rr.FIG_TRAINING not in item_figures
     assert rr.FIG_SYMMETRY in item_figures
@@ -407,18 +523,35 @@ def test_prediction_batch_writes_index_and_item_reports(tmp_path: Path) -> None:
 # Figure builders
 # ---------------------------------------------------------------------------
 def test_feature_tile_uses_fixed_range_per_channel() -> None:
-    """Signed channels span [-1, 1]; unsigned channels span [0, 1]."""
+    """Orientation/rotation channels span [-1, 1]; intensities span [0, 1]."""
     signed = "reflection_sin_2theta"
+    rotation = "rotation_4_fold"
     unsigned = "reflection_strength"
 
     assert rr._feature_display_range(signed) == (-1.0, 1.0)
+    assert rr._feature_display_range(rotation) == (-1.0, 1.0)
     assert rr._feature_display_range(unsigned) == (0.0, 1.0)
 
     # 0.0 is mid-grey only on a signed channel; on an unsigned channel it is black.
     assert 126 <= int(rr._feature_tile(np.full((2, 2), 0.0), signed)[0, 0]) <= 129
     assert int(rr._feature_tile(np.full((2, 2), 0.0), unsigned)[0, 0]) == 0
     assert int(rr._feature_tile(np.full((2, 2), -0.5), signed)[0, 0]) == 64
+    assert int(rr._feature_tile(np.full((2, 2), -0.5), rotation)[0, 0]) == 64
     assert 126 <= int(rr._feature_tile(np.full((2, 2), 0.5), unsigned)[0, 0]) <= 129
+
+
+def test_prediction_batch_links_resolve_when_index_is_relocated(tmp_path: Path) -> None:
+    run = _write_prediction_run(tmp_path)
+    target = tmp_path / "shared" / "prediction-report.md"
+    result = rr.build_run_report(run, output=target)
+
+    text = result.report_path.read_text(encoding="utf-8")
+    import re
+
+    links = re.findall(r"\[report\]\(<([^>]+)>\)", text)
+    assert links
+    for link in links:
+        assert (target.parent / link).resolve().is_file(), link
 
 
 def test_symmetry_montage_geometry() -> None:
@@ -517,6 +650,41 @@ def test_cli_report_latest_with_output_root(tmp_path, monkeypatch, capsys) -> No
     payload = json.loads(capsys.readouterr().out)
     assert payload["status"] == "ok"
     assert Path(payload["report"]) == run / rr.REPORT_FILENAME
+
+
+def test_cli_report_latest_fine_tune_session(tmp_path, monkeypatch, capsys) -> None:
+    session_id = "fine-tune-session-20260101T000000Z-cli"
+    _write_fine_tune_run(
+        tmp_path,
+        name="symmetry-20260101T000000Z-aaaa",
+        session_id=session_id,
+    )
+    _write_fine_tune_run(
+        tmp_path,
+        name="symmetry-20260101T010000Z-bbbb",
+        session_id=session_id,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "symmetry",
+            "report",
+            "--session",
+            "latest",
+            "--output-root",
+            str(tmp_path),
+            "--notes-text",
+            "cli session notes",
+        ],
+    )
+    cli.main()
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == rr.KIND_FINE_TUNE_SESSION
+    assert Path(payload["report"]) == (
+        tmp_path / "sessions" / session_id / rr.REPORT_FILENAME
+    )
+    assert len(payload["item_reports"]) == 2
 
 
 def test_cli_config_path_uses_installed_pointer(tmp_path, monkeypatch) -> None:
