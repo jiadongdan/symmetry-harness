@@ -97,6 +97,60 @@ def _overrides(arguments: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _label_codes(value: str) -> tuple[int, int]:
+    parts = [part.strip() for part in str(value).split(",") if part.strip()]
+    if len(parts) != 2:
+        raise ValueError("--label-codes needs exactly two comma-separated integers.")
+    return int(parts[0]), int(parts[1])
+
+
+def _dataset_path(value: Any, base: Path) -> Path:
+    candidate = Path(str(value)).expanduser()
+    return candidate if candidate.is_absolute() else (base / candidate)
+
+
+def _repeat_entries(arguments: argparse.Namespace) -> list[dict[str, Path]]:
+    """Collect the image/ground-truth pairs a repeat run should process."""
+    if arguments.dataset is not None:
+        if arguments.image or arguments.gt:
+            raise ValueError("Use either --dataset or repeated --image/--gt, not both.")
+        dataset_path = Path(arguments.dataset).expanduser().resolve()
+        if not dataset_path.is_file():
+            raise ValueError(f"The dataset manifest does not exist: {dataset_path}")
+        payload = json.loads(dataset_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            raw_entries = payload.get("images") or payload.get("entries") or []
+        elif isinstance(payload, list):
+            raw_entries = payload
+        else:
+            raise ValueError(
+                "--dataset must hold a JSON list or an object with an 'images' list."
+            )
+        entries: list[dict[str, Path]] = []
+        for raw in raw_entries:
+            if not isinstance(raw, dict) or "image" not in raw or "gt" not in raw:
+                raise ValueError(
+                    'Every dataset entry needs "image" and "gt" string fields.'
+                )
+            entries.append(
+                {
+                    "image": _dataset_path(raw["image"], dataset_path.parent),
+                    "gt": _dataset_path(raw["gt"], dataset_path.parent),
+                }
+            )
+        if not entries:
+            raise ValueError("--dataset contains no entries.")
+        return entries
+    if len(arguments.image) != len(arguments.gt):
+        raise ValueError("--image and --gt must be supplied in equal numbers.")
+    if not arguments.image:
+        raise ValueError("Provide --image/--gt pairs or --dataset.")
+    return [
+        {"image": image, "gt": gt}
+        for image, gt in zip(arguments.image, arguments.gt)
+    ]
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, prog="symmetry")
     parser.add_argument(
@@ -185,6 +239,98 @@ def _parser() -> argparse.ArgumentParser:
     _add_config_argument(reproduce)
     reproduce.add_argument("--record", type=Path, required=True)
     reproduce.add_argument("--output-root", type=Path)
+
+    repeat = commands.add_parser(
+        "repeat",
+        help=(
+            "Re-run the same k-shot fine-tuning many times and report how stable "
+            "the result is. Each round draws new support points from the confident "
+            "region, and the support set never accumulates."
+        ),
+    )
+    _add_config_argument(repeat)
+    repeat.add_argument(
+        "--image",
+        type=Path,
+        action="append",
+        default=[],
+        help="Source image. Repeat together with --gt to run several images.",
+    )
+    repeat.add_argument(
+        "--gt",
+        type=Path,
+        action="append",
+        default=[],
+        help="Integer label raster (.npy) matching the paired --image.",
+    )
+    repeat.add_argument(
+        "--dataset",
+        type=Path,
+        help=(
+            'JSON list of {"image": ..., "gt": ...} entries, or {"images": [...]}. '
+            "Use it instead of repeating --image/--gt."
+        ),
+    )
+    repeat.add_argument(
+        "--annotations",
+        type=Path,
+        help=(
+            "Optional round-0 annotation session for a single image. Without it, "
+            "round 0 draws its points from the interior of each ground-truth phase."
+        ),
+    )
+    repeat.add_argument(
+        "--rounds",
+        type=int,
+        default=5,
+        help="Number of repeated rounds after the seed round. Defaults to 5.",
+    )
+    repeat.add_argument(
+        "--points-per-class",
+        type=int,
+        default=5,
+        help="Support points drawn per class in every round. Defaults to 5.",
+    )
+    repeat.add_argument("--tau", type=float, default=0.95)
+    repeat.add_argument("--base-seed", type=int, default=42)
+    repeat.add_argument("--alarm-drop", type=float, default=3.0)
+    repeat.add_argument("--alarm-floor", type=float, default=0.90)
+    repeat.add_argument(
+        "--label-codes",
+        default="14,17",
+        help="Two ground-truth label codes mapped onto class A and class B.",
+    )
+    repeat.add_argument(
+        "--interior-margin",
+        type=int,
+        default=32,
+        help="Seed-round margin in pixels. Later rounds ignore it.",
+    )
+    repeat.add_argument("--output-root", type=Path)
+    repeat.add_argument(
+        "--keep-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep each round's fine_tuned_model.symmodel (about 46 MB per round).",
+    )
+    repeat.add_argument(
+        "--stop-on-alarm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop the loop when a round leaves the historical band.",
+    )
+    repeat.add_argument(
+        "--reuse-features",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compute the feature stack once per image and reuse it every round.",
+    )
+    repeat.add_argument(
+        "--resume",
+        type=Path,
+        help="Continue an interrupted loop directory from its completed rounds.",
+    )
+    _add_run_overrides(repeat)
 
     predict = commands.add_parser(
         "predict",
@@ -767,6 +913,63 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
 
         return reproduce_analysis(
             config, arguments.record, output_root=arguments.output_root
+        )
+    if arguments.command == "repeat":
+        from .repeat import RepeatOptions, run_repeat, run_repeat_batch
+
+        options = RepeatOptions(
+            rounds=int(arguments.rounds),
+            points_per_class=int(arguments.points_per_class),
+            tau=float(arguments.tau),
+            base_seed=int(arguments.base_seed),
+            alarm_drop=float(arguments.alarm_drop),
+            alarm_floor=float(arguments.alarm_floor),
+            interior_margin=int(arguments.interior_margin),
+            label_codes=_label_codes(arguments.label_codes),
+            keep_checkpoint=bool(arguments.keep_checkpoint),
+            stop_on_alarm=bool(arguments.stop_on_alarm),
+            reuse_features=bool(arguments.reuse_features),
+        )
+        options.validate()
+        entries = _repeat_entries(arguments)
+        progress = lambda message: print(  # noqa: E731 - tiny inline reporter
+            message, file=sys.stderr, flush=True
+        )
+        if arguments.resume is not None:
+            if len(entries) != 1:
+                raise ValueError("--resume takes exactly one --image/--gt pair.")
+            return run_repeat(
+                config,
+                image_path=entries[0]["image"],
+                label_path=entries[0]["gt"],
+                options=options,
+                output_root=arguments.output_root,
+                overrides=_overrides(arguments),
+                resume=arguments.resume,
+                progress=progress,
+            )
+        if len(entries) == 1:
+            return run_repeat(
+                config,
+                image_path=entries[0]["image"],
+                label_path=entries[0]["gt"],
+                options=options,
+                output_root=arguments.output_root,
+                overrides=_overrides(arguments),
+                annotations=arguments.annotations,
+                progress=progress,
+            )
+        if arguments.annotations is not None:
+            raise ValueError(
+                "--annotations applies to a single image; drop it or run one image."
+            )
+        return run_repeat_batch(
+            config,
+            entries,
+            options=options,
+            output_root=arguments.output_root,
+            overrides=_overrides(arguments),
+            progress=progress,
         )
     if arguments.command == "predict":
         from .prediction_workflow import run_saved_model_prediction_batch

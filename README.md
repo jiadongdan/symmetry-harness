@@ -233,6 +233,7 @@ symmetry launch      preflight the runtime and launch the local UI
 symmetry run         execute a saved annotation session
 symmetry predict     predict images with a saved fine-tuned model package
 symmetry reproduce   repeat a prior completed run
+symmetry repeat      re-run the same k-shot fine-tuning many times and report stability
 symmetry report      write the fixed-template Markdown report for a completed run
 symmetry ui          launch the local point-annotation interface
 ```
@@ -252,6 +253,8 @@ symmetry predict --model fine_tuned_model.symmodel --input image.npy
 symmetry predict --model fine_tuned_model.symmodel \
   --input one.tif --input two.tif --device cuda
 symmetry reproduce --record symmetry-runs/<run-id>/run_record.json
+symmetry repeat --image image.npy --gt labels.npy --rounds 100 --points-per-class 5
+symmetry repeat --dataset images.json --rounds 100 --points-per-class 5
 symmetry report --run latest
 symmetry report --run symmetry-runs/<run-id> --notes session-notes.md
 ```
@@ -261,6 +264,25 @@ starts. Both workspaces live in one application with isolated state.
 
 Configuration defaults to `SYMMETRY_HARNESS_CONFIG` or
 `./symmetry-harness.json`.
+
+## Repeat Loops (Stability Testing)
+
+`symmetry repeat` measures procedural reproducibility instead of accuracy on one
+lucky annotation. It runs the same k-shot fine-tuning many times; each round
+trains a fresh adapter from the backbone with newly drawn support points, and the
+support set never accumulates, so round 80 is still the same shot count as round
+1. Points are drawn only from cells whose accumulated confidence is at least
+`--tau`, and accuracy is scored every round against a ground-truth label raster.
+
+```bash
+symmetry repeat --image image.npy --gt labels.npy \
+  --rounds 100 --points-per-class 5 --tau 0.95
+```
+
+Each loop writes `loop_manifest.json`, `loop_rounds.csv`, `loop_summary.md`, four
+figures, and one directory per round. An alarm (accuracy below an absolute floor,
+below `mean - 3 sigma`, or a collapsed class) stops the loop and reports which
+round broke. See [references/repeat.md](references/repeat.md).
 
 ## Run Artifacts
 

@@ -2,7 +2,7 @@
 name: symmetry-harness
 description: Run local few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to launch the local interface, fine-tune adapters on representative points, inspect confidence or entropy, or apply a saved .symmodel package to new images without re-training. Requires the local symmetry-harness runtime and the symmetry-learn Provider. Do not use for foundation-model training, silent weight installation, or unattended label selection.
 metadata:
-  version: "0.2.3"
+  version: "0.3.0"
   product: "symmetry-harness"
 ---
 
@@ -208,6 +208,11 @@ the figure set, and the degradation rules.
   [references/prediction.md](references/prediction.md).
 - For a saved annotation session or completed-run reproduction, read
   [references/reproduction.md](references/reproduction.md).
+- When the user asks whether the fine-tuning pipeline is **stable across repeated
+  runs** — a reproducibility test on one or more labeled images, with a fixed
+  number of shots per round — read [references/repeat.md](references/repeat.md)
+  and use `symmetry repeat`. Do not confuse this with improving a model: every
+  round restarts from the backbone and the support set never accumulates.
 - When the user asks for a report or summary of a completed run, read
   [references/run-report.md](references/run-report.md).
 
