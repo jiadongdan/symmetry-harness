@@ -590,3 +590,147 @@ def test_run_repeat_reports_reuse_failure(config, tmp_path, monkeypatch) -> None
     )
     assert result["status"] == "completed"
     assert any("feature reuse unavailable" in message for message in messages)
+
+
+# ---------------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------------
+
+
+def test_point_groups_reads_both_row_shapes() -> None:
+    from symmetry_harness.repeat_report import _point_groups
+
+    nested = {"points_by_class": [[(1, 2), (3, 4)], [(5, 6)]]}
+    assert _point_groups(nested) == [[(1, 2), (3, 4)], [(5, 6)]]
+
+    # loop_rounds.csv keeps the same payload under points_xy, as a JSON string.
+    from_csv = {"points_xy": json.dumps([[[1, 2]], [[3, 4], [5, 6]]])}
+    assert _point_groups(from_csv) == [[[1, 2]], [[3, 4], [5, 6]]]
+    assert _point_groups({}) == []
+
+
+def test_evenly_keeps_the_first_and_the_last() -> None:
+    from symmetry_harness.repeat_report import _evenly
+
+    assert _evenly(list(range(5)), 12) == [0, 1, 2, 3, 4]
+    picked = _evenly(list(range(100)), 12)
+    assert len(picked) == 12
+    assert picked[0] == 0 and picked[-1] == 99
+
+
+def test_round_sheet_draws_one_row_per_round(tmp_path: Path) -> None:
+    from symmetry_harness.repeat_report import build_round_sheet
+
+    prediction = fake_prediction()
+    rounds_dir = tmp_path / "rounds"
+    kept = rounds_dir / "round-000" / "kept"
+    kept.mkdir(parents=True)
+    np.savez_compressed(kept / "prediction.npz", **prediction_arrays(prediction))
+
+    path = build_round_sheet(
+        tmp_path / "sheet.png",
+        two_phase_image(),
+        class_map_from_labels(two_phase_labels(), (14, 17)),
+        [
+            {
+                "round": 0,
+                "acc": "0.97",
+                "points_by_class": [[(40, 40)], [(80, 80)]],
+            }
+        ],
+        rounds_dir=rounds_dir,
+        class_colors=("#e41a1c", "#377eb8"),
+        patch_size=16,
+        stride=4,
+    )
+    assert path is not None and path.is_file()
+    assert path.stat().st_size > 0
+
+
+def test_round_sheet_skips_rounds_without_a_prediction(tmp_path: Path) -> None:
+    from symmetry_harness.repeat_report import build_round_sheet
+
+    path = build_round_sheet(
+        tmp_path / "sheet.png",
+        two_phase_image(),
+        None,
+        [{"round": 0, "acc": "0.97", "points_by_class": [[(40, 40)], [(80, 80)]]}],
+        rounds_dir=tmp_path / "rounds",
+        class_colors=("#e41a1c", "#377eb8"),
+        patch_size=16,
+        stride=4,
+    )
+    assert path is None
+    assert not (tmp_path / "sheet.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# Figures
+# ---------------------------------------------------------------------------
+
+
+def test_point_groups_reads_both_row_shapes() -> None:
+    from symmetry_harness.repeat_report import _point_groups
+
+    nested = {"points_by_class": [[(1, 2), (3, 4)], [(5, 6)]]}
+    assert _point_groups(nested) == [[(1, 2), (3, 4)], [(5, 6)]]
+
+    # loop_rounds.csv keeps the same payload under points_xy, as a JSON string.
+    from_csv = {"points_xy": json.dumps([[[1, 2]], [[3, 4], [5, 6]]])}
+    assert _point_groups(from_csv) == [[[1, 2]], [[3, 4], [5, 6]]]
+    assert _point_groups({}) == []
+
+
+def test_evenly_keeps_the_first_and_the_last() -> None:
+    from symmetry_harness.repeat_report import _evenly
+
+    assert _evenly(list(range(5)), 12) == [0, 1, 2, 3, 4]
+    picked = _evenly(list(range(100)), 12)
+    assert len(picked) == 12
+    assert picked[0] == 0 and picked[-1] == 99
+
+
+def test_round_sheet_draws_one_row_per_round(tmp_path: Path) -> None:
+    from symmetry_harness.repeat_report import build_round_sheet
+
+    prediction = fake_prediction()
+    rounds_dir = tmp_path / "rounds"
+    kept = rounds_dir / "round-000" / "kept"
+    kept.mkdir(parents=True)
+    np.savez_compressed(kept / "prediction.npz", **prediction_arrays(prediction))
+
+    path = build_round_sheet(
+        tmp_path / "sheet.png",
+        two_phase_image(),
+        class_map_from_labels(two_phase_labels(), (14, 17)),
+        [
+            {
+                "round": 0,
+                "acc": "0.97",
+                "points_by_class": [[(40, 40)], [(80, 80)]],
+            }
+        ],
+        rounds_dir=rounds_dir,
+        class_colors=("#e41a1c", "#377eb8"),
+        patch_size=16,
+        stride=4,
+    )
+    assert path is not None and path.is_file()
+    assert path.stat().st_size > 0
+
+
+def test_round_sheet_skips_rounds_without_a_prediction(tmp_path: Path) -> None:
+    from symmetry_harness.repeat_report import build_round_sheet
+
+    path = build_round_sheet(
+        tmp_path / "sheet.png",
+        two_phase_image(),
+        None,
+        [{"round": 0, "acc": "0.97", "points_by_class": [[(40, 40)], [(80, 80)]]}],
+        rounds_dir=tmp_path / "rounds",
+        class_colors=("#e41a1c", "#377eb8"),
+        patch_size=16,
+        stride=4,
+    )
+    assert path is None
+    assert not (tmp_path / "sheet.png").exists()

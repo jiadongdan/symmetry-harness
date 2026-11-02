@@ -162,7 +162,7 @@ def default_configuration(
             "minimum_shots_per_class": int(
                 capability.get(
                     "minimum_shots_per_class",
-                    defaults.get("minimum_shots_per_class", 3),
+                    defaults.get("minimum_shots_per_class", 1),
                 )
             ),
             "recommended_shots_per_class": int(

@@ -33,6 +33,11 @@ class stays at one point per class.
 | `--points-per-class` | Shots per class in every round. Match the experiment you are replicating (1, 3, or 5). | `5` |
 | `--rounds` | Rounds after the seed round. `0` runs only round 0. | `5` to shake out bugs, `50`–`100` for a real stability measurement |
 
+`minimum_shots_per_class` defaults to `1`, so a 1-shot replication needs no
+configuration change. Values below the configured minimum are rejected by the
+annotation validator, and the loop still raises the minimum to
+`--points-per-class` if a config sets it higher.
+
 ## Sampling rule
 
 Two fields are accumulated across rounds and used only to choose the next
@@ -145,7 +150,8 @@ mixing two protocols would corrupt the distribution.
 ├── loop_rounds.csv         one row per round
 ├── loop_summary.md         distribution, per-round table, embedded figures
 ├── features/               reusable feature stack (one per image)
-├── figures/                acc_vs_round, iou_vs_round, area_frac_vs_round, points_map
+├── figures/                acc_vs_round, iou_vs_round, area_frac_vs_round,
+│                           points_map, round_sheet
 └── rounds/round-00N/
     ├── session_round00N.json   the exact support points used
     ├── metrics.json
@@ -153,6 +159,12 @@ mixing two protocols would corrupt the distribution.
     └── kept/                   prediction.npz, run_record.json, confidence.png,
                                 prediction_overlay.png, fine_tuned_model.symmodel
 ```
+
+`figures/round_sheet.png` is one row per round and three columns: the source
+image with that round's support points (with a `classifier_patch_size` box per
+point), the predicted mask, and the cells that disagree with the ground truth.
+It caps at 12 rows, showing evenly spaced rounds including the first and the
+last, so a 100-round loop still produces a readable sheet.
 
 The harness run directory itself, its training-only artifacts, and the duplicate
 `-full-run.zip` are deleted after each round. Keeping every

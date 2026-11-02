@@ -236,7 +236,7 @@ def load_harness_config(path: str | Path) -> HarnessConfig:
 
     tune_raw = _mapping(payload.get("fine_tuning", {}), "fine_tuning")
     minimum = _positive_integer(
-        tune_raw.get("minimum_shots_per_class", 3), "minimum_shots_per_class"
+        tune_raw.get("minimum_shots_per_class", 1), "minimum_shots_per_class"
     )
     recommended = _positive_integer(
         tune_raw.get("recommended_shots_per_class", 5),

@@ -135,7 +135,7 @@ def _capabilities() -> dict:
                 "fine_tuning_strategy": (
                     "frozen pretrained network with residual adapters and a new local head"
                 ),
-                "minimum_shots_per_class": 3,
+                "minimum_shots_per_class": 1,
                 "recommended_shots_per_class": 5,
                 "maximum_shots_per_class": 50,
                 "feature_channels": [
@@ -155,7 +155,7 @@ def _capabilities() -> dict:
                     "reflection_p": 2.0,
                     "normalize_rotation_maps": False,
                     "classifier_patch_size": 64,
-                    "minimum_shots_per_class": 3,
+                    "minimum_shots_per_class": 1,
                     "maximum_shots_per_class": 50,
                     "adapter_bottleneck": 16,
                     "epochs": 150,
@@ -522,7 +522,7 @@ def test_example_configuration_is_portable_and_valid() -> None:
     assert config.provider.module == "symmlearn.provider.worker"
     assert Path(config.model.python_executable).is_file()
     assert config.features.rotation_folds == (2, 3, 4, 6)
-    assert config.fine_tuning.minimum_shots_per_class == 3
+    assert config.fine_tuning.minimum_shots_per_class == 1
     assert config.fine_tuning.recommended_shots_per_class == 5
 
 
@@ -534,7 +534,7 @@ def test_recorded_options_restore_all_execution_parameters() -> None:
     restored = recorded_run_options(payload)
     assert restored.n_max == 31
     assert restored.adapter_bottleneck == 7
-    assert restored.minimum_shots_per_class == 3
+    assert restored.minimum_shots_per_class == 1
 
 
 def test_portable_fine_tuned_model_package_contains_inference_contract(

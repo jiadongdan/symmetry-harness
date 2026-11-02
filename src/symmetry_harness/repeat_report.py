@@ -23,6 +23,14 @@ GRID = (226, 230, 235)
 BAND = (232, 238, 246)
 SERIES = ((214, 39, 40), (31, 119, 180), (44, 160, 44))
 CHART_SIZE = (960, 520)
+SHEET_PANEL = 300
+SHEET_GAP = 10
+SHEET_MARGIN = 24
+SHEET_HEADER = 62
+SHEET_ROW_TITLE = 26
+SHEET_ROW_GAP = 16
+SHEET_COLUMNS = ("support points", "predicted mask", "wrong cells vs truth")
+SHEET_MAX_ROWS = 12
 PAD_LEFT = 84
 PAD_RIGHT = 28
 PAD_TOP = 56
@@ -260,6 +268,212 @@ def build_points_figure(
     return path
 
 
+def _point_groups(entry: dict[str, Any]) -> list[list[Any]]:
+    """Return the round's support points grouped by class.
+
+    ``loop_rounds.csv`` stores them under ``points_xy`` while in-memory rows use
+    ``points_by_class``; both may arrive as a JSON string after a resume.
+    """
+    raw = entry.get("points_by_class")
+    if raw in (None, ""):
+        raw = entry.get("points_xy")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw, list) or not raw:
+        return []
+    first = raw[0]
+    if isinstance(first, (list, tuple)) and first and isinstance(first[0], (list, tuple)):
+        return [list(group) for group in raw]
+    return [list(raw)]
+
+
+def _evenly(values: Sequence[Any], limit: int) -> list[Any]:
+    """Keep at most ``limit`` entries, always including the first and the last."""
+    if len(values) <= limit or limit < 2:
+        return list(values)
+    picks = {round(position * (len(values) - 1) / (limit - 1)) for position in range(limit)}
+    return [values[position] for position in sorted(picks)]
+
+
+def _nearest_resize(grid: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Upscale a categorical grid by nearest neighbour so labels never blend."""
+    return np.asarray(
+        Image.fromarray(np.asarray(grid, dtype=np.uint8)).resize(size, Image.NEAREST)
+    )
+
+
+def _marker(
+    draw: ImageDraw.ImageDraw,
+    x: float,
+    y: float,
+    color: tuple[int, int, int],
+    *,
+    radius: int = 6,
+    patch_half: float | None = None,
+) -> None:
+    if patch_half is not None:
+        draw.rectangle(
+            [x - patch_half, y - patch_half, x + patch_half, y + patch_half],
+            outline=color,
+            width=1,
+        )
+    draw.ellipse([x - radius, y - radius, x + radius, y + radius], fill=(255, 255, 255))
+    inner = radius - 2
+    draw.ellipse(
+        [x - inner, y - inner, x + inner, y + inner],
+        fill=color,
+    )
+
+
+def _round_sheet(
+    path: Path,
+    image: np.ndarray,
+    manifest: dict[str, Any],
+    history: Sequence[dict[str, Any]],
+    loop_dir: Path,
+) -> Path | None:
+    """Resolve the ground truth and run options, then draw the round sheet."""
+    from .repeat import DEFAULT_CLASS_COLORS, class_map_from_labels, load_label_map
+
+    ground_truth = manifest.get("ground_truth") or {}
+    run_options = manifest.get("run_options") or {}
+    codes = [int(code) for code in (ground_truth.get("label_codes") or [])]
+    class_map = None
+    label_path = ground_truth.get("path")
+    if label_path and len(codes) == 2 and Path(label_path).is_file():
+        try:
+            class_map = class_map_from_labels(load_label_map(label_path), codes)
+        except Exception:  # noqa: BLE001 - the sheet is display-only
+            class_map = None
+    return build_round_sheet(
+        path,
+        image,
+        class_map,
+        history,
+        rounds_dir=loop_dir / "rounds",
+        class_colors=list(DEFAULT_CLASS_COLORS),
+        patch_size=int(run_options.get("classifier_patch_size") or 64),
+        stride=int(run_options.get("stride") or 4),
+    )
+
+
+def build_round_sheet(
+    path: Path,
+    image: np.ndarray,
+    class_map: np.ndarray | None,
+    rounds: Sequence[dict[str, Any]],
+    *,
+    rounds_dir: Path,
+    class_colors: Sequence[str],
+    patch_size: int,
+    stride: int,
+) -> Path | None:
+    """Draw one row per round: support points, predicted mask, and wrong cells.
+
+    The sheet answers the two questions a stability loop raises at a glance:
+    where did each round put its support points, and what mask did that round
+    produce. The third column marks cells that disagree with the ground truth,
+    so a round that drifts shows up as a red band rather than a number.
+    """
+    from .analysis import dense_prediction_from_arrays, prediction_display_bounds
+
+    palette = np.asarray([ImageColor.getrgb(color) for color in class_colors], dtype=np.uint8)
+    base = np.repeat(unit_to_uint8(image)[..., None], 3, axis=2).astype(np.uint8)
+    height, width = base.shape[:2]
+    panel_h = max(1, int(round(SHEET_PANEL * height / max(width, 1))))
+    scale = SHEET_PANEL / max(width, 1)
+
+    rendered: list[tuple[dict[str, Any], Image.Image, Image.Image, Image.Image]] = []
+    for entry in _evenly(list(rounds), SHEET_MAX_ROWS):
+        index = int(float(entry.get("round", len(rendered))))
+        source = rounds_dir / f"round-{index:03d}" / "kept" / "prediction.npz"
+        if not source.is_file():
+            continue
+        try:
+            with np.load(source, allow_pickle=False) as payload:
+                arrays = {name: np.asarray(payload[name]).copy() for name in payload.files}
+            prediction = dense_prediction_from_arrays(arrays)
+            left, top, right, bottom = prediction_display_bounds(
+                prediction, (height, width), stride=stride
+            )
+            classes = _nearest_resize(prediction.prediction_grid, (right - left, bottom - top))
+        except Exception:  # noqa: BLE001 - the sheet is display-only
+            continue
+
+        colors = palette[classes]
+        mask_rgb = np.full((height, width, 3), 244, dtype=np.uint8)
+        mask_rgb[top:bottom, left:right] = colors
+        # The error panel drops the class colours on purpose: a wrong cell painted
+        # in the class colour would be invisible against that same class.
+        wrong_rgb = np.full((height, width, 3), 238, dtype=np.uint8)
+        if class_map is not None and class_map.shape == (height, width):
+            truth = class_map[top:bottom, left:right]
+            wrong_rgb[top:bottom, left:right] = (232, 232, 232)
+            wrong_rgb[top:bottom, left:right][classes != truth] = (214, 39, 40)
+
+        raw_panel = Image.fromarray(base).resize((SHEET_PANEL, panel_h), Image.LANCZOS)
+        mask_panel = Image.fromarray(mask_rgb).resize((SHEET_PANEL, panel_h), Image.NEAREST)
+        wrong_panel = Image.fromarray(wrong_rgb).resize((SHEET_PANEL, panel_h), Image.NEAREST)
+
+        groups = _point_groups(entry)
+        for target, hollow, boxes in (
+            (raw_panel, False, True),
+            (mask_panel, True, False),
+        ):
+            draw = ImageDraw.Draw(target)
+            for class_index, group in enumerate(groups):
+                color = tuple(int(channel) for channel in palette[class_index % len(palette)])
+                for point in group:
+                    _marker(
+                        draw,
+                        float(point[0]) * scale,
+                        float(point[1]) * scale,
+                        color,
+                        radius=4 if hollow else 6,
+                        patch_half=None if not boxes else patch_size * scale / 2.0,
+                    )
+        rendered.append((entry, raw_panel, mask_panel, wrong_panel))
+
+    if not rendered:
+        return None
+
+    sheet_w = SHEET_MARGIN * 2 + 3 * SHEET_PANEL + 2 * SHEET_GAP
+    sheet_h = SHEET_HEADER + len(rendered) * (SHEET_ROW_TITLE + panel_h + SHEET_ROW_GAP)
+    canvas = Image.new("RGB", (sheet_w, sheet_h), BACKGROUND)
+    draw = ImageDraw.Draw(canvas)
+    draw.text((SHEET_MARGIN, 16), "Support points and predicted mask, one row per round", font=_font(17), fill=INK)
+    for column, label in enumerate(SHEET_COLUMNS):
+        x = SHEET_MARGIN + column * (SHEET_PANEL + SHEET_GAP)
+        draw.text((x, SHEET_HEADER - 20), label, font=_font(12), fill=MUTED)
+
+    y = SHEET_HEADER
+    for entry, raw_panel, mask_panel, wrong_panel in rendered:
+        index = int(float(entry.get("round", 0)))
+        counts = [len(group) for group in _point_groups(entry)]
+        detail = " + ".join(str(count) for count in counts) if counts else "?"
+        try:
+            accuracy = f"{float(entry.get('acc')):.2%}"
+        except (TypeError, ValueError):
+            accuracy = "n/a"
+        draw.text(
+            (SHEET_MARGIN, y + 4),
+            f"round {index}   accuracy {accuracy}   points {detail}",
+            font=_font(13),
+            fill=INK,
+        )
+        for column, panel in enumerate((raw_panel, mask_panel, wrong_panel)):
+            x = SHEET_MARGIN + column * (SHEET_PANEL + SHEET_GAP)
+            canvas.paste(panel, (x, y + SHEET_ROW_TITLE))
+        y += SHEET_ROW_TITLE + panel_h + SHEET_ROW_GAP
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(path)
+    return path
+
+
 def _percent(value: Any, digits: int = 2) -> str:
     try:
         number = float(value)
@@ -290,7 +504,7 @@ def write_loop_summary(
     status: str,
     alarm: str | None = None,
 ) -> Path:
-    """Write ``loop_summary.md`` plus the four loop figures."""
+    """Write ``loop_summary.md`` plus the loop figures."""
     figures_dir = loop_dir / "figures"
     rounds = [int(float(entry.get("round", index))) for index, entry in enumerate(history)]
     accuracies = _finite([entry.get("acc", "nan") for entry in history])
@@ -337,21 +551,27 @@ def write_loop_summary(
             image = None
         points_by_round: list[tuple[int, list[tuple[int, int]]]] = []
         for entry in history:
-            raw = entry.get("points_by_class")
-            if isinstance(raw, str):
-                try:
-                    raw = json.loads(raw)
-                except json.JSONDecodeError:
-                    raw = None
-            if not raw:
+            groups = _point_groups(entry)
+            if not groups:
                 continue
-            flat = [tuple(point) for group in raw for point in group]
+            flat = [tuple(point) for group in groups for point in group]
             points_by_round.append((int(float(entry.get("round", 0))), flat))
         if image is not None and points_by_round:
             points_path = build_points_figure(
                 figures_dir / "points_map.png", image, points_by_round
             )
             figures.append(("Every sampled support point, coloured by round", points_path))
+            sheet_path = _round_sheet(
+                figures_dir / "round_sheet.png", image, manifest, history, loop_dir
+            )
+            if sheet_path is not None:
+                figures.append(
+                    (
+                        "One row per round: where the support points landed, the mask "
+                        "that round produced, and the cells that disagree with the truth",
+                        sheet_path,
+                    )
+                )
 
     finite = [value for value in accuracies if np.isfinite(value)]
     mean = float(np.mean(finite)) if finite else float("nan")

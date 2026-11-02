@@ -521,9 +521,10 @@ def _configure_classes(
         value, state, classifier_patch_size=patch_size
     )
     names = list(updated["class_names"])
+    minimum = config.fine_tuning.minimum_shots_per_class
     status = (
         f"Configured {len(names)} classes. Select an active class and click at least "
-        f"{config.fine_tuning.minimum_shots_per_class} support points per class; "
+        f"{minimum} support point{'' if minimum == 1 else 's'} per class; "
         f"{config.fine_tuning.recommended_shots_per_class} are recommended."
     )
     return (
@@ -673,7 +674,7 @@ def _selection_details(
     strategy = str(
         capability.get("fine_tuning_strategy", "Provider-managed fine-tuning")
     )
-    minimum = int(capability.get("minimum_shots_per_class", 3))
+    minimum = int(capability.get("minimum_shots_per_class", 1))
     recommended = int(capability.get("recommended_shots_per_class", 5))
     maximum = int(capability.get("maximum_shots_per_class", 50))
     weight_text = "Registered default" if weight_identifier is None else None

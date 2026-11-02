@@ -408,7 +408,7 @@ def test_fine_tune_annotation_behavior_is_unchanged_after_the_refactor() -> None
     assert updated["show_valid_region"] is True
     assert annotated.shape == (720, 720, 3)
     assert rows == [["Phase A", 0, ""], ["Phase B", 0, ""]]
-    assert "at least 3 support points per class" in message
+    assert "at least 1 support point per class" in message
     assert active["value"] == "Phase A"
 
 
