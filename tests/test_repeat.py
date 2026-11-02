@@ -180,11 +180,24 @@ def test_interior_points_are_reproducible() -> None:
     assert first != third
 
 
-def test_interior_points_reject_impossible_margin() -> None:
-    labels = two_phase_labels()
+def test_interior_points_shrink_the_margin_for_a_narrow_phase() -> None:
+    """A phase narrower than twice the margin must not stop the loop."""
+    labels = np.full((128, 128), 14, dtype=np.int32)
+    labels[58:70] = 17  # a 12 px band: eroding by 32 wipes it out
+    class_map = class_map_from_labels(labels, (14, 17))
+    group_a, group_b = interior_points(
+        class_map, patch_size=8, points_per_class=2, margin=32, seed=1
+    )
+    assert len(group_a) == 2 and len(group_b) == 2
+    for x, y in group_b:
+        assert class_map[y, x] == 1
+
+
+def test_interior_points_reject_a_missing_phase() -> None:
+    labels = np.full((128, 128), 14, dtype=np.int32)
     class_map = class_map_from_labels(labels, (14, 17))
     with pytest.raises(RepeatError, match="interior pixels"):
-        interior_points(class_map, patch_size=64, points_per_class=5, margin=63, seed=1)
+        interior_points(class_map, patch_size=8, points_per_class=2, margin=8, seed=1)
 
 
 # ---------------------------------------------------------------------------
@@ -443,9 +456,15 @@ def test_run_repeat_keeps_rounds_independent(config, tmp_path, monkeypatch) -> N
         assert (kept / "prediction.npz").is_file()
         assert (kept / "fine_tuned_model.symmodel").is_file()
         assert (kept / "annotation_session.json").is_file()
-    # Run directories and their archives are pruned.
-    leftovers = [path for path in (loop_dir / "rounds").iterdir() if path.is_dir() and path.name.startswith("symmetry-")]
-    assert leftovers == []
+    # The run directories stay, but their two ~46 MB duplicates are removed.
+    leftovers = [
+        path
+        for path in (loop_dir / "rounds").iterdir()
+        if path.is_dir() and path.name.startswith("symmetry-")
+    ]
+    assert len(leftovers) == 3
+    for leftover in leftovers:
+        assert not (leftover / "fine_tuned_model.symmodel").is_file()
     assert list((loop_dir / "rounds").glob("*.zip")) == []
     assert (loop_dir / "figures" / "acc_vs_round.png").is_file()
 
