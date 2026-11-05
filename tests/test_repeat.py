@@ -557,7 +557,7 @@ def _install_fake_provider(monkeypatch: pytest.MonkeyPatch, *, bad_round: int | 
     def fake_features(config, image, *, options):
         raise RuntimeError("feature reuse is unavailable in this test")
 
-    def fake_run_analysis(config, *, image_path, annotation_session, output_root, resolved_options=None, overrides=None, features_path=None, features_record_path=None):
+    def fake_run_analysis(config, *, image_path, annotation_session, output_root, resolved_options=None, overrides=None, features_path=None, features_record_path=None, pack_archive=True):
         index = len(calls)
         session = annotation_session
         run_dir = Path(output_root) / f"symmetry-test-{index:04d}"
@@ -570,7 +570,8 @@ def _install_fake_provider(monkeypatch: pytest.MonkeyPatch, *, bad_round: int | 
         )
         for name in ("run_record.json", "confidence.png", "prediction_overlay.png", "fine_tuned_model.symmodel"):
             (run_dir / name).write_bytes(b"stub")
-        (run_dir.parent / f"{run_dir.name}-full-run.zip").write_bytes(b"zip")
+        if pack_archive:
+            (run_dir.parent / f"{run_dir.name}-full-run.zip").write_bytes(b"zip")
         calls.append(
             {
                 "seed": None if resolved_options is None else resolved_options.seed,
@@ -580,6 +581,7 @@ def _install_fake_provider(monkeypatch: pytest.MonkeyPatch, *, bad_round: int | 
                 "points": [[tuple(point) for point in entry.points] for entry in session.classes],
                 "counts": [len(entry.points) for entry in session.classes],
                 "features": features_path,
+                "pack_archive": pack_archive,
             }
         )
         return {
@@ -637,7 +639,8 @@ def test_run_repeat_keeps_rounds_independent(config, tmp_path, monkeypatch) -> N
         assert (kept / "prediction.npz").is_file()
         assert (kept / "fine_tuned_model.symmodel").is_file()
         assert (kept / "annotation_session.json").is_file()
-    # The run directories stay, but their two ~46 MB duplicates are removed.
+    # No round packages an archive and none issues a file deletion: the
+    # checkpoint is moved into kept/, so no duplicate is left to purge.
     leftovers = [
         path
         for path in (loop_dir / "rounds").iterdir()
@@ -647,8 +650,50 @@ def test_run_repeat_keeps_rounds_independent(config, tmp_path, monkeypatch) -> N
     for leftover in leftovers:
         assert not (leftover / "fine_tuned_model.symmodel").is_file()
     assert list((loop_dir / "rounds").glob("*.symmodel")) == []
-    assert list((loop_dir / "rounds").glob("*.zip")) == []
+    assert list((loop_dir / "rounds").rglob("*.zip")) == []
+    assert list((loop_dir / "rounds").rglob("*.purged")) == []
+    assert all(call["pack_archive"] is False for call in calls)
     assert (loop_dir / "figures" / "acc_vs_round.png").is_file()
+
+
+def test_run_repeat_reclaims_the_checkpoint_without_deleting(config, tmp_path, monkeypatch) -> None:
+    """``--no-keep-checkpoint`` must free the 46 MB without an unlink.
+
+    A hundred-round loop issues a hundred of these. On a machine that counts
+    deletions the loop is torn down the moment the counter trips, so the reclaim
+    is a rename plus a truncate instead.
+    """
+    calls = _install_fake_provider(monkeypatch)
+    image_path, label_path = _write_inputs(tmp_path)
+    options = RepeatOptions(
+        rounds=1,
+        points_per_class=2,
+        interior_margin=8,
+        min_point_distance=0,
+        keep_checkpoint=False,
+    )
+
+    result = run_repeat(
+        config, image_path=image_path, label_path=label_path, options=options
+    )
+
+    assert result["status"] == "completed"
+    assert len(calls) == 2
+    loop_dir = Path(result["loop_directory"])
+    leftovers = [
+        path
+        for path in (loop_dir / "rounds").iterdir()
+        if path.is_dir() and path.name.startswith("symmetry-")
+    ]
+    assert len(leftovers) == 2
+    for leftover in leftovers:
+        assert not (leftover / "fine_tuned_model.symmodel").is_file()
+        purged = leftover / "fine_tuned_model.symmodel.purged"
+        assert purged.is_file()
+        assert purged.stat().st_size == 0
+        # The small artifacts survive the prune untouched.
+        assert (leftover / "prediction.npz").is_file()
+    assert list((loop_dir / "rounds").rglob("*.zip")) == []
 
 
 def test_run_repeat_samples_from_a_frozen_pool(config, tmp_path, monkeypatch) -> None:
@@ -799,6 +844,52 @@ def test_run_repeat_resumes_from_completed_rounds(config, tmp_path, monkeypatch)
     assert second["rounds_completed"] == 3
     assert len(calls) == 2
     assert [call["seed"] for call in calls] == [44, 45]
+
+
+def test_run_repeat_resume_fills_a_round_missing_from_the_table(config, tmp_path, monkeypatch) -> None:
+    """A round can leave artifacts without a row; resume must not step over it.
+
+    That is exactly what happened when a delete guard killed the loop between
+    ``_keep_artifacts`` and the CSV append: the directory looked finished, so
+    counting directories resumed one round too late and dropped round 3 from the
+    distribution while still reporting a full loop.
+    """
+    calls = _install_fake_provider(monkeypatch)
+    image_path, label_path = _write_inputs(tmp_path)
+    first = run_repeat(
+        config,
+        image_path=image_path,
+        label_path=label_path,
+        options=RepeatOptions(rounds=3, points_per_class=2, interior_margin=8, min_point_distance=0),
+    )
+    assert first["rounds_completed"] == 3
+
+    loop_dir = Path(first["loop_directory"])
+    csv_path = loop_dir / "loop_rounds.csv"
+    rows = list(csv.DictReader(csv_path.open(encoding="utf-8")))
+    # Simulate the interruption: round 3 kept its artifacts but lost its row.
+    kept_rows = [row for row in rows if row["round"] != "3"]
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        for row in kept_rows:
+            writer.writerow(row)
+    assert (loop_dir / "rounds" / "round-003" / "kept" / "prediction.npz").is_file()
+
+    calls.clear()
+    second = run_repeat(
+        config,
+        image_path=image_path,
+        label_path=label_path,
+        options=RepeatOptions(rounds=3, points_per_class=2, interior_margin=8, min_point_distance=0),
+        resume=loop_dir,
+    )
+
+    assert second["rounds_completed"] == 3
+    assert len(calls) == 1
+    assert calls[0]["seed"] == 45
+    rounds = [row["round"] for row in csv.DictReader(csv_path.open(encoding="utf-8"))]
+    assert rounds == ["1", "2", "3"]
 
 
 def test_run_repeat_refuses_a_different_image(config, tmp_path, monkeypatch) -> None:

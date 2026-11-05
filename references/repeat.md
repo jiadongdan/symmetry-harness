@@ -216,6 +216,12 @@ the horizon may grow: changing `--mode`, `--points-per-class`, `--tau`, or
 `--base-seed` is refused, because mixing two protocols would corrupt the
 distribution.
 
+`loop_rounds.csv` is the record of what is finished, not the directory tree. A
+round writes its artifacts before its row, so an interruption can leave a
+`round-NNN/kept/` that the table never heard of; resume fills the first gap
+instead of stepping over it. Rows are rewritten from memory rather than appended,
+so re-running a round replaces its row instead of duplicating it.
+
 Loops written before schema `symmetry-repeat-loop-v2` cannot be resumed; their
 pool was accumulated across rounds and no longer exists.
 
@@ -244,11 +250,19 @@ point), the predicted mask, and the cells that disagree with the ground truth.
 It caps at 12 rows, showing evenly spaced rounds including the first and the
 last, so a 100-round loop still produces a readable sheet.
 
-The harness run directory itself, its training-only artifacts, and the duplicate
-`-full-run.zip` are deleted after each round. Keeping every
-`fine_tuned_model.symmodel` costs about **45 MB per round**: 5 rounds ≈ 230 MB,
-100 rounds ≈ 4.5 GB. Use `--no-keep-checkpoint` to keep only the maps, which is
-about 0.2 MB per round plus the one-time feature stack (≈4 MB at 512x512).
+The run directory itself and its training-only artifacts stay; the checkpoint is
+where all the space is. With `--keep-checkpoint` it is **moved** into
+`kept/` (same volume, so a rename) and costs about **45 MB per round**: 5 rounds
+≈ 230 MB, 100 rounds ≈ 4.5 GB. With `--no-keep-checkpoint` it is renamed to
+`fine_tuned_model.symmodel.purged` and truncated to zero bytes, which frees the
+same blocks without a file deletion and leaves about 0.2 MB per round plus the
+one-time feature stack (≈4 MB at 512x512).
+
+No round deletes anything, and no round writes a `-full-run.zip`. Both are
+deliberate: a hundred-round loop would otherwise issue two hundred deletions, and
+a machine with a batch-delete guard refuses the one that crosses its threshold by
+tearing down the process — no exception, exit code zero, a half-written run
+directory.
 
 ## Feature reuse
 

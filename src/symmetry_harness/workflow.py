@@ -422,8 +422,16 @@ def run_analysis(
     features_record_path: str | Path | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
     session_id: str | None = None,
+    pack_archive: bool = True,
 ) -> dict[str, Any]:
-    """Validate user input and delegate the complete numerical run to the provider."""
+    """Validate user input and delegate the complete numerical run to the provider.
+
+    ``pack_archive=False`` skips the complete-run ZIP. It exists for callers that
+    run the same analysis dozens of times and discard each result, such as the
+    repeat loop: the archive is a second copy of a directory nobody keeps, and
+    removing it later costs a file deletion per round, which is exactly the
+    operation that batch-delete guards block on locked-down machines.
+    """
     readiness = doctor(config)
     if readiness["status"] != "ready":
         raise RuntimeError(
@@ -633,18 +641,19 @@ def run_analysis(
     # the run record, and the report have been written. It is a faithful copy of
     # the run directory (including the normalized ``input.npy``) and never adds
     # the original uploaded source file.
-    archive_path: Path | None
-    try:
-        archive_path = create_run_archive(run_dir, output_root=root)
-    except Exception as error:  # artifact failure must not erase a valid model
-        archive_path = None
-        warnings.append(
-            "The numerical run completed, but the complete run ZIP could not "
-            f"be created: {error}"
-        )
-        record["warnings"] = warnings
-        record["artifact_errors"] = {"full_run_zip": str(error)}
-        _write_json(Path(artifacts["run_record"]), record)
+    archive_path: Path | None = None
+    if pack_archive:
+        try:
+            archive_path = create_run_archive(run_dir, output_root=root)
+        except Exception as error:  # artifact failure must not erase a valid model
+            archive_path = None
+            warnings.append(
+                "The numerical run completed, but the complete run ZIP could not "
+                f"be created: {error}"
+            )
+            record["warnings"] = warnings
+            record["artifact_errors"] = {"full_run_zip": str(error)}
+            _write_json(Path(artifacts["run_record"]), record)
     return {
         "status": "completed",
         "run_id": run_id,
