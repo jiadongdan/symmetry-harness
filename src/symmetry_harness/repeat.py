@@ -6,12 +6,27 @@ a fresh adapter from the backbone with exactly ``points_per_class`` newly chosen
 support points, so the support set never accumulates and each round is an
 independent replicate of the same experiment.
 
-Two accumulated fields decide where the next round samples:
+A loop has exactly one *anchor*: round 0, the first fine-tune. Its prediction
+and confidence map are frozen before the first replicate starts, and both the
+candidate pool and the pseudo-labels of every later round come from that frozen
+snapshot. Nothing a later round predicts can change where a later round samples.
+That is what makes the replicates independent: round 80 sees the same pool as
+round 1, so the spread across rounds measures the training procedure rather than
+a self-training feedback loop.
 
-* ``confidence`` - the arithmetic mean of every round's confidence grid. It is
-  used only as a filter: candidates below ``tau`` are not sampled.
-* ``votes`` - how often each grid cell was predicted as each class. It supplies
-  the pseudo-label of every sampled point.
+The pool depends on the mode:
+
+``user``
+    Candidates are anchor cells with ``confidence >= tau`` labelled ``c``. This
+    is the product flow: the user's own first fine-tune decides where the loop
+    is allowed to sample, and an unstable round can never widen or shift that
+    region.
+
+``stability``
+    Candidates are anchor cells that agree with the ground truth *and* sit at
+    least ``patch_size / 2`` away from a phase boundary, so a patch never
+    straddles two phases. This is the internal flow: with annotation noise
+    removed, all that is left is training variance.
 
 Points inside one round are drawn with a Poisson-disk constraint: no two support
 points end up closer than ``min_point_distance`` pixels, so a round never spends
@@ -33,7 +48,7 @@ import json
 from pathlib import Path
 import shutil
 from time import perf_counter
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Sequence
 from uuid import uuid4
 
 import numpy as np
@@ -51,9 +66,17 @@ from .provider import doctor, run_provider_features
 from .workflow import build_run_options, run_analysis
 
 
-REPEAT_SCHEMA_VERSION = "symmetry-repeat-loop-v1"
+REPEAT_SCHEMA_VERSION = "symmetry-repeat-loop-v2"
 DEFAULT_CLASS_NAMES = ("Class A", "Class B")
 DEFAULT_CLASS_COLORS = ("#e41a1c", "#377eb8")
+
+#: The two flows the loop can measure. See the module docstring.
+REPEAT_MODES = ("user", "stability")
+
+#: Below this many replicates the sample standard deviation is too noisy to
+#: bound anything: with four rounds `mean - 3 sigma` already fires on ordinary
+#: spread. Short loops therefore use the absolute floor only.
+SIGMA_MIN_SAMPLES = 6
 
 #: Artifacts copied out of a completed run before the run directory is removed.
 KEPT_ARTIFACTS = (
@@ -75,6 +98,7 @@ class RepeatOptions:
 
     rounds: int = 5
     points_per_class: int = 5
+    mode: str = "user"
     tau: float = 0.95
     base_seed: int = 42
     alarm_drop: float = 3.0
@@ -92,6 +116,10 @@ class RepeatOptions:
             raise RepeatError("rounds must be nonnegative (0 keeps only the seed round).")
         if self.points_per_class < 1:
             raise RepeatError("points_per_class must be at least 1.")
+        if self.mode not in REPEAT_MODES:
+            raise RepeatError(
+                f"mode must be one of {list(REPEAT_MODES)}; got {self.mode!r}."
+            )
         if not 0.5 <= self.tau <= 1.0:
             raise RepeatError("tau must lie in [0.5, 1.0]; confidence is max(p).")
         if self.base_seed < 0:
@@ -115,6 +143,7 @@ class RepeatOptions:
         return {
             "rounds": self.rounds,
             "points_per_class": self.points_per_class,
+            "mode": self.mode,
             "tau": self.tau,
             "base_seed": self.base_seed,
             "alarm_drop": self.alarm_drop,
@@ -291,54 +320,182 @@ def interior_points(
 
 
 # ---------------------------------------------------------------------------
-# Sampling on the accumulated confidence field
+# Sampling on the frozen anchor pool
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class Accumulated:
-    """Cross-round state used to choose the next support set."""
+# ---------------------------------------------------------------------------
+# The frozen anchor and the pool it defines
+# ---------------------------------------------------------------------------
 
-    confidence_sum: np.ndarray
-    votes: np.ndarray
-    rounds: int = 0
+
+def _boundary_mask(label_grid: np.ndarray) -> np.ndarray:
+    """Mark cells that touch a different class, including at the grid edge."""
+    grid = np.asarray(label_grid)
+    edge = np.zeros(grid.shape, dtype=bool)
+    edge[1:, :] |= grid[1:, :] != grid[:-1, :]
+    edge[:-1, :] |= grid[1:, :] != grid[:-1, :]
+    edge[:, 1:] |= grid[:, 1:] != grid[:, :-1]
+    edge[:, :-1] |= grid[:, 1:] != grid[:, :-1]
+    return edge
+
+
+def _squared_distance_1d(values: np.ndarray) -> np.ndarray:
+    """Exact squared distance transform of one line (Felzenszwalb-Huttenlocher)."""
+    size = values.size
+    result = np.empty(size, dtype=np.float64)
+    parabola = np.zeros(size, dtype=np.int64)
+    boundary = np.empty(size + 1, dtype=np.float64)
+    level = 0
+    parabola[0] = 0
+    boundary[0] = -np.inf
+    boundary[1] = np.inf
+    for index in range(1, size):
+        while True:
+            previous = parabola[level]
+            crossing = (
+                (values[index] + index * index) - (values[previous] + previous * previous)
+            ) / (2.0 * index - 2.0 * previous)
+            if crossing <= boundary[level] and level > 0:
+                level -= 1
+                continue
+            break
+        level += 1
+        parabola[level] = index
+        boundary[level] = crossing
+        boundary[level + 1] = np.inf
+    level = 0
+    for index in range(size):
+        while boundary[level + 1] < index:
+            level += 1
+        previous = parabola[level]
+        result[index] = (index - previous) ** 2 + values[previous]
+    return result
+
+
+def distance_to_boundary(label_grid: np.ndarray, *, step: float) -> np.ndarray:
+    """Distance from every cell to the nearest phase boundary, in pixels.
+
+    The transform is exact in grid units and then scaled by ``step``, so it
+    matches the pixel clearance a support patch needs rather than counting cell
+    hops.
+    """
+    mask = _boundary_mask(label_grid)
+    if not mask.any():
+        return np.full(np.shape(label_grid), np.inf, dtype=np.float64)
+    # A finite sentinel keeps the parabola intersection finite; ``inf`` would
+    # turn ``inf - inf`` into ``nan`` halfway through the transform.
+    height, width = mask.shape
+    sentinel = float(height * height + width * width + 1)
+    seeds = np.where(mask, 0.0, sentinel)
+    rows = np.empty_like(seeds)
+    for row in range(seeds.shape[0]):
+        rows[row] = _squared_distance_1d(seeds[row])
+    squared = np.empty_like(seeds)
+    for column in range(seeds.shape[1]):
+        squared[:, column] = _squared_distance_1d(rows[:, column])
+    return np.sqrt(squared) * float(step)
+
+
+@dataclass(frozen=True)
+class Anchor:
+    """Round 0's prediction, frozen before the first replicate starts.
+
+    ``pools`` holds one ``(n, 2)`` array of ``(x, y)`` pixel coordinates per
+    class. Both the pool and the label of every later round come from here, so
+    the replicates cannot influence each other.
+    """
+
+    x_coordinates: np.ndarray
+    y_coordinates: np.ndarray
+    label_grid: np.ndarray
+    confidence_grid: np.ndarray
+    pools: tuple[np.ndarray, np.ndarray]
+    cleared_pixels: float
 
     @property
-    def confidence(self) -> np.ndarray:
-        if self.rounds == 0:
-            raise RepeatError("No confidence map has been accumulated yet.")
-        return self.confidence_sum / float(self.rounds)
+    def pool_sizes(self) -> tuple[int, int]:
+        return (int(len(self.pools[0])), int(len(self.pools[1])))
 
-    @property
-    def labels(self) -> np.ndarray:
-        if self.rounds == 0:
-            raise RepeatError("No prediction has been accumulated yet.")
-        return np.argmax(self.votes, axis=2).astype(np.int16)
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "source_round": 0,
+            "grid_shape": [int(value) for value in self.label_grid.shape],
+            "x_range": [
+                int(self.x_coordinates.min()),
+                int(self.x_coordinates.max()),
+            ],
+            "y_range": [
+                int(self.y_coordinates.min()),
+                int(self.y_coordinates.max()),
+            ],
+            "pool_sizes": list(self.pool_sizes),
+            "phase_boundary_clearance_px": (
+                None if not np.isfinite(self.cleared_pixels) else self.cleared_pixels
+            ),
+        }
 
-    def update(self, prediction) -> None:
-        confidence = np.asarray(prediction.confidence_grid, dtype=np.float64)
-        grid = np.asarray(prediction.prediction_grid, dtype=np.int16)
-        if self.rounds == 0:
-            if self.confidence_sum.shape != confidence.shape:
-                raise RepeatError("Confidence grid shape changed between rounds.")
-            self.votes = np.zeros(confidence.shape + (2,), dtype=np.int32)
-        elif self.confidence_sum.shape != confidence.shape:
-            raise RepeatError("Confidence grid shape changed between rounds.")
-        self.confidence_sum += confidence
-        for class_index in (0, 1):
-            self.votes[:, :, class_index] += (grid == class_index).astype(np.int32)
-        self.rounds += 1
 
-    @classmethod
-    def empty(cls, shape: tuple[int, int]) -> "Accumulated":
-        return cls(
-            confidence_sum=np.zeros(shape, dtype=np.float64),
-            votes=np.zeros(shape + (2,), dtype=np.int32),
-        )
+def build_anchor(
+    prediction,
+    *,
+    options: RepeatOptions,
+    class_map: np.ndarray | None,
+    patch_size: int,
+) -> Anchor:
+    """Freeze one prediction into the loop's anchor and its per-class pools."""
+    x_coordinates = np.asarray(prediction.x_coordinates, dtype=np.int64)
+    y_coordinates = np.asarray(prediction.y_coordinates, dtype=np.int64)
+    labels = np.asarray(prediction.prediction_grid, dtype=np.int16)
+    confidence = np.asarray(prediction.confidence_grid, dtype=np.float64)
+    if labels.shape != (len(y_coordinates), len(x_coordinates)):
+        raise RepeatError("The prediction grid and its axes disagree on shape.")
 
-    def replay(self, predictions: Iterable[Any]) -> None:
-        for prediction in predictions:
-            self.update(prediction)
+    clearance_px = float("inf")
+    if options.mode == "stability":
+        if class_map is None:
+            raise RepeatError(
+                "Stability mode anchors on cells where the prediction agrees with "
+                "the ground truth, so it needs a label raster."
+            )
+        truth = class_map[np.ix_(y_coordinates, x_coordinates)]
+        step = float(min(grid_step(x_coordinates), grid_step(y_coordinates)))
+        clearance = distance_to_boundary(truth, step=step)
+        clearance_px = float(patch_size) / 2.0
+        accepted = (labels == truth) & (clearance >= clearance_px)
+    else:
+        accepted = confidence >= float(options.tau)
+
+    pools: list[np.ndarray] = []
+    for class_index in (0, 1):
+        rows, columns = np.nonzero(accepted & (labels == class_index))
+        pool = np.stack(
+            [x_coordinates[columns], y_coordinates[rows]], axis=1
+        ).astype(np.int64)
+        if len(pool) < options.points_per_class:
+            if options.mode == "stability":
+                raise RepeatError(
+                    f"Class {class_index} has {len(pool)} anchor cells that match the "
+                    f"ground truth and sit {clearance_px:.1f} px from a phase "
+                    f"boundary; {options.points_per_class} are required. The anchor "
+                    "fine-tune is too wrong, or the phases are narrower than one "
+                    "patch, for this loop to measure anything."
+                )
+            raise RepeatError(
+                f"Class {class_index} has {len(pool)} anchor cells with confidence "
+                f">= {options.tau}; {options.points_per_class} are required. The "
+                "first fine-tune is not reliable enough to seed the loop. Relabel a "
+                "few points and fine-tune again instead of lowering tau."
+            )
+        pools.append(pool)
+    return Anchor(
+        x_coordinates=x_coordinates,
+        y_coordinates=y_coordinates,
+        label_grid=labels,
+        confidence_grid=confidence,
+        pools=(pools[0], pools[1]),
+        cleared_pixels=clearance_px,
+    )
 
 
 @dataclass(frozen=True)
@@ -454,60 +611,38 @@ def poisson_disk_select(
         radius = max(floor, radius * shrink)
 
 
-def select_points(
-    accumulated: Accumulated,
-    x_coordinates: np.ndarray,
-    y_coordinates: np.ndarray,
+def select_from_anchor(
+    anchor: Anchor,
     *,
     points_per_class: int,
-    tau: float,
     seed: int,
     min_distance: float = 0.0,
 ) -> Sampling:
-    """Draw ``points_per_class`` cells per class from the confident region.
+    """Draw ``points_per_class`` cells per class from the frozen anchor pool.
 
-    Candidates must have an accumulated confidence of at least ``tau``. Selection
-    is uniform without replacement, with a Poisson-disk constraint of
-    ``min_distance`` pixels across the whole support set: two points of the same
-    class or of different classes never sit closer than that. Pass ``0`` to fall
-    back to unconstrained uniform sampling.
+    The pool never changes, so the only thing that varies between rounds is the
+    draw. Every sampled cell carries the anchor's own label: no round can vote a
+    label onto a cell that another round predicted differently.
     """
-    confidence = accumulated.confidence
-    labels = accumulated.labels
-    pool = confidence >= float(tau)
-    if pool.shape != labels.shape:
-        raise RepeatError("The accumulated confidence and label grids differ in shape.")
-    xs = np.asarray(x_coordinates, dtype=np.int64)
-    ys = np.asarray(y_coordinates, dtype=np.int64)
-    point_groups: list[np.ndarray] = []
-    pool_sizes: list[int] = []
-    available: list[int] = []
-    rng = np.random.default_rng(seed)
+    xs = np.asarray(anchor.x_coordinates, dtype=np.int64)
+    pool_sizes = anchor.pool_sizes
     for class_index in (0, 1):
-        candidates = np.argwhere(pool & (labels == class_index))
-        pool_sizes.append(int(len(candidates)))
-        class_total = int((labels == class_index).sum())
-        available.append(class_total)
-        if len(candidates) < points_per_class:
+        if pool_sizes[class_index] < points_per_class:
             raise RepeatError(
-                f"Round pool for class {class_index} has {len(candidates)} confident "
-                f"cells (tau={tau}); {points_per_class} are required. Lower tau or "
-                "points_per_class."
+                f"The frozen pool for class {class_index} holds "
+                f"{pool_sizes[class_index]} cells; {points_per_class} are required."
             )
-        point_groups.append(
-            np.stack([xs[candidates[:, 1]], ys[candidates[:, 0]]], axis=1)
-        )
     chosen, used = poisson_disk_select(
-        point_groups,
+        anchor.pools,
         points_per_class,
         min_distance,
-        rng,
+        np.random.default_rng(seed),
         floor=max(2.0, 2.0 * grid_step(xs)),
     )
     return Sampling(
         points_by_class=(chosen[0], chosen[1]),
-        pool_sizes=(pool_sizes[0], pool_sizes[1]),
-        available=(available[0], available[1]),
+        pool_sizes=pool_sizes,
+        available=pool_sizes,
         seed=seed,
         min_distance=used,
         requested_min_distance=float(min_distance),
@@ -614,7 +749,15 @@ def evaluate_round(
         "history": statistics,
         "alarm_floor": options.alarm_floor,
         "alarm_drop": options.alarm_drop,
+        "sigma_min_samples": SIGMA_MIN_SAMPLES,
     }
+    if not np.isfinite(accuracy):
+        return StopDecision(
+            stop=False,
+            status="unscored",
+            reason="no ground truth, so this round carries no accuracy to judge",
+            detail=detail,
+        )
     if accuracy < options.alarm_floor:
         return StopDecision(
             stop=options.stop_on_alarm,
@@ -625,7 +768,7 @@ def evaluate_round(
             ),
             detail=detail,
         )
-    if statistics["count"] >= 3 and statistics["std"] >= 0.0:
+    if statistics["count"] >= SIGMA_MIN_SAMPLES:
         bound = statistics["mean"] - options.alarm_drop * statistics["std"]
         detail["lower_bound"] = bound
         if accuracy < bound:
@@ -685,12 +828,15 @@ def _write_json(path: Path, payload: Any) -> None:
 
 CSV_COLUMNS = (
     "round",
+    "mode",
     "points_a",
     "points_b",
     "spread_req",
     "spread",
     "pool_a",
     "pool_b",
+    "reuse_a",
+    "reuse_b",
     "acc",
     "acc_class_a",
     "acc_class_b",
@@ -698,6 +844,7 @@ CSV_COLUMNS = (
     "iou_class_b",
     "area_frac_pred",
     "area_frac_gt",
+    "anchor_agree",
     "agree_prev",
     "conf_mean",
     "conf_median",
@@ -792,7 +939,7 @@ def run_repeat(
     config: HarnessConfig,
     *,
     image_path: str | Path,
-    label_path: str | Path,
+    label_path: str | Path | None = None,
     options: RepeatOptions,
     output_root: str | Path | None = None,
     overrides: dict[str, Any] | None = None,
@@ -800,8 +947,18 @@ def run_repeat(
     resume: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Run one repeat loop on one labeled image and return its summary."""
+    """Run one repeat loop on one image and return its summary.
+
+    ``label_path`` is optional in ``user`` mode: without it the loop still runs
+    and still samples from the frozen anchor, but accuracy is not scored and the
+    alarm rules are inert. ``stability`` mode requires it.
+    """
     options.validate()
+    if options.mode == "stability" and label_path is None:
+        raise RepeatError(
+            "Stability mode anchors on cells that agree with the ground truth, so "
+            "every image needs a label raster."
+        )
     report = progress or (lambda message: None)
     readiness = doctor(config)
     if readiness["status"] != "ready":
@@ -810,12 +967,24 @@ def run_repeat(
         )
 
     image, input_record = inspect_input(image_path, config.features.input_normalization)
-    labels = load_label_map(label_path)
-    if labels.shape != image.shape:
-        raise RepeatError(
-            f"The label map {labels.shape} and image {image.shape} shapes differ."
-        )
-    class_map = class_map_from_labels(labels, options.label_codes)
+    labels: np.ndarray | None = None
+    class_map: np.ndarray | None = None
+    label_record: dict[str, Any] | None = None
+    if label_path is not None:
+        labels = load_label_map(label_path)
+        if labels.shape != image.shape:
+            raise RepeatError(
+                f"The label map {labels.shape} and image {image.shape} shapes differ."
+            )
+        class_map = class_map_from_labels(labels, options.label_codes)
+        label_record = {
+            "path": str(Path(label_path).expanduser().resolve()),
+            "sha256": file_sha256(label_path),
+            "shape": list(labels.shape),
+            "dtype": str(labels.dtype),
+            "label_codes": list(options.label_codes),
+            "class_names": list(options.class_names),
+        }
 
     run_options = build_run_options(config, overrides)
     if options.points_per_class < run_options.minimum_shots_per_class:
@@ -847,14 +1016,21 @@ def run_repeat(
             raise RepeatError(
                 "The resume directory was produced from a different image (SHA-256 differs)."
             )
-        if manifest["ground_truth"]["sha256"] != file_sha256(label_path):
+        if (manifest.get("ground_truth") or {}).get("sha256") != (
+            None if label_record is None else label_record["sha256"]
+        ):
             raise RepeatError(
                 "The resume directory was produced from a different ground truth."
             )
         recorded = RepeatOptions.from_dict(manifest["options"])
-        # Only the horizon may grow on resume: changing the shot count or the
-        # sampling rule would mix two protocols in one distribution. The
+        # Only the horizon may grow on resume: changing the mode, the shot count
+        # or the sampling rule would mix two protocols in one distribution. The
         # operational switches stay under the caller's control.
+        if recorded.mode != options.mode:
+            raise RepeatError(
+                f"The resume directory runs in {recorded.mode!r} mode; this command "
+                f"asked for {options.mode!r}. Two modes cannot share one distribution."
+            )
         options = replace(
             recorded,
             rounds=max(recorded.rounds, options.rounds),
@@ -897,14 +1073,7 @@ def run_repeat(
             "loop_id": loop_id,
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "input": input_record,
-            "ground_truth": {
-                "path": str(Path(label_path).expanduser().resolve()),
-                "sha256": file_sha256(label_path),
-                "shape": list(labels.shape),
-                "dtype": str(labels.dtype),
-                "label_codes": list(options.label_codes),
-                "class_names": list(options.class_names),
-            },
+            "ground_truth": label_record,
             "options": options.to_dict(),
             "run_options": run_options.to_dict(),
             "annotations": None if annotations is None else str(Path(annotations).resolve()),
@@ -925,33 +1094,26 @@ def run_repeat(
         _write_json(loop_dir / "loop_manifest.json", manifest)
 
     # ---------------------------------------------------------------- rounds
-    accumulated: Accumulated | None = None
+    anchor: Anchor | None = None
     history: list[dict[str, Any]] = []
     previous_grid: np.ndarray | None = None
-    x_coordinates: np.ndarray | None = None
-    y_coordinates: np.ndarray | None = None
     completed = 0
 
     if resume is not None:
+        anchor = _load_anchor(loop_dir, options=options, class_map=class_map, patch_size=patch_size)
+        completed = 1
         for path in sorted(rounds_dir.glob("round-*/kept/prediction.npz")):
+            if path.parent.parent.name == "round-000":
+                continue
             with np.load(path, allow_pickle=False) as payload:
                 arrays = {name: np.asarray(payload[name]).copy() for name in payload.files}
             prediction = dense_prediction_from_arrays(arrays)
-            if accumulated is None:
-                accumulated = Accumulated.empty(prediction.confidence_grid.shape)
-                x_coordinates = np.asarray(prediction.x_coordinates, dtype=np.int64)
-                y_coordinates = np.asarray(prediction.y_coordinates, dtype=np.int64)
-            accumulated.update(prediction)
             previous_grid = np.asarray(prediction.prediction_grid, dtype=np.int16)
             completed += 1
         if csv_path.is_file():
             with csv_path.open(encoding="utf-8", newline="") as handle:
                 history = list(csv.DictReader(handle))
-        report(f"replayed {completed} completed round(s)")
-        if completed == 0:
-            raise RepeatError(
-                "The resume directory holds a manifest but no completed round to replay."
-            )
+        report(f"replayed the anchor and {completed - 1} replicate(s)")
         if completed >= options.rounds + 1:
             return _finalize(loop_id, loop_dir, manifest, options, history, "completed")
 
@@ -984,7 +1146,7 @@ def run_repeat(
                     tuple(session.classes[0].points),
                     tuple(session.classes[1].points),
                 )
-            else:
+            elif class_map is not None:
                 points_by_class, spread_used = _interior_draw(
                     class_map,
                     patch_size=patch_size,
@@ -993,17 +1155,19 @@ def run_repeat(
                     seed=options.base_seed,
                     min_distance=requested_spread,
                 )
+            else:
+                raise RepeatError(
+                    "Without a label raster the anchor can only come from a real "
+                    "annotation; pass --annotations."
+                )
             pool_sizes = (0, 0)
             sample_seed = options.base_seed
         else:
-            if accumulated is None or x_coordinates is None or y_coordinates is None:
-                raise RepeatError("The loop has no accumulated prediction to sample from.")
-            sampling = select_points(
-                accumulated,
-                x_coordinates,
-                y_coordinates,
+            if anchor is None:
+                raise RepeatError("The loop has no frozen anchor to sample from.")
+            sampling = select_from_anchor(
+                anchor,
                 points_per_class=options.points_per_class,
-                tau=options.tau,
                 seed=sample_seed,
                 min_distance=requested_spread,
             )
@@ -1049,54 +1213,107 @@ def run_repeat(
         with np.load(run_directory / "prediction.npz", allow_pickle=False) as payload:
             arrays = {name: np.asarray(payload[name]).copy() for name in payload.files}
         prediction = dense_prediction_from_arrays(arrays)
-        metrics: dict[str, Any] = score_prediction(prediction, class_map)
-        metrics["agree_prev"] = agreement_with(previous_grid, prediction.prediction_grid)
-        training_path = run_directory / "training_history.json"
-        training = (
-            json.loads(training_path.read_text(encoding="utf-8"))
-            if training_path.is_file()
-            else {}
+        if round_index == 0:
+            anchor = build_anchor(
+                prediction,
+                options=options,
+                class_map=class_map,
+                patch_size=patch_size,
+            )
+            previous_grid = np.asarray(prediction.prediction_grid, dtype=np.int16)
+            metrics = _round_metrics(
+                prediction,
+                class_map,
+                previous_grid=None,
+                round_started=round_started,
+                training=_training_history(run_directory),
+            )
+            metrics["round"] = 0
+            metrics["train_seed"] = train_seed
+            metrics["sample_seed"] = sample_seed
+            metrics["run_id"] = result["run_id"]
+            metrics["role"] = "anchor"
+            metrics["points_by_class"] = [list(group) for group in points_by_class]
+            metrics["pool_sizes"] = list(anchor.pool_sizes)
+            kept_dir = round_dir / "kept"
+            _keep_artifacts(
+                run_directory, kept_dir, keep_checkpoint=options.keep_checkpoint
+            )
+            _prune_run_directory(run_directory)
+            shutil.copy2(session_path, kept_dir / "annotation_session.json")
+            _write_json(round_dir / "metrics.json", metrics)
+            anchor_dir = loop_dir / "anchor"
+            anchor_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(kept_dir / "prediction.npz", anchor_dir / "prediction.npz")
+            _write_json(anchor_dir / "anchor.json", anchor.to_record())
+            _write_json(anchor_dir / "metrics.json", metrics)
+            _write_json(
+                round_dir / "stop_decision.json",
+                {
+                    "stop": False,
+                    "status": "anchor",
+                    "reason": "the anchor defines the pool; it is not a replicate",
+                    "detail": {"pool_sizes": list(anchor.pool_sizes)},
+                },
+            )
+            manifest["anchor"] = {
+                **anchor.to_record(),
+                "options": {
+                    "mode": options.mode,
+                    "tau": options.tau,
+                    "classifier_patch_size": patch_size,
+                },
+            }
+            _write_json(loop_dir / "loop_manifest.json", manifest)
+            report(
+                f"anchor: frozen {anchor.pool_sizes[0]}+{anchor.pool_sizes[1]} "
+                "candidate cells from the first fine-tune"
+            )
+            continue
+
+        metrics = _round_metrics(
+            prediction,
+            class_map,
+            previous_grid=previous_grid,
+            round_started=round_started,
+            training=_training_history(run_directory),
         )
-        metrics["support_acc"] = float(
-            training.get("final_support_accuracy", float("nan"))
-        )
-        metrics["support_loss"] = float(training.get("final_support_loss", float("nan")))
-        metrics["seconds"] = round(perf_counter() - round_started, 3)
         metrics["round"] = round_index
         metrics["train_seed"] = train_seed
         metrics["sample_seed"] = sample_seed
         metrics["run_id"] = result["run_id"]
+        metrics["role"] = "replicate"
         metrics["points_by_class"] = [list(group) for group in points_by_class]
         metrics["pool_sizes"] = list(pool_sizes)
+        metrics["anchor_agree"] = (
+            float(
+                (
+                    np.asarray(prediction.prediction_grid, dtype=np.int16)
+                    == anchor.label_grid
+                ).mean()
+            )
+            if anchor is not None
+            else float("nan")
+        )
 
         kept_dir = round_dir / "kept"
         _keep_artifacts(run_directory, kept_dir, keep_checkpoint=options.keep_checkpoint)
         _prune_run_directory(run_directory)
         shutil.copy2(session_path, kept_dir / "annotation_session.json")
-
-        if accumulated is None:
-            accumulated = Accumulated.empty(prediction.confidence_grid.shape)
-            x_coordinates = np.asarray(prediction.x_coordinates, dtype=np.int64)
-            y_coordinates = np.asarray(prediction.y_coordinates, dtype=np.int64)
-        elif (
-            x_coordinates is None
-            or y_coordinates is None
-            or len(x_coordinates) != len(prediction.x_coordinates)
-            or not np.array_equal(x_coordinates, np.asarray(prediction.x_coordinates))
-        ):
-            raise RepeatError("The prediction grid changed between rounds.")
-        accumulated.update(prediction)
         previous_grid = np.asarray(prediction.prediction_grid, dtype=np.int16)
 
         _write_json(round_dir / "metrics.json", metrics)
         row: dict[str, Any] = {
             **metrics,
+            "mode": options.mode,
             "points_a": len(points_by_class[0]),
             "points_b": len(points_by_class[1]),
             "spread_req": requested_spread,
             "spread": spread_used,
             "pool_a": pool_sizes[0],
             "pool_b": pool_sizes[1],
+            "reuse_a": _reuse(round_index, options.points_per_class, pool_sizes[0]),
+            "reuse_b": _reuse(round_index, options.points_per_class, pool_sizes[1]),
             "points_xy": json.dumps(metrics["points_by_class"]),
         }
         _append_csv(csv_path, row)
@@ -1119,6 +1336,84 @@ def run_repeat(
     return _finalize(loop_id, loop_dir, manifest, options, history, "completed")
 
 
+def _reuse(round_index: int, points_per_class: int, pool_size: int) -> float | None:
+    """How many times each pool cell has been drawn on average by this round."""
+    if pool_size <= 0:
+        return None
+    return round_index * points_per_class / pool_size
+
+
+def _round_metrics(
+    prediction,
+    class_map: np.ndarray | None,
+    *,
+    previous_grid: np.ndarray | None,
+    round_started: float,
+    training: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Score one round, tolerating a loop that has no ground truth."""
+    if class_map is None:
+        grid = np.asarray(prediction.prediction_grid, dtype=np.int16)
+        metrics: dict[str, Any] = {
+            "cells": int(grid.size),
+            "acc": float("nan"),
+            "area_frac_pred": float((grid == 1).mean()),
+            "area_frac_gt": float("nan"),
+            "conf_mean": float(np.mean(prediction.confidence_grid)),
+            "conf_median": float(np.median(prediction.confidence_grid)),
+        }
+        for tag in ("acc_class_a", "acc_class_b", "iou_class_a", "iou_class_b"):
+            metrics[tag] = float("nan")
+    else:
+        metrics = score_prediction(prediction, class_map)
+    metrics["agree_prev"] = agreement_with(previous_grid, prediction.prediction_grid)
+    history = training or {}
+    metrics["support_acc"] = float(
+        history.get("final_support_accuracy", float("nan"))
+    )
+    metrics["support_loss"] = float(history.get("final_support_loss", float("nan")))
+    metrics["seconds"] = round(perf_counter() - round_started, 3)
+    return metrics
+
+
+def _training_history(run_directory: Path) -> dict[str, Any]:
+    path = run_directory / "training_history.json"
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _load_anchor(
+    loop_dir: Path,
+    *,
+    options: RepeatOptions,
+    class_map: np.ndarray | None,
+    patch_size: int,
+) -> Anchor:
+    """Rebuild the frozen anchor of an interrupted loop from its stored prediction."""
+    for candidate in (
+        loop_dir / "rounds" / "round-000" / "kept" / "prediction.npz",
+        loop_dir / "anchor" / "prediction.npz",
+    ):
+        if not candidate.is_file():
+            continue
+        with np.load(candidate, allow_pickle=False) as payload:
+            arrays = {name: np.asarray(payload[name]).copy() for name in payload.files}
+        return build_anchor(
+            dense_prediction_from_arrays(arrays),
+            options=options,
+            class_map=class_map,
+            patch_size=patch_size,
+        )
+    raise RepeatError(
+        "The resume directory holds no anchor prediction, so the frozen pool cannot "
+        "be rebuilt."
+    )
+
+
 def _history_accuracies(history: Sequence[dict[str, Any]]) -> list[float]:
     """Extract finite accuracies from rows that may have come from a CSV."""
     values: list[float] = []
@@ -1130,6 +1425,26 @@ def _history_accuracies(history: Sequence[dict[str, Any]]) -> list[float]:
         if np.isfinite(value):
             values.append(value)
     return values
+
+
+def pool_record(
+    manifest: dict[str, Any],
+    options: RepeatOptions,
+    rounds_completed: int,
+) -> dict[str, Any]:
+    """Describe the frozen pool and how hard the loop leaned on it."""
+    anchor = manifest.get("anchor") or {}
+    sizes = list(anchor.get("pool_sizes") or [0, 0])
+    reuse = [
+        (rounds_completed * options.points_per_class / size) if size else None
+        for size in sizes
+    ]
+    return {
+        "mode": options.mode,
+        "sizes": sizes,
+        "reuse": reuse,
+        "cleared_pixels": anchor.get("phase_boundary_clearance_px"),
+    }
 
 
 def _finalize(
@@ -1162,9 +1477,11 @@ def _finalize(
         "loop_directory": str(loop_dir),
         "rounds_completed": len(history),
         "planned_rounds": options.rounds + 1,
+        "mode": options.mode,
         "points_per_class": options.points_per_class,
         "tau": options.tau,
         "min_point_distance": options.min_point_distance,
+        "pool": pool_record(manifest, options, len(history)),
         "accuracy": statistics,
         "alarm": alarm,
         "summary": str(summary_path),
@@ -1222,7 +1539,8 @@ def run_repeat_batch(
     results: list[dict[str, Any]] = []
     for index, entry in enumerate(entries, start=1):
         image_path = Path(entry["image"]).expanduser()
-        label_path = Path(entry["gt"]).expanduser()
+        raw_label = entry.get("gt")
+        label_path = None if raw_label is None else Path(raw_label).expanduser()
         report(f"[{index}/{len(entries)}] {image_path.name}")
         try:
             result = run_repeat(
@@ -1238,12 +1556,12 @@ def run_repeat_batch(
             result = {
                 "status": "error",
                 "image": str(image_path),
-                "ground_truth": str(label_path),
+                "ground_truth": None if label_path is None else str(label_path),
                 "error": f"{type(error).__name__}: {error}",
             }
             report(f"  failed: {error}")
         result["image"] = str(image_path)
-        result["ground_truth"] = str(label_path)
+        result["ground_truth"] = None if label_path is None else str(label_path)
         results.append(result)
     payload = {
         "status": "completed"

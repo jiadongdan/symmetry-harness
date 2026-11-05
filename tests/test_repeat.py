@@ -13,11 +13,15 @@ from symmetry_harness import repeat as repeat_module
 from symmetry_harness.analysis import DensePrediction
 from symmetry_harness.config import load_harness_config
 from symmetry_harness.repeat import (
-    Accumulated,
+    REPEAT_SCHEMA_VERSION,
+    SIGMA_MIN_SAMPLES,
+    Anchor,
     RepeatError,
     RepeatOptions,
     agreement_with,
+    build_anchor,
     class_map_from_labels,
+    distance_to_boundary,
     evaluate_round,
     history_statistics,
     interior_points,
@@ -26,7 +30,7 @@ from symmetry_harness.repeat import (
     run_repeat,
     run_repeat_batch,
     score_prediction,
-    select_points,
+    select_from_anchor,
 )
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -203,24 +207,99 @@ def test_interior_points_reject_a_missing_phase() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Accumulation and sampling
+# The frozen anchor and the pool it defines
 # ---------------------------------------------------------------------------
 
 
-def test_accumulated_averages_confidence_and_votes() -> None:
-    first = fake_prediction()
-    accumulated = Accumulated.empty(first.confidence_grid.shape)
-    accumulated.update(first)
-    assert accumulated.rounds == 1
-    assert np.allclose(accumulated.confidence, first.confidence_grid)
+def _grid_class_map(height: int = 128, width: int = 128, split: int = 64) -> np.ndarray:
+    """Ground truth that agrees with :func:`fake_prediction` on the test grid."""
+    return class_map_from_labels(two_phase_labels(height, width, split), (14, 17))
 
-    inverted = fake_prediction(inverted=True)
-    accumulated.update(inverted)
-    assert accumulated.rounds == 2
-    expected = (first.confidence_grid + inverted.confidence_grid) / 2.0
-    assert np.allclose(accumulated.confidence, expected)
-    # One vote each per class: the argmax breaks the tie towards class 0.
-    assert set(np.unique(accumulated.labels)) == {0}
+
+def user_anchor(prediction: DensePrediction, *, tau: float = 0.95) -> Anchor:
+    return build_anchor(
+        prediction,
+        options=RepeatOptions(mode="user", tau=tau),
+        class_map=None,
+        patch_size=64,
+    )
+
+
+def test_build_anchor_user_pool_uses_the_anchor_label_and_confidence() -> None:
+    prediction = fake_prediction()
+    anchor = user_anchor(prediction)
+    assert anchor.pool_sizes[0] > 0 and anchor.pool_sizes[1] > 0
+    for class_index, pool in enumerate(anchor.pools):
+        for x, y in pool:
+            row = int((y - int(prediction.y_coordinates[0])) // 4)
+            column = int((x - int(prediction.x_coordinates[0])) // 4)
+            assert prediction.prediction_grid[row, column] == class_index
+            assert prediction.confidence_grid[row, column] >= 0.95
+
+
+def test_build_anchor_refuses_a_pool_too_thin_to_seed() -> None:
+    prediction = fake_prediction()
+    with pytest.raises(RepeatError, match="not reliable enough"):
+        build_anchor(
+            prediction,
+            options=RepeatOptions(mode="user", tau=0.999),
+            class_map=None,
+            patch_size=64,
+        )
+
+
+def test_build_anchor_stability_pool_agrees_and_clears_the_boundary() -> None:
+    prediction = fake_prediction()
+    class_map = _grid_class_map()
+    anchor = build_anchor(
+        prediction,
+        options=RepeatOptions(mode="stability"),
+        class_map=class_map,
+        patch_size=56,
+    )
+    assert anchor.cleared_pixels == 28.0
+    assert anchor.pool_sizes[0] > 0 and anchor.pool_sizes[1] > 0
+    for class_index, pool in enumerate(anchor.pools):
+        for x, y in pool:
+            assert class_map[y, x] == class_index
+            assert abs(int(x) - 64) >= 28
+
+
+def test_build_anchor_stability_rejects_a_clearance_no_cell_can_meet() -> None:
+    with pytest.raises(RepeatError, match="phase boundary"):
+        build_anchor(
+            fake_prediction(),
+            options=RepeatOptions(mode="stability"),
+            class_map=_grid_class_map(),
+            patch_size=128,
+        )
+
+
+def test_build_anchor_stability_needs_a_label_raster() -> None:
+    with pytest.raises(RepeatError, match="needs a label raster"):
+        build_anchor(
+            fake_prediction(),
+            options=RepeatOptions(mode="stability"),
+            class_map=None,
+            patch_size=64,
+        )
+
+
+def test_distance_to_boundary_scales_by_the_grid_step() -> None:
+    grid = np.zeros((9, 9), dtype=np.int16)
+    grid[:, 4:] = 1
+    distance = distance_to_boundary(grid, step=4.0)
+    # Both cells either side of the interface count as boundary cells, so a
+    # patch centred on them straddles the phase change.
+    assert distance[0, 3] == 0.0
+    assert distance[0, 4] == 0.0
+    assert distance[0, 2] == 4.0
+    assert distance[0, 0] == 12.0
+
+
+def test_distance_to_boundary_is_infinite_without_a_boundary() -> None:
+    distance = distance_to_boundary(np.zeros((5, 5), dtype=np.int16), step=4.0)
+    assert np.all(~np.isfinite(distance))
 
 
 def _cell(prediction: DensePrediction, x: int, y: int) -> tuple[int, int]:
@@ -230,49 +309,33 @@ def _cell(prediction: DensePrediction, x: int, y: int) -> tuple[int, int]:
     return row, column
 
 
-def test_select_points_respects_tau_and_class() -> None:
+def test_select_from_anchor_respects_the_pool() -> None:
     prediction = fake_prediction()
-    accumulated = Accumulated.empty(prediction.confidence_grid.shape)
-    accumulated.update(prediction)
-    xs, ys = prediction.x_coordinates, prediction.y_coordinates
-    sampling = select_points(
-        accumulated, xs, ys, points_per_class=4, tau=0.95, seed=11
-    )
+    anchor = user_anchor(prediction)
+    sampling = select_from_anchor(anchor, points_per_class=4, seed=11)
     points_a, points_b = sampling.points_by_class
     assert len(points_a) == len(points_b) == 4
     assert len(set(points_a) & set(points_b)) == 0
-    for x, y in points_a:
-        row, column = _cell(prediction, x, y)
-        assert prediction.prediction_grid[row, column] == 0
-        assert prediction.confidence_grid[row, column] >= 0.95
-    for x, y in points_b:
-        row, column = _cell(prediction, x, y)
-        assert prediction.prediction_grid[row, column] == 1
-        assert prediction.confidence_grid[row, column] >= 0.95
-    assert sampling.pool_sizes[0] > 0 and sampling.pool_sizes[1] > 0
+    pool_a = {tuple(int(value) for value in point) for point in anchor.pools[0]}
+    pool_b = {tuple(int(value) for value in point) for point in anchor.pools[1]}
+    assert set(points_a) <= pool_a
+    assert set(points_b) <= pool_b
+    assert sampling.pool_sizes == anchor.pool_sizes
 
 
-def test_select_points_is_seed_deterministic() -> None:
-    prediction = fake_prediction()
-    accumulated = Accumulated.empty(prediction.confidence_grid.shape)
-    accumulated.update(prediction)
-    xs, ys = prediction.x_coordinates, prediction.y_coordinates
-    first = select_points(accumulated, xs, ys, points_per_class=5, tau=0.95, seed=3)
-    second = select_points(accumulated, xs, ys, points_per_class=5, tau=0.95, seed=3)
-    third = select_points(accumulated, xs, ys, points_per_class=5, tau=0.95, seed=4)
+def test_select_from_anchor_is_seed_deterministic() -> None:
+    anchor = user_anchor(fake_prediction())
+    first = select_from_anchor(anchor, points_per_class=5, seed=3)
+    second = select_from_anchor(anchor, points_per_class=5, seed=3)
+    third = select_from_anchor(anchor, points_per_class=5, seed=4)
     assert first.points_by_class == second.points_by_class
     assert first.points_by_class != third.points_by_class
 
 
-def test_select_points_rejects_small_pool() -> None:
-    prediction = fake_prediction()
-    accumulated = Accumulated.empty(prediction.confidence_grid.shape)
-    accumulated.update(prediction)
-    xs, ys = prediction.x_coordinates, prediction.y_coordinates
-    with pytest.raises(RepeatError, match="confident cells"):
-        select_points(accumulated, xs, ys, points_per_class=500, tau=0.95, seed=1)
-    with pytest.raises(RepeatError, match="confident cells"):
-        select_points(accumulated, xs, ys, points_per_class=1, tau=0.999, seed=1)
+def test_select_from_anchor_rejects_an_impossible_draw() -> None:
+    anchor = user_anchor(fake_prediction())
+    with pytest.raises(RepeatError, match="are required"):
+        select_from_anchor(anchor, points_per_class=500, seed=1)
 
 
 # ---------------------------------------------------------------------------
@@ -341,36 +404,19 @@ def test_poisson_disk_rejects_an_unfillable_pool() -> None:
         poisson_disk_select([tiny], 3, 64.0, np.random.default_rng(1), floor=8.0)
 
 
-def test_select_points_honours_min_distance() -> None:
-    prediction = fake_prediction()
-    accumulated = Accumulated.empty(prediction.confidence_grid.shape)
-    accumulated.update(prediction)
-    sampling = select_points(
-        accumulated,
-        prediction.x_coordinates,
-        prediction.y_coordinates,
-        points_per_class=2,
-        tau=0.95,
-        seed=13,
-        min_distance=8.0,
+def test_select_from_anchor_honours_min_distance() -> None:
+    anchor = user_anchor(fake_prediction())
+    sampling = select_from_anchor(
+        anchor, points_per_class=2, seed=13, min_distance=8.0
     )
     assert sampling.min_distance == 8.0
     assert sampling.relaxed is False
     assert _min_pairwise(sampling.as_points()) >= 8.0 - 1e-9
 
 
-def test_select_points_without_a_distance_keeps_the_old_draw() -> None:
-    prediction = fake_prediction()
-    accumulated = Accumulated.empty(prediction.confidence_grid.shape)
-    accumulated.update(prediction)
-    sampling = select_points(
-        accumulated,
-        prediction.x_coordinates,
-        prediction.y_coordinates,
-        points_per_class=3,
-        tau=0.95,
-        seed=21,
-    )
+def test_select_from_anchor_without_a_distance_keeps_the_plain_draw() -> None:
+    anchor = user_anchor(fake_prediction())
+    sampling = select_from_anchor(anchor, points_per_class=3, seed=21)
     assert sampling.min_distance == 0.0
     assert sampling.relaxed is False
     assert len(set(sampling.as_points())) == 6
@@ -446,10 +492,25 @@ def test_stop_rules() -> None:
 
     drift = evaluate_round(
         {"acc": 0.90, "iou_class_a": 0.8, "iou_class_b": 0.8},
-        [0.99, 0.98, 1.0],
+        [0.99, 0.98, 1.0, 0.97, 0.99, 0.98],
         RepeatOptions(alarm_floor=0.5),
     )
     assert drift.stop and "sigma" in drift.reason
+    assert drift.detail["sigma_min_samples"] == SIGMA_MIN_SAMPLES
+
+    short_history = evaluate_round(
+        {"acc": 0.90, "iou_class_a": 0.8, "iou_class_b": 0.8},
+        [0.99, 0.98, 1.0, 0.97, 0.99],
+        RepeatOptions(alarm_floor=0.5),
+    )
+    assert not short_history.stop and "lower_bound" not in short_history.detail
+
+    unscored = evaluate_round(
+        {"acc": float("nan"), "iou_class_a": float("nan"), "iou_class_b": float("nan")},
+        [],
+        options,
+    )
+    assert not unscored.stop and unscored.status == "unscored"
 
     collapsed = evaluate_round(
         {"acc": 0.95, "iou_class_a": 0.9, "iou_class_b": 0.05},
@@ -551,7 +612,8 @@ def test_run_repeat_keeps_rounds_independent(config, tmp_path, monkeypatch) -> N
     )
 
     assert result["status"] == "completed"
-    assert result["rounds_completed"] == 3
+    # One anchor fine-tune plus two replicates.
+    assert result["rounds_completed"] == 2
     assert len(calls) == 3
     # The support set never accumulates: every round carries exactly k points.
     assert all(call["counts"] == [3, 3] for call in calls)
@@ -560,10 +622,11 @@ def test_run_repeat_keeps_rounds_independent(config, tmp_path, monkeypatch) -> N
 
     loop_dir = Path(result["loop_directory"])
     assert (loop_dir / "loop_manifest.json").is_file()
-    assert (loop_dir / "loop_rounds.csv").is_file()
-    assert (loop_dir / "loop_summary.md").is_file()
+    assert (loop_dir / "anchor" / "anchor.json").is_file()
+    assert (loop_dir / "anchor" / "prediction.npz").is_file()
     csv_lines = (loop_dir / "loop_rounds.csv").read_text(encoding="utf-8").strip().splitlines()
-    assert len(csv_lines) == 4
+    # The anchor row is not a replicate, so the CSV holds the replicates only.
+    assert len(csv_lines) == 3
 
     for index in range(3):
         round_dir = loop_dir / "rounds" / f"round-{index:03d}"
@@ -583,8 +646,81 @@ def test_run_repeat_keeps_rounds_independent(config, tmp_path, monkeypatch) -> N
     assert len(leftovers) == 3
     for leftover in leftovers:
         assert not (leftover / "fine_tuned_model.symmodel").is_file()
+    assert list((loop_dir / "rounds").glob("*.symmodel")) == []
     assert list((loop_dir / "rounds").glob("*.zip")) == []
     assert (loop_dir / "figures" / "acc_vs_round.png").is_file()
+
+
+def test_run_repeat_samples_from_a_frozen_pool(config, tmp_path, monkeypatch) -> None:
+    """A collapsed replicate cannot change the next round's candidate pool."""
+    _install_fake_provider(monkeypatch, bad_round=1)
+    image_path, label_path = _write_inputs(tmp_path)
+    options = RepeatOptions(
+        rounds=3,
+        points_per_class=3,
+        interior_margin=8,
+        min_point_distance=0,
+        stop_on_alarm=False,
+    )
+
+    result = run_repeat(
+        config, image_path=image_path, label_path=label_path, options=options
+    )
+    loop_dir = Path(result["loop_directory"])
+    with (loop_dir / "loop_rounds.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 3
+    pools = {(int(row["pool_a"]), int(row["pool_b"])) for row in rows}
+    assert len(pools) == 1
+    anchor = json.loads((loop_dir / "anchor" / "anchor.json").read_text(encoding="utf-8"))
+    assert list(pools)[0] == tuple(anchor["pool_sizes"])
+    # Every sampled point carries the anchor's label, so the CSV never records a
+    # point whose class disagrees with the anchor grid.
+    for row in rows:
+        assert row["mode"] == "user"
+        assert float(row["anchor_agree"]) <= 1.0
+
+
+def test_run_repeat_stability_mode_requires_ground_truth(config, tmp_path, monkeypatch) -> None:
+    _install_fake_provider(monkeypatch)
+    image_path, _ = _write_inputs(tmp_path)
+    with pytest.raises(RepeatError, match="needs a label raster"):
+        run_repeat(
+            config,
+            image_path=image_path,
+            options=RepeatOptions(mode="stability", rounds=1),
+        )
+
+
+def test_run_repeat_user_mode_scores_nothing_without_ground_truth(
+    config, tmp_path, monkeypatch
+) -> None:
+    _install_fake_provider(monkeypatch)
+    image_path, _ = _write_inputs(tmp_path)
+    annotation = tmp_path / "anchor_session.json"
+    session = repeat_module.create_annotation_session(
+        image_path=str(image_path),
+        image_sha256=repeat_module.inspect_input(image_path, "minmax_0_1")[1]["sha256"],
+        image_shape=(128, 128),
+        classifier_patch_size=config.model.classifier_patch_size,
+        class_names=("A", "B"),
+        points_by_class=(((40, 40),), ((88, 88),)),
+    )
+    repeat_module.save_annotation_session(annotation, session)
+
+    result = run_repeat(
+        config,
+        image_path=image_path,
+        options=RepeatOptions(rounds=1, points_per_class=2, min_point_distance=0),
+        annotations=annotation,
+    )
+    assert result["status"] == "completed"
+    assert result["rounds_completed"] == 1
+    assert np.isnan(result["accuracy"]["mean"])
+    loop_dir = Path(result["loop_directory"])
+    with (loop_dir / "loop_rounds.csv").open(encoding="utf-8", newline="") as handle:
+        row = next(iter(csv.DictReader(handle)))
+    assert row["acc"] == "nan"
 
 
 def test_run_repeat_resolves_the_default_spacing(config, tmp_path, monkeypatch) -> None:
@@ -603,7 +739,7 @@ def test_run_repeat_resolves_the_default_spacing(config, tmp_path, monkeypatch) 
 
     with (loop_dir / "loop_rounds.csv").open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
-    assert len(rows) == 2
+    assert len(rows) == 1
     patch_size = config.model.classifier_patch_size
     for row in rows:
         assert float(row["spread_req"]) == float(patch_size)
@@ -621,7 +757,7 @@ def test_run_repeat_stops_on_alarm(config, tmp_path, monkeypatch) -> None:
     )
 
     assert result["status"] == "alarm"
-    assert result["rounds_completed"] == 3
+    assert result["rounds_completed"] == 2
     assert result["alarm"] and "floor" in result["alarm"]
     summary = Path(result["summary"]).read_text(encoding="utf-8")
     assert "## Alarm" in summary
@@ -637,7 +773,7 @@ def test_run_repeat_can_continue_past_an_alarm(config, tmp_path, monkeypatch) ->
     )
 
     assert result["status"] == "completed"
-    assert result["rounds_completed"] == 4
+    assert result["rounds_completed"] == 3
 
 
 def test_run_repeat_resumes_from_completed_rounds(config, tmp_path, monkeypatch) -> None:
@@ -649,7 +785,7 @@ def test_run_repeat_resumes_from_completed_rounds(config, tmp_path, monkeypatch)
         label_path=label_path,
         options=RepeatOptions(rounds=1, points_per_class=3, interior_margin=8, min_point_distance=0),
     )
-    assert first["rounds_completed"] == 2
+    assert first["rounds_completed"] == 1
 
     calls.clear()
     second = run_repeat(
@@ -660,7 +796,7 @@ def test_run_repeat_resumes_from_completed_rounds(config, tmp_path, monkeypatch)
         resume=first["loop_directory"],
     )
     assert second["loop_directory"] == first["loop_directory"]
-    assert second["rounds_completed"] == 4
+    assert second["rounds_completed"] == 3
     assert len(calls) == 2
     assert [call["seed"] for call in calls] == [44, 45]
 

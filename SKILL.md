@@ -2,7 +2,7 @@
 name: symmetry-harness
 description: Run local few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to launch the local interface, fine-tune adapters on representative points, inspect confidence or entropy, or apply a saved .symmodel package to new images without re-training. Requires the local symmetry-harness runtime and the symmetry-learn Provider. Do not use for foundation-model training, silent weight installation, or unattended label selection.
 metadata:
-  version: "0.4.0"
+  version: "0.3.1"
   product: "symmetry-harness"
 ---
 

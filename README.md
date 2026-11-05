@@ -268,24 +268,35 @@ Configuration defaults to `SYMMETRY_HARNESS_CONFIG` or
 ## Repeat Loops (Stability Testing)
 
 `symmetry repeat` measures procedural reproducibility instead of accuracy on one
-lucky annotation. It runs the same k-shot fine-tuning many times; each round
-trains a fresh adapter from the backbone with newly drawn support points, and the
+lucky annotation. It trains one anchor fine-tune, freezes that prediction, and
+then runs the same k-shot fine-tuning many times from the anchor's pool; the
 support set never accumulates, so round 80 is still the same shot count as round
-1. Points are drawn only from cells whose accumulated confidence is at least
-`--tau`, accuracy is scored every round against a ground-truth label raster, and
-within one round the points keep a Poisson-disk minimum spacing
+1. Because the pool and the pseudo-labels are frozen before the first replicate,
+no round can move what the next round samples.
+
+Two modes decide what the pool is:
+
+| `--mode` | Pool | Labels | Ground truth |
+| --- | --- | --- | --- |
+| `user` | anchor cells with confidence `>= --tau` and the anchor label | the anchor label | optional (scoring only) |
+| `stability` | anchor cells that match the truth and sit `>= patch/2` from a phase boundary | the ground truth | required |
+
+Within one round the points keep a Poisson-disk minimum spacing
 (`--min-point-distance`, one classifier patch by default) so a round never spends
 two support slots on overlapping crops.
 
 ```bash
-symmetry repeat --image image.npy --gt labels.npy \
-  --rounds 100 --points-per-class 5 --tau 0.95
+symmetry repeat --image image.npy --gt labels.npy --mode stability \
+  --rounds 100 --points-per-class 5
+symmetry repeat --image image.npy --annotations session.json \
+  --mode user --rounds 20 --points-per-class 5
 ```
 
-Each loop writes `loop_manifest.json`, `loop_rounds.csv`, `loop_summary.md`, four
-figures, and one directory per round. An alarm (accuracy below an absolute floor,
-below `mean - 3 sigma`, or a collapsed class) stops the loop and reports which
-round broke. See [references/repeat.md](references/repeat.md).
+Each loop writes `loop_manifest.json`, `anchor/`, `loop_rounds.csv` (replicates
+only), `loop_summary.md`, figures, and one directory per round. An alarm
+(accuracy below an absolute floor, below `mean - 3 sigma` once there are six
+replicates, or a collapsed class) stops the loop and reports which round broke.
+See [references/repeat.md](references/repeat.md).
 
 ## Run Artifacts
 

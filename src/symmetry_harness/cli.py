@@ -126,25 +126,29 @@ def _repeat_entries(arguments: argparse.Namespace) -> list[dict[str, Path]]:
             raise ValueError(
                 "--dataset must hold a JSON list or an object with an 'images' list."
             )
-        entries: list[dict[str, Path]] = []
+        entries: list[dict[str, Path | None]] = []
         for raw in raw_entries:
-            if not isinstance(raw, dict) or "image" not in raw or "gt" not in raw:
-                raise ValueError(
-                    'Every dataset entry needs "image" and "gt" string fields.'
-                )
+            if not isinstance(raw, dict) or "image" not in raw:
+                raise ValueError('Every dataset entry needs an "image" string field.')
             entries.append(
                 {
                     "image": _dataset_path(raw["image"], dataset_path.parent),
-                    "gt": _dataset_path(raw["gt"], dataset_path.parent),
+                    "gt": (
+                        None
+                        if raw.get("gt") is None
+                        else _dataset_path(raw["gt"], dataset_path.parent)
+                    ),
                 }
             )
         if not entries:
             raise ValueError("--dataset contains no entries.")
         return entries
-    if len(arguments.image) != len(arguments.gt):
-        raise ValueError("--image and --gt must be supplied in equal numbers.")
     if not arguments.image:
         raise ValueError("Provide --image/--gt pairs or --dataset.")
+    if arguments.gt and len(arguments.image) != len(arguments.gt):
+        raise ValueError("--image and --gt must be supplied in equal numbers.")
+    if not arguments.gt:
+        return [{"image": image, "gt": None} for image in arguments.image]
     return [
         {"image": image, "gt": gt}
         for image, gt in zip(arguments.image, arguments.gt)
@@ -244,24 +248,39 @@ def _parser() -> argparse.ArgumentParser:
         "repeat",
         help=(
             "Re-run the same k-shot fine-tuning many times and report how stable "
-            "the result is. Each round draws new support points from the confident "
-            "region, and the support set never accumulates."
+            "the result is. The first fine-tune is frozen as an anchor, every later "
+            "round samples from that anchor's pool, and the support set never "
+            "accumulates."
         ),
     )
     _add_config_argument(repeat)
+    repeat.add_argument(
+        "--mode",
+        choices=("user", "stability"),
+        default="user",
+        help=(
+            "user: the pool is the anchor's high-confidence cells, pseudo-labels come "
+            "from the anchor, no ground truth needed. stability: the pool is the "
+            "anchor cells that agree with the ground truth and sit at least half a "
+            "patch from a phase boundary; requires --gt."
+        ),
+    )
     repeat.add_argument(
         "--image",
         type=Path,
         action="append",
         default=[],
-        help="Source image. Repeat together with --gt to run several images.",
+        help="Source image. Repeat to run several images.",
     )
     repeat.add_argument(
         "--gt",
         type=Path,
         action="append",
         default=[],
-        help="Integer label raster (.npy) matching the paired --image.",
+        help=(
+            "Integer label raster (.npy) matching the paired --image. Required in "
+            "stability mode; in user mode it only adds accuracy scoring."
+        ),
     )
     repeat.add_argument(
         "--dataset",
@@ -275,15 +294,19 @@ def _parser() -> argparse.ArgumentParser:
         "--annotations",
         type=Path,
         help=(
-            "Optional round-0 annotation session for a single image. Without it, "
-            "round 0 draws its points from the interior of each ground-truth phase."
+            "Round-0 annotation session for a single image: this is the anchor "
+            "fine-tune. Without it, round 0 draws its points from the interior of "
+            "each ground-truth phase, which needs --gt."
         ),
     )
     repeat.add_argument(
         "--rounds",
         type=int,
         default=5,
-        help="Number of repeated rounds after the seed round. Defaults to 5.",
+        help=(
+            "Number of replicates after the anchor fine-tune. The loop trains the "
+            "anchor plus this many rounds. Defaults to 5."
+        ),
     )
     repeat.add_argument(
         "--points-per-class",
@@ -291,7 +314,15 @@ def _parser() -> argparse.ArgumentParser:
         default=5,
         help="Support points drawn per class in every round. Defaults to 5.",
     )
-    repeat.add_argument("--tau", type=float, default=0.95)
+    repeat.add_argument(
+        "--tau",
+        type=float,
+        default=0.95,
+        help=(
+            "Confidence floor for a user-mode pool cell. Ignored in stability mode, "
+            "where agreeing with the ground truth already implies the label."
+        ),
+    )
     repeat.add_argument(
         "--min-point-distance",
         type=float,
@@ -936,6 +967,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             base_seed=int(arguments.base_seed),
             alarm_drop=float(arguments.alarm_drop),
             alarm_floor=float(arguments.alarm_floor),
+            mode=str(arguments.mode),
             interior_margin=int(arguments.interior_margin),
             min_point_distance=(
                 None
@@ -949,6 +981,8 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
         )
         options.validate()
         entries = _repeat_entries(arguments)
+        if options.mode == "stability" and any(entry["gt"] is None for entry in entries):
+            raise ValueError("--mode stability needs a --gt for every image.")
         progress = lambda message: print(  # noqa: E731 - tiny inline reporter
             message, file=sys.stderr, flush=True
         )

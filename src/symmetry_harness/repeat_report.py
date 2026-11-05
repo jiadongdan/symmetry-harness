@@ -48,6 +48,17 @@ def _text(draw: ImageDraw.ImageDraw, xy: tuple[float, float], value: str, *, siz
     draw.text(xy, value, font=_font(size), fill=fill)
 
 
+def _read_json(path: Path) -> dict[str, Any] | None:
+    """Load a small JSON sidecar, or ``None`` when it is missing or unreadable."""
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _finite(values: Sequence[Any]) -> list[float]:
     result: list[float] = []
     for value in values:
@@ -514,25 +525,27 @@ def write_loop_summary(
     area_gt = _finite([entry.get("area_frac_gt", "nan") for entry in history])
 
     figures: list[tuple[str, Path]] = []
+    scored = any(np.isfinite(value) for value in accuracies)
     if rounds:
-        figures.append(
-            (
-                "Accuracy per round, with the historical mean ± sigma band",
-                build_accuracy_figure(
-                    figures_dir / "acc_vs_round.png",
-                    rounds,
-                    accuracies,
-                    floor=float(options.alarm_floor),
-                    sigma=float(options.alarm_drop),
-                ),
+        if scored:
+            figures.append(
+                (
+                    "Accuracy per round, with the historical mean ± sigma band",
+                    build_accuracy_figure(
+                        figures_dir / "acc_vs_round.png",
+                        rounds,
+                        accuracies,
+                        floor=float(options.alarm_floor),
+                        sigma=float(options.alarm_drop),
+                    ),
+                )
             )
-        )
-        figures.append(
-            (
-                "Per-class IoU",
-                build_iou_figure(figures_dir / "iou_vs_round.png", rounds, iou_a, iou_b),
+            figures.append(
+                (
+                    "Per-class IoU",
+                    build_iou_figure(figures_dir / "iou_vs_round.png", rounds, iou_a, iou_b),
+                )
             )
-        )
         figures.append(
             (
                 "Class-B area fraction: prediction against ground truth",
@@ -550,6 +563,12 @@ def write_loop_summary(
         except Exception:  # noqa: BLE001 - the map is display-only
             image = None
         points_by_round: list[tuple[int, list[tuple[int, int]]]] = []
+        anchor_metrics = _read_json(loop_dir / "anchor" / "metrics.json")
+        anchor_groups = _point_groups(anchor_metrics) if anchor_metrics else []
+        if anchor_groups:
+            points_by_round.append(
+                (0, [tuple(point) for group in anchor_groups for point in group])
+            )
         for entry in history:
             groups = _point_groups(entry)
             if not groups:
@@ -579,13 +598,45 @@ def write_loop_summary(
     minimum = float(np.min(finite)) if finite else float("nan")
     maximum = float(np.max(finite)) if finite else float("nan")
 
+    mode = str(getattr(options, "mode", "user"))
+    anchor_record = manifest.get("anchor") or {}
+    pool_sizes = [int(value or 0) for value in (anchor_record.get("pool_sizes") or [0, 0])]
+    reuse = [
+        (len(history) * int(options.points_per_class) / size) if size else None
+        for size in pool_sizes
+    ]
+
     lines: list[str] = [
         f"# Repeat Loop Summary: `{loop_id}`",
         "",
         f"- Status: `{status}`",
-        f"- Rounds completed: `{len(history)}` of `{int(options.rounds) + 1}` (round 0 is the seed round)",
+        f"- Mode: `{mode}`",
+        f"- Replicates completed: `{len(history)}` of `{int(options.rounds)}` "
+        "(the anchor fine-tune is not a replicate)",
         f"- Points per class per round: `{int(options.points_per_class)}`",
-        f"- Confidence threshold `tau`: `{options.tau}`",
+    ]
+    if mode == "stability":
+        clearance = anchor_record.get("phase_boundary_clearance_px")
+        lines.append(
+            "- Pool: anchor cells that match the ground truth and sit at least `"
+            + ("n/a" if clearance is None else f"{float(clearance):g} px")
+            + "` from a phase boundary"
+        )
+    else:
+        lines.append(
+            f"- Pool: anchor cells with confidence `>= {options.tau}` and the anchor label"
+        )
+    lines.append(
+        f"- Pool size (A / B): `{pool_sizes[0]:,}` / `{pool_sizes[1]:,}` cells"
+    )
+    if any(reuse):
+        lines.append(
+            "- Mean draws per pool cell over the whole loop (A / B): "
+            + " / ".join(
+                "n/a" if value is None else f"`{value:.4f}`" for value in reuse
+            )
+        )
+    lines += [
         "- Minimum support-point spacing: `"
         + (
             "auto (one classifier patch)"
@@ -594,7 +645,8 @@ def write_loop_summary(
         )
         + "`",
         f"- Training seed: `{options.base_seed} + round_index`",
-        f"- Alarm: floor `{options.alarm_floor}`, band `mean - {options.alarm_drop:g} sigma`",
+        f"- Alarm: floor `{options.alarm_floor}`; band `mean - {options.alarm_drop:g} sigma` "
+        "only from 6 replicates on",
         "",
     ]
     if alarm:
@@ -603,22 +655,42 @@ def write_loop_summary(
         "## Accuracy Distribution",
         "",
         f"- Mean: `{_percent(mean)}`",
-        f"- Standard deviation (sample): `{_percent(deviation)}`",
+        f"- Standard deviation (sample): `{_percent(deviation if len(finite) > 1 else float('nan'))}`",
         f"- Minimum / maximum: `{_percent(minimum)}` / `{_percent(maximum)}`",
         f"- Spread: `{_percent(maximum - minimum) if finite else 'n/a'}`",
         "",
-        "Every round trains a fresh adapter from the backbone with the same number of",
-        "points, so the spread above measures procedural reproducibility, not",
-        "improvement. The support set never accumulates.",
-        "",
+    ]
+    if finite:
+        lines += [
+            "Every round trains a fresh adapter from the backbone with the same number of",
+            "points, so the spread above measures procedural reproducibility, not",
+            "improvement. The support set never accumulates.",
+            "",
+        ]
+    else:
+        agreement = _finite([entry.get("anchor_agree", "nan") for entry in history])
+        agreement = [value for value in agreement if np.isfinite(value)]
+        lines += [
+            "No ground truth was supplied, so accuracy was not scored. What is left is",
+            "how far each round's map moved: `vs anchor` compares it with the frozen",
+            "anchor prediction"
+            + (
+                f" (mean `{_percent(float(np.mean(agreement)))}`)"
+                if agreement
+                else ""
+            )
+            + ", `agree prev` compares it with the round before.",
+            "",
+        ]
+    lines += [
         "## Rounds",
         "",
-        "| round | acc | class A acc | class B acc | IoU A | IoU B | pred area | agree prev | support acc | spacing px | seed | seconds |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| round | acc | class A acc | class B acc | IoU A | IoU B | pred area | vs anchor | agree prev | support acc | spacing px | seed | seconds |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for entry in history:
         lines.append(
-            "| {round} | {acc} | {a} | {b} | {iou_a} | {iou_b} | {area} | {agree} | {support} | {spread} | {seed} | {seconds} |".format(
+            "| {round} | {acc} | {a} | {b} | {iou_a} | {iou_b} | {area} | {anchor} | {agree} | {support} | {spread} | {seed} | {seconds} |".format(
                 round=entry.get("round", ""),
                 acc=_percent(entry.get("acc")),
                 a=_percent(entry.get("acc_class_a")),
@@ -626,6 +698,7 @@ def write_loop_summary(
                 iou_a=_number(entry.get("iou_class_a"), 3),
                 iou_b=_number(entry.get("iou_class_b"), 3),
                 area=_percent(entry.get("area_frac_pred")),
+                anchor=_percent(entry.get("anchor_agree")),
                 agree=_percent(entry.get("agree_prev")),
                 support=_percent(entry.get("support_acc")),
                 spread=_number(entry.get("spread"), 1),
@@ -644,19 +717,28 @@ def write_loop_summary(
         "## Reading This Loop",
         "",
         "- A round is an independent replicate: same backbone, same patch size, same",
-        "  epoch count, fresh support points drawn only from cells whose accumulated",
-        "  confidence is at least `tau`.",
+        "  epoch count, fresh support points. The pool and the pseudo-labels are",
+        "  frozen from the anchor, so round N cannot change what round N+1 samples.",
         "- Within one round the support points keep a minimum distance (Poisson-disk",
         "  spacing, across both classes). The `spacing px` column is what actually",
         "  fit: a value below the requested spacing means the pool was too small for",
         "  that separation, and the round is slightly less spread than the protocol.",
-        "- `agree prev` is informational. It measures how much the map moved between two",
-        "  rounds; it is not part of the stop rule.",
-        "- Sampling stays inside the confident region by design, so this loop measures",
-        "  reproducibility under one sampling rule. It does not measure robustness to a",
-        "  human who clicks near a phase boundary.",
-        "",
+        "- `vs anchor` compares a round's map with the frozen anchor map; `agree prev`",
+        "  compares it with the round before. Both are informational, not stop rules.",
     ]
+    if mode == "stability":
+        lines += [
+            "- Pool cells already match the ground truth and clear the boundary by half",
+            "  a patch, so the spread here is training variance with annotation noise",
+            "  removed. Do not subtract it from a user-mode run: the two differ in both",
+            "  pool and label source.",
+        ]
+    else:
+        lines += [
+            "- Pool cells come from the anchor's own confidence map. A round that",
+            "  collapses cannot move the pool, and cannot relabel a cell either.",
+        ]
+    lines += [""]
     summary_path = loop_dir / "loop_summary.md"
     summary_path.write_text("\n".join(lines), encoding="utf-8")
     return summary_path

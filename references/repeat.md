@@ -9,10 +9,16 @@ round trains a fresh adapter from the selected backbone with exactly
 accumulates, so round 40 is still a 5-shot experiment, not a 205-shot one.
 
 ```
-round 0   seed support set  ->  adapter -> prediction -> accuracy vs ground truth
-round 1   sample k/class    ->  adapter -> prediction -> accuracy
-round 2   sample k/class    ->  ...
+anchor    the user's first fine-tune -> prediction + confidence  [FROZEN]
+          +-> pool A, pool B         (the only place later rounds may sample)
+round 1   sample k/class from pool   ->  adapter -> prediction -> accuracy
+round 2   sample k/class from pool   ->  ...
 ```
+
+The anchor is trained once and then locked. Its prediction grid decides both
+**where** later rounds may sample and **what label** a sampled cell carries;
+nothing a later round predicts can change either. That is what makes the rounds
+independent replicates instead of one self-training trajectory.
 
 ## Why the support set must not accumulate
 
@@ -30,8 +36,9 @@ class stays at one point per class.
 
 | Parameter | Meaning | Recommended |
 | --- | --- | --- |
+| `--mode` | Which flow to measure. `user` pools the anchor's confident cells; `stability` pools the cells that agree with the ground truth and clear the phase boundary. | `user` for the product path, `stability` for internal numbers |
 | `--points-per-class` | Shots per class in every round. Match the experiment you are replicating (1, 3, or 5). | `5` |
-| `--rounds` | Rounds after the seed round. `0` runs only round 0. | `5` to shake out bugs, `50`–`100` for a real stability measurement |
+| `--rounds` | Replicates after the anchor. `--rounds 100` trains the anchor plus 100 rounds. | `5` to shake out bugs, `50`–`100` for a real measurement |
 | `--min-point-distance` | Minimum pixel distance between any two support points of a round (Poisson-disk spacing, both classes). | leave at the default (one classifier patch); `0` disables it |
 
 `minimum_shots_per_class` defaults to `1`, so a 1-shot replication needs no
@@ -39,26 +46,54 @@ configuration change. Values below the configured minimum are rejected by the
 annotation validator, and the loop still raises the minimum to
 `--points-per-class` if a config sets it higher.
 
+## The two modes
+
+Both modes freeze a pool, then sample from it for every replicate. They differ in
+how the pool is drawn and where the labels come from.
+
+| | `user` | `stability` |
+| --- | --- | --- |
+| Pool cell | anchor confidence `>= --tau` and anchor label `c` | anchor label `== ground truth` and `>= patch/2` px from a phase boundary |
+| Pseudo-label | the anchor label | the ground-truth label |
+| Ground truth | optional, adds accuracy scoring only | required |
+| Measures | how reproducible the fit is from one user annotation | training variance with annotation noise removed |
+
+`stability` does not also apply `tau`: agreement with the ground truth already
+implies a correct label, and a confidence floor would only shrink the pool
+without changing which labels are right.
+
+Do not subtract one mode's numbers from the other. They differ in both the pool
+and the label source, so the difference mixes two effects.
+
+A pool that cannot supply `--points-per-class` cells for both classes is a loop
+error, deliberately. In `user` mode it means the first fine-tune was not good
+enough to anchor anything: the guidance is to relabel a few points and fine-tune
+again, **not** to lower `--tau`. Lowering the threshold just builds a dirtier
+pool and hides the problem.
+
+### Phase-boundary clearance
+
+`stability` mode needs the distance from each grid cell to the nearest phase
+change. It is computed exactly on the prediction lattice and scaled to pixels by
+the grid step. Both cells either side of an interface count as boundary cells; a
+patch centred on either of them straddles the phase change, so its clearance is
+zero. That is at most half a grid step more conservative than the geometric
+interface, which is the safe direction.
+
 ## Sampling rule
 
-Two fields are accumulated across rounds and used only to choose the next
-support set:
+Each replicate draws `--points-per-class` cells per class from the frozen pool,
+uniformly and without replacement, seeded with `base_seed * 1000 + round`. The
+pool is never rewritten, so the only thing that varies between rounds is the
+draw.
 
-* **confidence** — the arithmetic mean of every round's confidence grid;
-* **votes** — how often each grid cell was predicted as each class, which
-  supplies the pseudo-label of a sampled cell.
-
-A cell is a candidate when its accumulated confidence is at least `--tau`
-(default `0.95`). Sampling is uniform, without replacement, and seeded with
-`base_seed * 1000 + round`.
-
-On top of that filter, the points of one round obey a Poisson-disk constraint:
-no two support points are closer than `--min-point-distance` pixels. The default
-is the classifier patch size (64 px), which is the distance at which two support
-patches stop overlapping; `0` restores unconstrained uniform sampling. The
-constraint spans **both classes** — two nearly co-located points with different
-labels force the classifier to memorise one crop under two contradictory labels,
-which is worse than a wasted support slot.
+The points of one round also obey a Poisson-disk constraint: no two support
+points are closer than `--min-point-distance` pixels. The default is the
+classifier patch size (64 px), which is the distance at which two support patches
+stop overlapping; `0` restores unconstrained uniform sampling. The constraint
+spans **both classes** — two nearly co-located points with different labels force
+the classifier to memorise one crop under two contradictory labels, which is
+worse than a wasted support slot.
 
 The spacing is a ceiling, not a promise. When the pool cannot fit the requested
 radius (a grain-boundary band narrower than the patch, or many points per class
@@ -69,30 +104,39 @@ at two grid steps — until a draw succeeds. Every round records both numbers:
 line when it happens. If even the floor radius cannot be satisfied the round
 stops with an error rather than drawing overlapping points.
 
-`tau` is deliberately not the main constraint. On a typical phase map the model
-is already above 0.95 on roughly 96% of the grid, so `tau` filters very little.
-What varies between rounds is the draw itself.
+Two columns track how hard the loop leans on one pool: `pool_a` / `pool_b` are
+the pool sizes, and `reuse_a` / `reuse_b` are the average number of draws per
+pool cell so far. A large reuse number on a small pool means the rounds are
+revisiting the same cells, which weakens their independence.
 
-## The seed round
+## The anchor round
 
-Round 0 is the reference: it produces the first confidence map and the first
-accuracy value. It draws its points from the interior of each ground-truth phase
-(`--interior-margin`, default 32 px, so a 64 px patch stays inside one phase) and
-applies the same `--min-point-distance` rule, so a five-shot seed set does not
-spend four clicks on the same grain.
+Round 0 is the anchor. It runs one fine-tune, writes its prediction to
+`anchor/`, and freezes the pool. **It is not a replicate**: it does not appear in
+`loop_rounds.csv` and it is excluded from the mean and standard deviation.
 
-Pass `--annotations SESSION.json` to use a human annotation session instead. The
-session must have been drawn on the same image file, because the harness compares
-the file SHA-256.
+Pass `--annotations SESSION.json` to anchor on a real human annotation session —
+this is the normal path for the `user` flow and the only way to run without
+ground truth. The session must have been drawn on the same image file, because
+the harness compares the file SHA-256.
 
-The interior margin applies to round 0 only. Later rounds ignore it, exactly as
-specified.
+Without `--annotations`, the anchor draws its points from the interior of each
+ground-truth phase (`--interior-margin`, default 32 px, so a 64 px patch stays
+inside one phase), which requires `--gt`. It applies the same
+`--min-point-distance` rule, so a five-shot anchor does not spend four clicks on
+the same grain.
+
+The interior margin applies to the anchor only. Later rounds ignore it.
 
 ## Accuracy
 
 Accuracy is scored on the dense prediction grid against a ground-truth label
 raster (`.npy`, integer, two codes). The two codes are mapped positionally onto
 class A and class B by `--label-codes`, default `14,17`.
+
+Without `--gt` (allowed in `user` mode only) accuracy is `nan` and the stop rules
+are inert; the loop still reports `anchor_agree` and `agree_prev`, which measure
+how far each round's map moved from the anchor and from the round before.
 
 Score on the whole grid, never on a high-confidence subset: restricting to
 confident cells inflates the number and makes the alarm threshold meaningless.
@@ -104,7 +148,7 @@ Checked after every round, in this order:
 | Condition | Result |
 | --- | --- |
 | accuracy below `--alarm-floor` (default 0.90) | alarm |
-| at least 3 rounds and accuracy below `mean - alarm_drop x std` (default 3 sigma) | alarm |
+| at least 6 rounds and accuracy below `mean - alarm_drop x std` (default 3 sigma) | alarm |
 | either class IoU below 0.10 | alarm |
 | candidate pool for a class smaller than `--points-per-class` | loop error |
 | pool too small for `--points-per-class` points at the minimum spacing (two grid steps) | loop error; the spacing is shrunk first, and only the floor is fatal |
@@ -117,22 +161,31 @@ The comparison baseline is the **whole history**, not the previous round. In a
 replication loop the previous round is itself a random draw, so tracking it would
 flag ordinary fluctuation as a collapse.
 
+The sigma rule needs at least 6 replicates. With four rounds the sample standard
+deviation is small enough that `mean - 3 sigma` fires on ordinary spread; shorter
+loops are judged on the absolute floor alone.
+
 ## One image or many
 
 ```powershell
-# one image
-symmetry repeat --config symmetry-harness.json `
+# internal stability numbers: pool = anchor cells that agree with the truth
+symmetry repeat --config symmetry-harness.json --mode stability `
   --image "D:\data\simu img1.npy" --gt "D:\data\simu lbs1.npy" `
-  --rounds 5 --points-per-class 5
+  --rounds 100 --points-per-class 5
+
+# product path: pool = the user's own confident region, no ground truth needed
+symmetry repeat --config symmetry-harness.json --mode user `
+  --image "D:\data\simu img1.npy" --annotations "D:\data\session.json" `
+  --rounds 20 --points-per-class 5
 
 # several images, one after another
-symmetry repeat --config symmetry-harness.json `
+symmetry repeat --config symmetry-harness.json --mode stability `
   --image "D:\data\a.npy" --gt "D:\data\a_lbs.npy" `
   --image "D:\data\b.npy" --gt "D:\data\b_lbs.npy" `
   --rounds 100 --points-per-class 5
 
 # or a manifest
-symmetry repeat --config symmetry-harness.json --dataset images.json --rounds 100
+symmetry repeat --config symmetry-harness.json --dataset images.json --mode stability --rounds 100
 ```
 
 `images.json` is either a list or an object with an `images` list:
@@ -157,17 +210,22 @@ symmetry repeat --config symmetry-harness.json --image ... --gt ... `
   --rounds 100 --resume "D:\runs\repeat-simu-img1-20261102T051328Z-475ee7"
 ```
 
-Resume replays each `round-*/kept/prediction.npz` to rebuild the confidence field
-and the vote counts, then continues at the next round. Only the horizon may grow:
-changing `--points-per-class`, `--tau`, or `--base-seed` is refused, because
-mixing two protocols would corrupt the distribution.
+Resume reloads the anchor from `anchor/prediction.npz` (or `rounds/round-000/`)
+and rebuilds the frozen pool from it, then continues at the next replicate. Only
+the horizon may grow: changing `--mode`, `--points-per-class`, `--tau`, or
+`--base-seed` is refused, because mixing two protocols would corrupt the
+distribution.
+
+Loops written before schema `symmetry-repeat-loop-v2` cannot be resumed; their
+pool was accumulated across rounds and no longer exists.
 
 ## Artifacts
 
 ```
 <output-root>/repeat-<image>-<timestamp>-<id>/
-├── loop_manifest.json      options, input SHA-256, GT SHA-256, backbone identity
-├── loop_rounds.csv         one row per round
+├── loop_manifest.json      options, input SHA-256, GT SHA-256, anchor pools
+├── anchor/                 anchor.json, metrics.json, prediction.npz
+├── loop_rounds.csv         one row per replicate (the anchor is not a row)
 ├── loop_summary.md         distribution, per-round table, embedded figures
 ├── features/               reusable feature stack (one per image)
 ├── figures/                acc_vs_round, iou_vs_round, area_frac_vs_round,
@@ -203,11 +261,13 @@ recomputing them and says so on stderr; results are unchanged.
 
 ## Reading a loop honestly
 
-* With `tau=0.95` and interior-geometry sampling, all rounds draw from a narrow
-  band of "easy, confident" patches. A flat accuracy curve therefore means
-  **reproducibility under one sampling rule**.
-* It does **not** mean the model is robust to a human who clicks near a phase
-  boundary, or to a patch that straddles two phases.
+* A flat accuracy curve means **reproducibility under one frozen pool**. It does
+  not mean the model is robust to points outside that pool: in `user` mode the
+  pool is only the anchor's confident region, and in `stability` mode it excludes
+  the phase boundary by construction.
+* Because the pool never changes, a round that collapses cannot drag the next
+  round down with it. A collapsing round is a data point about training
+  variance, not a contamination event.
 * On a clean simulated image accuracy can saturate near 99%, which compresses the
   spread and makes any procedure look stable. Check the absolute level before
   concluding anything about stability.
