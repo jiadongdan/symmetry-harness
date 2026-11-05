@@ -13,6 +13,12 @@ Two accumulated fields decide where the next round samples:
 * ``votes`` - how often each grid cell was predicted as each class. It supplies
   the pseudo-label of every sampled point.
 
+Points inside one round are drawn with a Poisson-disk constraint: no two support
+points end up closer than ``min_point_distance`` pixels, so a round never spends
+two of its support slots on nearly the same patch. The constraint spans both
+classes, because two nearly co-located points of different classes make the
+classifier memorise one patch with two contradictory labels.
+
 Nothing in this module trains a model itself; each round delegates to
 :func:`symmetry_harness.workflow.run_analysis` so the numerical path is exactly
 the one the CLI ``run`` command uses.
@@ -76,6 +82,7 @@ class RepeatOptions:
     interior_margin: int = 32
     label_codes: tuple[int, int] = (14, 17)
     class_names: tuple[str, str] = DEFAULT_CLASS_NAMES
+    min_point_distance: float | None = None
     keep_checkpoint: bool = True
     stop_on_alarm: bool = True
     reuse_features: bool = True
@@ -95,6 +102,10 @@ class RepeatOptions:
             raise RepeatError("alarm_drop must be positive.")
         if self.interior_margin < 0:
             raise RepeatError("interior_margin must be nonnegative.")
+        if self.min_point_distance is not None and self.min_point_distance < 0:
+            raise RepeatError(
+                "min_point_distance must be nonnegative, or null for the patch-size default."
+            )
         if len(set(self.label_codes)) != 2:
             raise RepeatError("label_codes must contain two distinct label codes.")
         if len(self.class_names) != 2 or len(set(self.class_names)) != 2:
@@ -109,6 +120,7 @@ class RepeatOptions:
             "alarm_drop": self.alarm_drop,
             "alarm_floor": self.alarm_floor,
             "interior_margin": self.interior_margin,
+            "min_point_distance": self.min_point_distance,
             "label_codes": list(self.label_codes),
             "class_names": list(self.class_names),
             "keep_checkpoint": self.keep_checkpoint,
@@ -218,26 +230,22 @@ def _deepest_region(layers: list[np.ndarray], needed: int) -> tuple[np.ndarray, 
     return layers[0], 0
 
 
-def interior_points(
+def _interior_draw(
     class_map: np.ndarray,
     *,
     patch_size: int,
     points_per_class: int,
     margin: int,
     seed: int,
-) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
-    """Draw the first round's support points from the interior of each phase.
-
-    The margin keeps every ``patch_size`` patch inside one phase, so the initial
-    support set never contains a mixed patch. This margin applies to the initial
-    points only; later rounds sample on the confidence field alone.
-    """
+    min_distance: float = 0.0,
+) -> tuple[tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]], float]:
+    """Draw the seed round's points and report the spacing that was used."""
     height, width = class_map.shape
     min_x, max_x, min_y, max_y = valid_center_bounds((height, width), patch_size)
     allowed = np.zeros(class_map.shape, dtype=bool)
     allowed[min_y : max_y + 1, min_x : max_x + 1] = True
     rng = np.random.default_rng(seed)
-    groups: list[tuple[tuple[int, int], ...]] = []
+    point_groups: list[np.ndarray] = []
     for class_index in (0, 1):
         base = (class_map == class_index) & allowed
         region, _ = _deepest_region(_interior_layers(base, margin), points_per_class)
@@ -247,15 +255,39 @@ def interior_points(
                 f"Class {class_index} has only {len(rows)} interior pixels at "
                 f"margin {margin} px; reduce interior_margin or points_per_class."
             )
-        order = np.lexsort((columns, rows))
-        chosen = np.sort(rng.choice(len(order), size=points_per_class, replace=False))
-        groups.append(
-            tuple(
-                (int(columns[order[position]]), int(rows[order[position]]))
-                for position in chosen
-            )
-        )
-    return (groups[0], groups[1])
+        point_groups.append(np.stack([columns, rows], axis=1).astype(np.int64))
+    chosen, used = poisson_disk_select(
+        point_groups, points_per_class, min_distance, rng, floor=2.0
+    )
+    return (chosen[0], chosen[1]), used
+
+
+def interior_points(
+    class_map: np.ndarray,
+    *,
+    patch_size: int,
+    points_per_class: int,
+    margin: int,
+    seed: int,
+    min_distance: float = 0.0,
+) -> tuple[tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]:
+    """Draw the first round's support points from the interior of each phase.
+
+    The margin keeps every ``patch_size`` patch inside one phase, so the initial
+    support set never contains a mixed patch. ``min_distance`` additionally keeps
+    the points of that first round apart, so a five-shot seed set does not spend
+    four clicks on the same grain. This margin applies to the initial points
+    only; later rounds sample on the confidence field alone.
+    """
+    groups, _ = _interior_draw(
+        class_map,
+        patch_size=patch_size,
+        points_per_class=points_per_class,
+        margin=margin,
+        seed=seed,
+        min_distance=min_distance,
+    )
+    return groups
 
 
 # ---------------------------------------------------------------------------
@@ -317,9 +349,109 @@ class Sampling:
     pool_sizes: tuple[int, int]
     available: tuple[int, int]
     seed: int
+    min_distance: float = 0.0
+    requested_min_distance: float = 0.0
+
+    @property
+    def relaxed(self) -> bool:
+        """True when the requested spacing did not fit and had to be shrunk."""
+        return self.min_distance < self.requested_min_distance - 1e-9
 
     def as_points(self) -> list[tuple[int, int]]:
         return [*self.points_by_class[0], *self.points_by_class[1]]
+
+
+def grid_step(coordinates: np.ndarray) -> float:
+    """Return the spacing between neighbouring grid coordinates, in pixels."""
+    unique = np.unique(np.asarray(coordinates, dtype=np.int64))
+    if unique.size < 2:
+        return 1.0
+    return float(np.median(np.diff(unique)))
+
+
+def _dart_throw(
+    points: np.ndarray,
+    count: int,
+    radius: float,
+    blocked: Sequence[tuple[int, int]],
+    rng: np.random.Generator,
+) -> list[tuple[int, int]] | None:
+    """Greedily accept ``count`` points that sit at least ``radius`` from every
+    point already taken.
+
+    Points are visited in a seeded random order, which is exactly uniform
+    without replacement when ``radius`` is zero and blue noise otherwise. A full
+    scan that cannot place ``count`` points returns ``None``.
+    """
+    taken = np.asarray(blocked, dtype=np.float64).reshape(-1, 2)
+    accepted: list[tuple[int, int]] = []
+    radius_sq = float(radius) ** 2
+    for index in rng.permutation(len(points)):
+        candidate = points[index]
+        if radius_sq > 0.0 and taken.size:
+            deltas = taken - candidate
+            if np.any((deltas * deltas).sum(axis=1) < radius_sq):
+                continue
+        point = (int(candidate[0]), int(candidate[1]))
+        accepted.append(point)
+        taken = np.vstack([taken, [[float(point[0]), float(point[1])]]])
+        if len(accepted) == count:
+            return accepted
+    return None
+
+
+def poisson_disk_select(
+    groups: Sequence[np.ndarray],
+    count: int,
+    min_distance: float,
+    rng: np.random.Generator,
+    *,
+    floor: float = 1.0,
+    shrink: float = 0.85,
+) -> tuple[tuple[tuple[tuple[int, int], ...], ...], float]:
+    """Draw ``count`` well-spaced points from every group.
+
+    Each group contributes ``count`` points, and no two accepted points - from
+    the same group or from different groups - are closer than the spacing that
+    was used. Groups are filled in order, so later groups also avoid the points
+    already accepted.
+
+    When the requested spacing cannot fit the pools, it is shrunk geometrically
+    down to ``floor`` and the radius that actually fit is returned. The caller
+    is expected to surface that number: a silently relaxed radius means the pool
+    is too small for the requested separation, which is a property of the data,
+    not a detail.
+    """
+    radius = float(min_distance)
+    if radius <= 0.0:
+        chosen: list[tuple[tuple[int, int], ...]] = []
+        for points in groups:
+            picked = _dart_throw(points, count, 0.0, [], rng)
+            if picked is None:
+                raise RepeatError(
+                    f"A pool holds {len(points)} cells; {count} points are required."
+                )
+            chosen.append(tuple(picked))
+        return tuple(chosen), 0.0
+
+    while True:
+        accepted: list[tuple[int, int]] = []
+        chosen = []
+        for points in groups:
+            picked = _dart_throw(points, count, radius, accepted, rng)
+            if picked is None:
+                break
+            chosen.append(tuple(picked))
+            accepted.extend(picked)
+        else:
+            return tuple(chosen), radius
+        if radius <= floor:
+            raise RepeatError(
+                f"Cannot place {count} points per class at least {radius:.1f} px "
+                "apart; the sampling pool is too small. Lower min_point_distance "
+                "or tau, or draw fewer points per class."
+            )
+        radius = max(floor, radius * shrink)
 
 
 def select_points(
@@ -330,19 +462,24 @@ def select_points(
     points_per_class: int,
     tau: float,
     seed: int,
+    min_distance: float = 0.0,
 ) -> Sampling:
     """Draw ``points_per_class`` cells per class from the confident region.
 
-    Candidates must have an accumulated confidence of at least ``tau``. Sampling
-    is uniform and without replacement inside each class, so repeated rounds can
-    revisit a cell but never reuse a cell twice within one round.
+    Candidates must have an accumulated confidence of at least ``tau``. Selection
+    is uniform without replacement, with a Poisson-disk constraint of
+    ``min_distance`` pixels across the whole support set: two points of the same
+    class or of different classes never sit closer than that. Pass ``0`` to fall
+    back to unconstrained uniform sampling.
     """
     confidence = accumulated.confidence
     labels = accumulated.labels
     pool = confidence >= float(tau)
     if pool.shape != labels.shape:
         raise RepeatError("The accumulated confidence and label grids differ in shape.")
-    groups: list[tuple[tuple[int, int], ...]] = []
+    xs = np.asarray(x_coordinates, dtype=np.int64)
+    ys = np.asarray(y_coordinates, dtype=np.int64)
+    point_groups: list[np.ndarray] = []
     pool_sizes: list[int] = []
     available: list[int] = []
     rng = np.random.default_rng(seed)
@@ -357,21 +494,23 @@ def select_points(
                 f"cells (tau={tau}); {points_per_class} are required. Lower tau or "
                 "points_per_class."
             )
-        chosen = np.sort(rng.choice(len(candidates), size=points_per_class, replace=False))
-        groups.append(
-            tuple(
-                (
-                    int(x_coordinates[int(candidates[position][1])]),
-                    int(y_coordinates[int(candidates[position][0])]),
-                )
-                for position in chosen
-            )
+        point_groups.append(
+            np.stack([xs[candidates[:, 1]], ys[candidates[:, 0]]], axis=1)
         )
+    chosen, used = poisson_disk_select(
+        point_groups,
+        points_per_class,
+        min_distance,
+        rng,
+        floor=max(2.0, 2.0 * grid_step(xs)),
+    )
     return Sampling(
-        points_by_class=(groups[0], groups[1]),
+        points_by_class=(chosen[0], chosen[1]),
         pool_sizes=(pool_sizes[0], pool_sizes[1]),
         available=(available[0], available[1]),
         seed=seed,
+        min_distance=used,
+        requested_min_distance=float(min_distance),
     )
 
 
@@ -548,6 +687,8 @@ CSV_COLUMNS = (
     "round",
     "points_a",
     "points_b",
+    "spread_req",
+    "spread",
     "pool_a",
     "pool_b",
     "acc",
@@ -686,6 +827,14 @@ def run_repeat(
         )
     patch_size = run_options.classifier_patch_size
     image_sha = input_record["sha256"]
+    # Two support points closer than one patch would train on overlapping crops,
+    # so the default spacing is exactly one patch size. Pools that cannot fit it
+    # (a thin grain-boundary band, say) are reported after relaxation.
+    requested_spread = (
+        float(patch_size)
+        if options.min_point_distance is None
+        else float(options.min_point_distance)
+    )
 
     if resume is not None:
         loop_dir = Path(resume).expanduser().resolve()
@@ -812,6 +961,7 @@ def run_repeat(
         sample_seed = options.base_seed * 1000 + round_index
         round_dir = rounds_dir / f"round-{round_index:03d}"
         round_dir.mkdir(parents=True, exist_ok=True)
+        spread_used: float | None = None
 
         if round_index == 0:
             if annotations is not None:
@@ -835,12 +985,13 @@ def run_repeat(
                     tuple(session.classes[1].points),
                 )
             else:
-                points_by_class = interior_points(
+                points_by_class, spread_used = _interior_draw(
                     class_map,
                     patch_size=patch_size,
                     points_per_class=options.points_per_class,
                     margin=options.interior_margin,
                     seed=options.base_seed,
+                    min_distance=requested_spread,
                 )
             pool_sizes = (0, 0)
             sample_seed = options.base_seed
@@ -854,9 +1005,20 @@ def run_repeat(
                 points_per_class=options.points_per_class,
                 tau=options.tau,
                 seed=sample_seed,
+                min_distance=requested_spread,
             )
             points_by_class = sampling.points_by_class
             pool_sizes = sampling.pool_sizes
+            spread_used = sampling.min_distance
+        if (
+            spread_used is not None
+            and requested_spread > 0
+            and spread_used < requested_spread - 1e-9
+        ):
+            report(
+                f"round {round_index}: spacing relaxed from {requested_spread:.1f} px "
+                f"to {spread_used:.1f} px to fit the pool"
+            )
 
         session = create_annotation_session(
             image_path=str(Path(image_path).expanduser().resolve()),
@@ -931,6 +1093,8 @@ def run_repeat(
             **metrics,
             "points_a": len(points_by_class[0]),
             "points_b": len(points_by_class[1]),
+            "spread_req": requested_spread,
+            "spread": spread_used,
             "pool_a": pool_sizes[0],
             "pool_b": pool_sizes[1],
             "points_xy": json.dumps(metrics["points_by_class"]),
@@ -1000,6 +1164,7 @@ def _finalize(
         "planned_rounds": options.rounds + 1,
         "points_per_class": options.points_per_class,
         "tau": options.tau,
+        "min_point_distance": options.min_point_distance,
         "accuracy": statistics,
         "alarm": alarm,
         "summary": str(summary_path),

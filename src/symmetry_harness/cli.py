@@ -292,6 +292,18 @@ def _parser() -> argparse.ArgumentParser:
         help="Support points drawn per class in every round. Defaults to 5.",
     )
     repeat.add_argument("--tau", type=float, default=0.95)
+    repeat.add_argument(
+        "--min-point-distance",
+        type=float,
+        default=None,
+        help=(
+            "Minimum pixel distance between any two support points of one round "
+            "(Poisson-disk spacing, across both classes). Defaults to the classifier "
+            "patch size; 0 restores unconstrained uniform sampling. The spacing is "
+            "shrunk automatically when the pool cannot fit it, and the value that "
+            "was actually used is recorded per round."
+        ),
+    )
     repeat.add_argument("--base-seed", type=int, default=42)
     repeat.add_argument("--alarm-drop", type=float, default=3.0)
     repeat.add_argument("--alarm-floor", type=float, default=0.90)
@@ -925,6 +937,11 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
             alarm_drop=float(arguments.alarm_drop),
             alarm_floor=float(arguments.alarm_floor),
             interior_margin=int(arguments.interior_margin),
+            min_point_distance=(
+                None
+                if arguments.min_point_distance is None
+                else float(arguments.min_point_distance)
+            ),
             label_codes=_label_codes(arguments.label_codes),
             keep_checkpoint=bool(arguments.keep_checkpoint),
             stop_on_alarm=bool(arguments.stop_on_alarm),

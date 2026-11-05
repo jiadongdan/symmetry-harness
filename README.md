@@ -272,7 +272,10 @@ lucky annotation. It runs the same k-shot fine-tuning many times; each round
 trains a fresh adapter from the backbone with newly drawn support points, and the
 support set never accumulates, so round 80 is still the same shot count as round
 1. Points are drawn only from cells whose accumulated confidence is at least
-`--tau`, and accuracy is scored every round against a ground-truth label raster.
+`--tau`, accuracy is scored every round against a ground-truth label raster, and
+within one round the points keep a Poisson-disk minimum spacing
+(`--min-point-distance`, one classifier patch by default) so a round never spends
+two support slots on overlapping crops.
 
 ```bash
 symmetry repeat --image image.npy --gt labels.npy \

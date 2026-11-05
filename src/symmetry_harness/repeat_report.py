@@ -586,6 +586,13 @@ def write_loop_summary(
         f"- Rounds completed: `{len(history)}` of `{int(options.rounds) + 1}` (round 0 is the seed round)",
         f"- Points per class per round: `{int(options.points_per_class)}`",
         f"- Confidence threshold `tau`: `{options.tau}`",
+        "- Minimum support-point spacing: `"
+        + (
+            "auto (one classifier patch)"
+            if options.min_point_distance is None
+            else f"{options.min_point_distance:g} px"
+        )
+        + "`",
         f"- Training seed: `{options.base_seed} + round_index`",
         f"- Alarm: floor `{options.alarm_floor}`, band `mean - {options.alarm_drop:g} sigma`",
         "",
@@ -606,12 +613,12 @@ def write_loop_summary(
         "",
         "## Rounds",
         "",
-        "| round | acc | class A acc | class B acc | IoU A | IoU B | pred area | agree prev | support acc | seed | seconds |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| round | acc | class A acc | class B acc | IoU A | IoU B | pred area | agree prev | support acc | spacing px | seed | seconds |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for entry in history:
         lines.append(
-            "| {round} | {acc} | {a} | {b} | {iou_a} | {iou_b} | {area} | {agree} | {support} | {seed} | {seconds} |".format(
+            "| {round} | {acc} | {a} | {b} | {iou_a} | {iou_b} | {area} | {agree} | {support} | {spread} | {seed} | {seconds} |".format(
                 round=entry.get("round", ""),
                 acc=_percent(entry.get("acc")),
                 a=_percent(entry.get("acc_class_a")),
@@ -621,6 +628,7 @@ def write_loop_summary(
                 area=_percent(entry.get("area_frac_pred")),
                 agree=_percent(entry.get("agree_prev")),
                 support=_percent(entry.get("support_acc")),
+                spread=_number(entry.get("spread"), 1),
                 seed=entry.get("train_seed", ""),
                 seconds=entry.get("seconds", ""),
             )
@@ -638,6 +646,10 @@ def write_loop_summary(
         "- A round is an independent replicate: same backbone, same patch size, same",
         "  epoch count, fresh support points drawn only from cells whose accumulated",
         "  confidence is at least `tau`.",
+        "- Within one round the support points keep a minimum distance (Poisson-disk",
+        "  spacing, across both classes). The `spacing px` column is what actually",
+        "  fit: a value below the requested spacing means the pool was too small for",
+        "  that separation, and the round is slightly less spread than the protocol.",
         "- `agree prev` is informational. It measures how much the map moved between two",
         "  rounds; it is not part of the stop rule.",
         "- Sampling stays inside the confident region by design, so this loop measures",

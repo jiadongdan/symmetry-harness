@@ -26,12 +26,13 @@ Because the support set never accumulates, the configured
 `maximum_shots_per_class` never becomes a limit: 100 rounds at one point per
 class stays at one point per class.
 
-## What the two parameters mean
+## What the main parameters mean
 
 | Parameter | Meaning | Recommended |
 | --- | --- | --- |
 | `--points-per-class` | Shots per class in every round. Match the experiment you are replicating (1, 3, or 5). | `5` |
 | `--rounds` | Rounds after the seed round. `0` runs only round 0. | `5` to shake out bugs, `50`–`100` for a real stability measurement |
+| `--min-point-distance` | Minimum pixel distance between any two support points of a round (Poisson-disk spacing, both classes). | leave at the default (one classifier patch); `0` disables it |
 
 `minimum_shots_per_class` defaults to `1`, so a 1-shot replication needs no
 configuration change. Values below the configured minimum are rejected by the
@@ -49,8 +50,24 @@ support set:
 
 A cell is a candidate when its accumulated confidence is at least `--tau`
 (default `0.95`). Sampling is uniform, without replacement, and seeded with
-`base_seed * 1000 + round`. There is no minimum-distance rule and no cross-round
-de-duplication: the confidence field is the only filter.
+`base_seed * 1000 + round`.
+
+On top of that filter, the points of one round obey a Poisson-disk constraint:
+no two support points are closer than `--min-point-distance` pixels. The default
+is the classifier patch size (64 px), which is the distance at which two support
+patches stop overlapping; `0` restores unconstrained uniform sampling. The
+constraint spans **both classes** — two nearly co-located points with different
+labels force the classifier to memorise one crop under two contradictory labels,
+which is worse than a wasted support slot.
+
+The spacing is a ceiling, not a promise. When the pool cannot fit the requested
+radius (a grain-boundary band narrower than the patch, or many points per class
+in a small phase), the radius is shrunk geometrically — 15% per attempt, floored
+at two grid steps — until a draw succeeds. Every round records both numbers:
+`spread_req` is what was requested, `spread` is what fit. A `spread` below
+`spread_req` is a property of the data, not a silent detail, and the CLI prints a
+line when it happens. If even the floor radius cannot be satisfied the round
+stops with an error rather than drawing overlapping points.
 
 `tau` is deliberately not the main constraint. On a typical phase map the model
 is already above 0.95 on roughly 96% of the grid, so `tau` filters very little.
@@ -60,7 +77,9 @@ What varies between rounds is the draw itself.
 
 Round 0 is the reference: it produces the first confidence map and the first
 accuracy value. It draws its points from the interior of each ground-truth phase
-(`--interior-margin`, default 32 px, so a 64 px patch stays inside one phase).
+(`--interior-margin`, default 32 px, so a 64 px patch stays inside one phase) and
+applies the same `--min-point-distance` rule, so a five-shot seed set does not
+spend four clicks on the same grain.
 
 Pass `--annotations SESSION.json` to use a human annotation session instead. The
 session must have been drawn on the same image file, because the harness compares
@@ -88,6 +107,7 @@ Checked after every round, in this order:
 | at least 3 rounds and accuracy below `mean - alarm_drop x std` (default 3 sigma) | alarm |
 | either class IoU below 0.10 | alarm |
 | candidate pool for a class smaller than `--points-per-class` | loop error |
+| pool too small for `--points-per-class` points at the minimum spacing (two grid steps) | loop error; the spacing is shrunk first, and only the floor is fatal |
 | `--rounds` reached | completed |
 
 An alarm stops the loop by default. Use `--no-stop-on-alarm` to keep running and

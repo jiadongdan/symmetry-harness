@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from symmetry_harness.repeat import (
     history_statistics,
     interior_points,
     load_label_map,
+    poisson_disk_select,
     run_repeat,
     run_repeat_batch,
     score_prediction,
@@ -274,6 +276,121 @@ def test_select_points_rejects_small_pool() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Poisson-disk spacing
+# ---------------------------------------------------------------------------
+
+
+def _min_pairwise(points: list[tuple[int, int]]) -> float:
+    if len(points) < 2:
+        return float("inf")
+    coordinates = np.asarray(points, dtype=np.float64)
+    deltas = coordinates[:, None, :] - coordinates[None, :, :]
+    distances = np.sqrt((deltas * deltas).sum(axis=2))
+    np.fill_diagonal(distances, np.inf)
+    return float(distances.min())
+
+
+def _dense_pool(width: int = 40, height: int = 40, step: int = 4) -> np.ndarray:
+    xs = np.arange(0, width * step, step, dtype=np.int64)
+    ys = np.arange(0, height * step, step, dtype=np.int64)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    return np.stack([grid_x.reshape(-1), grid_y.reshape(-1)], axis=1)
+
+
+def test_poisson_disk_keeps_points_apart() -> None:
+    pool = _dense_pool()
+    points, radius = poisson_disk_select([pool], 5, 40.0, np.random.default_rng(1))
+    assert len(points[0]) == 5
+    assert radius == 40.0
+    assert _min_pairwise(list(points[0])) >= 40.0 - 1e-9
+
+
+def test_poisson_disk_spacing_spans_both_groups() -> None:
+    """Two nearby groups of different classes must not collapse onto each other."""
+    left = _dense_pool(width=20, step=4)
+    right = left + np.asarray([[80, 0]], dtype=np.int64)
+    points, radius = poisson_disk_select(
+        [left, right], 4, 24.0, np.random.default_rng(5)
+    )
+    assert radius == 24.0
+    assert _min_pairwise([*points[0], *points[1]]) >= 24.0 - 1e-9
+
+
+def test_poisson_disk_relaxes_an_infeasible_radius() -> None:
+    small = np.asarray([[0, 0], [4, 0], [8, 0], [0, 4], [4, 4], [8, 4]], dtype=np.int64)
+    points, radius = poisson_disk_select(
+        [small], 3, 200.0, np.random.default_rng(2), floor=4.0
+    )
+    assert len(set(points[0])) == 3
+    assert radius < 200.0
+    assert _min_pairwise(list(points[0])) >= radius - 1e-9
+
+
+def test_poisson_disk_is_seed_deterministic() -> None:
+    pool = _dense_pool()
+    first = poisson_disk_select([pool], 6, 24.0, np.random.default_rng(7))
+    second = poisson_disk_select([pool], 6, 24.0, np.random.default_rng(7))
+    third = poisson_disk_select([pool], 6, 24.0, np.random.default_rng(8))
+    assert first == second
+    assert first != third
+
+
+def test_poisson_disk_rejects_an_unfillable_pool() -> None:
+    tiny = np.asarray([[0, 0], [4, 0]], dtype=np.int64)
+    with pytest.raises(RepeatError, match="too small"):
+        poisson_disk_select([tiny], 3, 64.0, np.random.default_rng(1), floor=8.0)
+
+
+def test_select_points_honours_min_distance() -> None:
+    prediction = fake_prediction()
+    accumulated = Accumulated.empty(prediction.confidence_grid.shape)
+    accumulated.update(prediction)
+    sampling = select_points(
+        accumulated,
+        prediction.x_coordinates,
+        prediction.y_coordinates,
+        points_per_class=2,
+        tau=0.95,
+        seed=13,
+        min_distance=8.0,
+    )
+    assert sampling.min_distance == 8.0
+    assert sampling.relaxed is False
+    assert _min_pairwise(sampling.as_points()) >= 8.0 - 1e-9
+
+
+def test_select_points_without_a_distance_keeps_the_old_draw() -> None:
+    prediction = fake_prediction()
+    accumulated = Accumulated.empty(prediction.confidence_grid.shape)
+    accumulated.update(prediction)
+    sampling = select_points(
+        accumulated,
+        prediction.x_coordinates,
+        prediction.y_coordinates,
+        points_per_class=3,
+        tau=0.95,
+        seed=21,
+    )
+    assert sampling.min_distance == 0.0
+    assert sampling.relaxed is False
+    assert len(set(sampling.as_points())) == 6
+
+
+def test_interior_points_honour_min_distance() -> None:
+    labels = two_phase_labels()
+    class_map = class_map_from_labels(labels, (14, 17))
+    group_a, group_b = interior_points(
+        class_map,
+        patch_size=8,
+        points_per_class=3,
+        margin=16,
+        seed=4,
+        min_distance=16.0,
+    )
+    assert _min_pairwise([*group_a, *group_b]) >= 16.0 - 1e-9
+
+
+# ---------------------------------------------------------------------------
 # Metrics and stop rules
 # ---------------------------------------------------------------------------
 
@@ -358,6 +475,7 @@ def test_option_validation() -> None:
         RepeatOptions(alarm_drop=0),
         RepeatOptions(label_codes=(14, 14)),
         RepeatOptions(class_names=("A", "A")),
+        RepeatOptions(min_point_distance=-1.0),
     ):
         with pytest.raises(RepeatError):
             bad.validate()
@@ -426,7 +544,7 @@ def _write_inputs(tmp_path: Path) -> tuple[Path, Path]:
 def test_run_repeat_keeps_rounds_independent(config, tmp_path, monkeypatch) -> None:
     calls = _install_fake_provider(monkeypatch)
     image_path, label_path = _write_inputs(tmp_path)
-    options = RepeatOptions(rounds=2, points_per_class=3, tau=0.95, base_seed=42, interior_margin=8)
+    options = RepeatOptions(rounds=2, points_per_class=3, tau=0.95, base_seed=42, interior_margin=8, min_point_distance=0)
 
     result = run_repeat(
         config, image_path=image_path, label_path=label_path, options=options
@@ -469,10 +587,34 @@ def test_run_repeat_keeps_rounds_independent(config, tmp_path, monkeypatch) -> N
     assert (loop_dir / "figures" / "acc_vs_round.png").is_file()
 
 
+def test_run_repeat_resolves_the_default_spacing(config, tmp_path, monkeypatch) -> None:
+    """An unspecified spacing means one classifier patch, and it reaches the CSV."""
+    _install_fake_provider(monkeypatch)
+    image_path, label_path = _write_inputs(tmp_path)
+    options = RepeatOptions(rounds=1, points_per_class=1, interior_margin=8)
+
+    result = run_repeat(
+        config, image_path=image_path, label_path=label_path, options=options
+    )
+
+    loop_dir = Path(result["loop_directory"])
+    manifest = json.loads((loop_dir / "loop_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["options"]["min_point_distance"] is None
+
+    with (loop_dir / "loop_rounds.csv").open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 2
+    patch_size = config.model.classifier_patch_size
+    for row in rows:
+        assert float(row["spread_req"]) == float(patch_size)
+        achieved = float(row["spread"])
+        assert 0.0 < achieved <= float(patch_size)
+
+
 def test_run_repeat_stops_on_alarm(config, tmp_path, monkeypatch) -> None:
     _install_fake_provider(monkeypatch, bad_round=2)
     image_path, label_path = _write_inputs(tmp_path)
-    options = RepeatOptions(rounds=4, points_per_class=3, tau=0.95, interior_margin=8)
+    options = RepeatOptions(rounds=4, points_per_class=3, tau=0.95, interior_margin=8, min_point_distance=0)
 
     result = run_repeat(
         config, image_path=image_path, label_path=label_path, options=options
@@ -488,7 +630,7 @@ def test_run_repeat_stops_on_alarm(config, tmp_path, monkeypatch) -> None:
 def test_run_repeat_can_continue_past_an_alarm(config, tmp_path, monkeypatch) -> None:
     _install_fake_provider(monkeypatch, bad_round=2)
     image_path, label_path = _write_inputs(tmp_path)
-    options = RepeatOptions(rounds=3, points_per_class=3, stop_on_alarm=False, interior_margin=8)
+    options = RepeatOptions(rounds=3, points_per_class=3, stop_on_alarm=False, interior_margin=8, min_point_distance=0)
 
     result = run_repeat(
         config, image_path=image_path, label_path=label_path, options=options
@@ -505,7 +647,7 @@ def test_run_repeat_resumes_from_completed_rounds(config, tmp_path, monkeypatch)
         config,
         image_path=image_path,
         label_path=label_path,
-        options=RepeatOptions(rounds=1, points_per_class=3, interior_margin=8),
+        options=RepeatOptions(rounds=1, points_per_class=3, interior_margin=8, min_point_distance=0),
     )
     assert first["rounds_completed"] == 2
 
@@ -514,7 +656,7 @@ def test_run_repeat_resumes_from_completed_rounds(config, tmp_path, monkeypatch)
         config,
         image_path=image_path,
         label_path=label_path,
-        options=RepeatOptions(rounds=3, points_per_class=3, interior_margin=8),
+        options=RepeatOptions(rounds=3, points_per_class=3, interior_margin=8, min_point_distance=0),
         resume=first["loop_directory"],
     )
     assert second["loop_directory"] == first["loop_directory"]
@@ -530,7 +672,7 @@ def test_run_repeat_refuses_a_different_image(config, tmp_path, monkeypatch) -> 
         config,
         image_path=image_path,
         label_path=label_path,
-        options=RepeatOptions(rounds=0, points_per_class=3, interior_margin=8),
+        options=RepeatOptions(rounds=0, points_per_class=3, interior_margin=8, min_point_distance=0),
     )
 
     other_image = tmp_path / "other.npy"
@@ -540,7 +682,7 @@ def test_run_repeat_refuses_a_different_image(config, tmp_path, monkeypatch) -> 
             config,
             image_path=other_image,
             label_path=label_path,
-            options=RepeatOptions(rounds=1, points_per_class=3, interior_margin=8),
+            options=RepeatOptions(rounds=1, points_per_class=3, interior_margin=8, min_point_distance=0),
             resume=first["loop_directory"],
         )
 
@@ -554,7 +696,7 @@ def test_run_repeat_rejects_a_mismatched_label_shape(config, tmp_path, monkeypat
             config,
             image_path=image_path,
             label_path=label_path,
-            options=RepeatOptions(rounds=1, points_per_class=3, interior_margin=8),
+            options=RepeatOptions(rounds=1, points_per_class=3, interior_margin=8, min_point_distance=0),
         )
 
 
@@ -572,7 +714,7 @@ def test_run_repeat_batch_reports_every_image(config, tmp_path, monkeypatch) -> 
             {"image": image_path, "gt": label_path},
             {"image": other_image, "gt": other_labels},
         ],
-        options=RepeatOptions(rounds=0, points_per_class=3, interior_margin=8),
+        options=RepeatOptions(rounds=0, points_per_class=3, interior_margin=8, min_point_distance=0),
     )
 
     assert payload["status"] == "completed"
@@ -590,7 +732,7 @@ def test_run_repeat_relaxes_the_shot_floor_for_one_shot_runs(config, tmp_path, m
         config,
         image_path=image_path,
         label_path=label_path,
-        options=RepeatOptions(rounds=0, points_per_class=1, interior_margin=8),
+        options=RepeatOptions(rounds=0, points_per_class=1, interior_margin=8, min_point_distance=0),
     )
     assert [call["counts"] for call in calls] == [[1, 1]]
     assert calls[0]["minimum_shots"] == 1
@@ -604,7 +746,7 @@ def test_run_repeat_reports_reuse_failure(config, tmp_path, monkeypatch) -> None
         config,
         image_path=image_path,
         label_path=label_path,
-        options=RepeatOptions(rounds=0, points_per_class=3, interior_margin=8),
+        options=RepeatOptions(rounds=0, points_per_class=3, interior_margin=8, min_point_distance=0),
         progress=messages.append,
     )
     assert result["status"] == "completed"
