@@ -43,6 +43,7 @@ from .analysis import DensePrediction, dense_prediction_from_arrays
 from .annotations import create_annotation_session
 from .catalog import model_capability, model_weights, provider_models, weight_capability
 from .config import HarnessConfig, config_for_model_selection
+from .finish import finish_run
 from .image_io import file_sha256, inspect_input
 from .numeric import require_whole_number
 from .provider import install_registered_weight, run_provider_features
@@ -1081,6 +1082,11 @@ def build_fine_tune_workspace(
             DEFAULT_OVERLAY_ALPHA,  # alpha_slider
             gr.update(value=None, visible=False),  # result_exports_files
             None,  # result_json
+            gr.update(visible=False),  # finish_button
+            gr.update(visible=False, value=""),  # finish_note
+            gr.update(visible=False, value=None),  # finish_gallery
+            gr.update(visible=False, value=""),  # finish_report
+            gr.update(value=None, visible=False),  # finish_html_download
             gr.update(
                 visible=True,
                 open=False,
@@ -1459,6 +1465,29 @@ def build_fine_tune_workspace(
                     )
                     with gr.Accordion("Technical details", open=False):
                         result_json = gr.JSON(label="Run result")
+                    # Closing out a run is a local action: it reads artifacts the
+                    # run already wrote, so it needs neither the Provider nor the
+                    # conversation. The button stays hidden until a run exists,
+                    # and the note it leaves behind names the next step instead
+                    # of pretending the assistant can speak first.
+                    finish_button = gr.Button(
+                        "Finish this run", variant="primary", visible=False
+                    )
+                    finish_note = gr.Markdown(visible=False)
+                    finish_gallery = gr.Gallery(
+                        label="Report figures",
+                        visible=False,
+                        columns=3,
+                        height="auto",
+                        object_fit="contain",
+                        buttons=["download", "fullscreen"],
+                    )
+                    finish_report = gr.Markdown(visible=False)
+                    finish_html_download = gr.DownloadButton(
+                        "Download report (.html)",
+                        variant="secondary",
+                        visible=False,
+                    )
 
     RESULT_OUTPUTS = [
         prediction_overlay,
@@ -1473,6 +1502,11 @@ def build_fine_tune_workspace(
         alpha_slider,
         result_exports_files,
         result_json,
+        finish_button,
+        finish_note,
+        finish_gallery,
+        finish_report,
+        finish_html_download,
         results_group,
         results_status,
         presentation_state,
@@ -2634,6 +2668,17 @@ def build_fine_tune_workspace(
             DEFAULT_OVERLAY_ALPHA,  # alpha_slider
             gr.update(value=None, visible=False),  # result_exports_files
             result,  # result_json
+            gr.update(visible=True),  # finish_button
+            gr.update(
+                visible=True,
+                value=(
+                    "Run finished. Press **Finish this run** to write the report and "
+                    "leave a handoff the conversation can pick up."
+                ),
+            ),  # finish_note
+            gr.update(visible=False, value=None),  # finish_gallery
+            gr.update(visible=False, value=""),  # finish_report
+            gr.update(value=None, visible=False),  # finish_html_download
             gr.update(
                 visible=True, open=True, label="Prediction results"
             ),  # results_group
@@ -2662,6 +2707,47 @@ def build_fine_tune_workspace(
         outputs=run_outputs,
         show_progress="hidden",
     ).then(on_refresh, inputs=REFRESH_INPUTS, outputs=REFRESH_OUTPUTS)
+
+    # ------------------------------------------------------------------
+    # Finish: write the report and leave a handoff for the conversation
+    # ------------------------------------------------------------------
+    def on_finish(run_directory):
+        if not run_directory:
+            return (
+                gr.update(
+                    value="Complete a fine-tuning run before finishing it.",
+                    visible=True,
+                ),
+                gr.update(visible=False),
+                gr.update(visible=False),
+                gr.update(visible=False),
+            )
+        try:
+            outcome = finish_run(run_directory)
+        except Exception as error:  # noqa: BLE001 - the interface must show it
+            return (
+                gr.update(value=f"Report failed: {error}", visible=True),
+                gr.update(visible=False),
+                gr.update(visible=False),
+                gr.update(visible=False),
+            )
+        report_text = Path(outcome["report"]).read_text(encoding="utf-8")
+        gallery = [
+            (str(path), Path(path).stem.replace("_", " "))
+            for path in outcome["figures"]
+        ]
+        return (
+            gr.update(value=outcome["next_step"], visible=True),
+            gr.update(value=gallery, visible=True),
+            gr.update(value=report_text, visible=True),
+            gr.update(value=outcome["report_html"], visible=True),
+        )
+
+    finish_button.click(
+        on_finish,
+        inputs=[copy_path],
+        outputs=[finish_note, finish_gallery, finish_report, finish_html_download],
+    )
 
     # ------------------------------------------------------------------
     # Presentation rerender / PNG exports (never touch the Provider)

@@ -960,16 +960,107 @@ def _features_artifacts(
     return array_path, record_path
 
 
+@dataclass(frozen=True)
+class SourceRun:
+    """A finished fine-tune the loop anchors on instead of a bare image.
+
+    The run directory is self-contained. Its ``annotation_session.json`` points
+    at the normalised copy ``input.npy`` sitting beside it, so the session hash
+    and the file agree without reaching back to the uploaded original - which
+    lives in a temporary directory and is usually gone by the time a loop runs.
+    """
+
+    directory: Path
+    run_id: str
+    session_path: Path
+    image_path: Path
+    image_name: str
+    inherited: dict[str, Any]
+
+    def to_record(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "directory": str(self.directory),
+            "annotation_session": str(self.session_path),
+            "input": str(self.image_path),
+            "image_name": self.image_name,
+            "inherited_overrides": sorted(self.inherited),
+        }
+
+
+def resolve_source_run(config: HarnessConfig, value: str | Path) -> SourceRun:
+    """Resolve a completed run into the pieces a repeat loop needs.
+
+    Only three run options are inherited: the classifier patch, the symmetry
+    patch and the epoch count. They set the support-patch geometry and the
+    scoring lattice, so a loop that disagreed with its anchor on any of them
+    would not be measuring the same procedure. Everything else keeps the
+    command-line default.
+    """
+    from .run_report import ReportError, resolve_run
+
+    try:
+        directory = resolve_run(value, config.output_root, prefix="symmetry")
+    except ReportError as error:
+        raise RepeatError(str(error)) from error
+    session_path = directory / "annotation_session.json"
+    image_path = directory / "input.npy"
+    if not session_path.is_file() or not image_path.is_file():
+        raise RepeatError(
+            f"The run {directory.name} holds no reusable annotation session. Finish "
+            "one fine-tune in the interface before anchoring a loop on it."
+        )
+    session = load_annotation_session(session_path)
+    if session.image_sha256 != file_sha256(image_path):
+        raise RepeatError(
+            f"The annotation session in {directory.name} was drawn on a different "
+            "image file than the copy stored beside it."
+        )
+
+    run_id = directory.name
+    image_name = directory.name
+    inherited: dict[str, Any] = {}
+    record_path = directory / "run_record.json"
+    if record_path.is_file():
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        run_id = str(record.get("run_id") or directory.name)
+        raw_path = (record.get("input") or {}).get("path")
+        if raw_path:
+            image_name = Path(str(raw_path)).name
+        configuration = record.get("configuration") or {}
+        candidates = {
+            "classifier_patch_size": (configuration.get("model") or {}).get(
+                "classifier_patch_size"
+            ),
+            "symmetry_patch_size": (configuration.get("features") or {}).get(
+                "symmetry_patch_size"
+            ),
+            "epochs": (configuration.get("fine_tuning") or {}).get("epochs"),
+        }
+        inherited = {
+            name: item for name, item in candidates.items() if item is not None
+        }
+    return SourceRun(
+        directory=directory,
+        run_id=run_id,
+        session_path=session_path,
+        image_path=image_path,
+        image_name=image_name,
+        inherited=inherited,
+    )
+
+
 def run_repeat(
     config: HarnessConfig,
     *,
-    image_path: str | Path,
+    image_path: str | Path | None = None,
     label_path: str | Path | None = None,
     options: RepeatOptions,
     output_root: str | Path | None = None,
     overrides: dict[str, Any] | None = None,
     annotations: str | Path | None = None,
     resume: str | Path | None = None,
+    source_run: str | Path | None = None,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Run one repeat loop on one image and return its summary.
@@ -977,6 +1068,11 @@ def run_repeat(
     ``label_path`` is optional in ``user`` mode: without it the loop still runs
     and still samples from the frozen anchor, but accuracy is not scored and the
     alarm rules are inert. ``stability`` mode requires it.
+
+    ``source_run`` anchors on a completed fine-tune instead of an image: its
+    annotation session becomes the anchor's support set and its normalised
+    ``input.npy`` becomes the image, which is how a conversation picks up the
+    run that was just produced in the interface.
     """
     options.validate()
     if options.mode == "stability" and label_path is None:
@@ -984,7 +1080,33 @@ def run_repeat(
             "Stability mode anchors on cells that agree with the ground truth, so "
             "every image needs a label raster."
         )
+    source: SourceRun | None = None
+    if source_run is not None:
+        if resume is not None:
+            raise RepeatError(
+                "A loop resumed from a directory already holds its anchor; it cannot "
+                "also anchor on a completed run."
+            )
+        if image_path is not None or annotations is not None:
+            raise RepeatError(
+                "Anchor on either a completed run or an image with an annotation "
+                "session, not both."
+            )
+        source = resolve_source_run(config, source_run)
+        image_path = source.image_path
+        annotations = source.session_path
+        # The run fills the gaps; an explicit override still wins.
+        overrides = {**source.inherited, **dict(overrides or {})}
+    if image_path is None:
+        raise RepeatError(
+            "A repeat loop needs an image (--image) or a completed run (--run)."
+        )
     report = progress or (lambda message: None)
+    if source is not None:
+        report(
+            f"anchored on run {source.run_id} ({source.image_name}); the anchor "
+            "reuses that run's annotation session"
+        )
     readiness = doctor(config)
     if readiness["status"] != "ready":
         raise RepeatError(
@@ -1066,9 +1188,10 @@ def run_repeat(
         loop_id = str(manifest["loop_id"])
         report(f"resuming {loop_id}")
     else:
+        loop_label = source.image_name if source is not None else image_path
         loop_id, loop_dir = _new_loop_directory(
             config.output_root if output_root is None else Path(output_root),
-            _slug(Path(image_path).stem),
+            _slug(Path(loop_label).stem),
         )
         manifest = {}
         report(f"loop {loop_id}")
@@ -1102,6 +1225,7 @@ def run_repeat(
             "options": options.to_dict(),
             "run_options": run_options.to_dict(),
             "annotations": None if annotations is None else str(Path(annotations).resolve()),
+            "source_run": None if source is None else source.to_record(),
             "model": {
                 "identifier": config.model.identifier,
                 "checkpoint_path": (
@@ -1301,6 +1425,7 @@ def run_repeat(
                 f"anchor: frozen {anchor.pool_sizes[0]}+{anchor.pool_sizes[1]} "
                 "candidate cells from the first fine-tune"
             )
+            report(_progress_line("anchor", metrics, spread_used, anchor.pool_sizes))
             continue
 
         metrics = _round_metrics(
@@ -1334,6 +1459,11 @@ def run_repeat(
         previous_grid = np.asarray(prediction.prediction_grid, dtype=np.int16)
 
         _write_json(round_dir / "metrics.json", metrics)
+        report(
+            _progress_line(
+                f"round {round_index}/{options.rounds}", metrics, spread_used, pool_sizes
+            )
+        )
         row: dict[str, Any] = {
             **metrics,
             "mode": options.mode,
@@ -1375,6 +1505,34 @@ def run_repeat(
             )
 
     return _finalize(loop_id, loop_dir, manifest, options, history, "completed")
+
+
+def _progress_line(
+    label: str,
+    metrics: dict[str, Any],
+    spread: float | None,
+    pool_sizes: Sequence[int],
+) -> str:
+    """One line per round, shaped for a conversation to relay.
+
+    Accuracy is ``n/a`` in ``user`` mode without a ground truth; ``agree`` then
+    measures drift from the anchor instead. Both are printed rather than one
+    substituted for the other, because they answer different questions.
+    """
+    parts = [label]
+    raw_acc = metrics.get("acc")
+    if raw_acc is None or not np.isfinite(float(raw_acc)):
+        raw_agree = metrics.get("anchor_agree")
+        if raw_agree is not None and np.isfinite(float(raw_agree)):
+            parts.append(f"acc=n/a agree={float(raw_agree):.3f}")
+        else:
+            parts.append("acc=n/a")
+    else:
+        parts.append(f"acc={float(raw_acc):.3f}")
+    if spread is not None and np.isfinite(float(spread)):
+        parts.append(f"spread={float(spread):.1f}")
+    parts.append(f"pool={int(pool_sizes[0])}/{int(pool_sizes[1])}")
+    return " ".join(parts)
 
 
 def _reuse(round_index: int, points_per_class: int, pool_size: int) -> float | None:

@@ -649,6 +649,20 @@ def write_loop_summary(
         "only from 6 replicates on",
         "",
     ]
+    source_run = manifest.get("source_run") or {}
+    if source_run:
+        # The loop was anchored on an existing fine-tune rather than a bare
+        # annotated image; say so, and point at that run's own report so the
+        # stability numbers can be read next to the run they came from.
+        lines.insert(
+            3,
+            "- Anchored on run `{}` (`{}`). The anchor reuses that run's "
+            "annotation session; its report is `report_summary.md` in that "
+            "directory.".format(
+                source_run.get("run_id") or "n/a",
+                source_run.get("image_name") or "n/a",
+            ),
+        )
     if alarm:
         lines += ["## Alarm", "", f"> {alarm}", ""]
     lines += [

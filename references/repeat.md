@@ -36,6 +36,7 @@ class stays at one point per class.
 
 | Parameter | Meaning | Recommended |
 | --- | --- | --- |
+| `--run` | Anchor on a finished fine-tune instead of an image: a run directory, a run id, or `latest`. Reuses that run's annotation session and stored `input.npy`, and inherits the classifier patch, the symmetry patch and the epoch count. | `latest` right after a fine-tune |
 | `--mode` | Which flow to measure. `user` pools the anchor's confident cells; `stability` pools the cells that agree with the ground truth and clear the phase boundary. | `user` for the product path, `stability` for internal numbers |
 | `--points-per-class` | Shots per class in every round. Match the experiment you are replicating (1, 3, or 5). | `5` |
 | `--rounds` | Replicates after the anchor. `--rounds 100` trains the anchor plus 100 rounds. | `5` to shake out bugs, `50`–`100` for a real measurement |
@@ -128,6 +129,33 @@ the same grain.
 
 The interior margin applies to the anchor only. Later rounds ignore it.
 
+## Anchoring on a finished fine-tune
+
+A loop usually follows a fine-tune the user has just run. That run directory is
+self-contained: its `annotation_session.json` points at the normalised
+`input.npy` stored beside it, so the session hash and the file agree without
+reaching back to the uploaded original - which lives in a temporary directory
+and is usually gone by the time a loop runs.
+
+```powershell
+symmetry repeat --run latest --rounds 20 --points-per-class 5 `
+  --no-keep-checkpoint --no-stop-on-alarm
+```
+
+`--run` accepts a directory, a run id, or `latest`, and is mutually exclusive
+with `--image`, `--annotations` and `--resume`. It supplies the image and the
+anchor's support points. `--gt` is still passed separately, because a
+ground-truth raster is never stored inside a run, and that flag is what makes
+`stability` possible: without it the loop runs in `user` mode and accuracy is
+`nan`.
+
+Three run options are inherited - `classifier_patch_size`,
+`symmetry_patch_size` and `epochs` - because they decide the support-patch
+geometry and the scoring lattice. A loop that disagreed with its anchor on any
+of them would not be measuring the same procedure. Everything else keeps the
+command-line default. What was resolved is printed at startup and recorded under
+`source_run` in `loop_manifest.json`.
+
 ## Accuracy
 
 Accuracy is scored on the dense prediction grid against a ground-truth label
@@ -168,6 +196,10 @@ loops are judged on the absolute floor alone.
 ## One image or many
 
 ```powershell
+# the usual case: replicate the fine-tune the user just ran
+symmetry repeat --run latest --rounds 20 --points-per-class 5 `
+  --no-keep-checkpoint --no-stop-on-alarm
+
 # internal stability numbers: pool = anchor cells that agree with the truth
 symmetry repeat --config symmetry-harness.json --mode stability `
   --image "D:\data\simu img1.npy" --gt "D:\data\simu lbs1.npy" `
@@ -221,6 +253,9 @@ round writes its artifacts before its row, so an interruption can leave a
 `round-NNN/kept/` that the table never heard of; resume fills the first gap
 instead of stepping over it. Rows are rewritten from memory rather than appended,
 so re-running a round replaces its row instead of duplicating it.
+
+`--resume` and `--run` are alternatives: a resumed loop already holds its
+anchor, so it cannot also be told to build one from a run.
 
 Loops written before schema `symmetry-repeat-loop-v2` cannot be resumed; their
 pool was accumulated across rounds and no longer exists.
@@ -288,6 +323,22 @@ recomputing them and says so on stderr; results are unchanged.
 * A round that collapses under a per-round training seed (`base_seed + round`)
   cannot be attributed to the points alone. Re-run that round with a fixed seed
   to separate the two causes.
+
+## Progress
+
+Every round prints one line to stderr, so a conversation can relay progress
+instead of going quiet for the length of the loop:
+
+```text
+anchored on run symmetry-20261028T173236Z-0b7216d2 (MoS2_1H_1T_half_0p1A_spline.npy)
+anchor acc=0.972 pool=3246/2316
+round 1/20 acc=0.968 spread=64.0 pool=3246/2316
+```
+
+In `user` mode without a ground truth the accuracy field is `acc=n/a
+agree=0.973`, where `agree` is drift from the anchor prediction - not a correct
+rate. The two are printed side by side rather than one substituted for the
+other, because they answer different questions.
 
 ## Cost
 

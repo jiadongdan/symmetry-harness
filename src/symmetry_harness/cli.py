@@ -143,8 +143,19 @@ def _repeat_entries(arguments: argparse.Namespace) -> list[dict[str, Path]]:
         if not entries:
             raise ValueError("--dataset contains no entries.")
         return entries
+    if arguments.run is not None:
+        # The run supplies the image and the annotation session, so an explicit
+        # image would be a second, possibly conflicting anchor.
+        if arguments.image or arguments.dataset:
+            raise ValueError(
+                "Use --run alone: it already carries the image and its annotations. "
+                "Pass --gt only to add ground-truth scoring."
+            )
+        if len(arguments.gt) > 1:
+            raise ValueError("--run takes at most one --gt.")
+        return [{"image": None, "gt": arguments.gt[0] if arguments.gt else None}]
     if not arguments.image:
-        raise ValueError("Provide --image/--gt pairs or --dataset.")
+        raise ValueError("Provide --image/--gt pairs, --dataset, or --run.")
     if arguments.gt and len(arguments.image) != len(arguments.gt):
         raise ValueError("--image and --gt must be supplied in equal numbers.")
     if not arguments.gt:
@@ -288,6 +299,17 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             'JSON list of {"image": ..., "gt": ...} entries, or {"images": [...]}. '
             "Use it instead of repeating --image/--gt."
+        ),
+    )
+    repeat.add_argument(
+        "--run",
+        default=None,
+        help=(
+            "Anchor on a completed fine-tune instead of an image: a run directory, "
+            "a run id, or 'latest'. The loop reuses that run's annotation session "
+            "and its stored input image, and inherits the classifier patch, the "
+            "symmetry patch and the epoch count. Combine with --gt for "
+            "ground-truth scoring."
         ),
     )
     repeat.add_argument(
@@ -981,6 +1003,16 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
         )
         options.validate()
         entries = _repeat_entries(arguments)
+        if arguments.run is not None:
+            if arguments.annotations is not None:
+                raise ValueError(
+                    "--run already carries an annotation session; drop --annotations."
+                )
+            if arguments.resume is not None:
+                raise ValueError(
+                    "--run and --resume are alternatives: a resumed loop already "
+                    "holds its anchor."
+                )
         if options.mode == "stability" and any(entry["gt"] is None for entry in entries):
             raise ValueError("--mode stability needs a --gt for every image.")
         progress = lambda message: print(  # noqa: E731 - tiny inline reporter
@@ -1008,6 +1040,7 @@ def _execute(arguments: argparse.Namespace) -> dict[str, Any] | None:
                 output_root=arguments.output_root,
                 overrides=_overrides(arguments),
                 annotations=arguments.annotations,
+                source_run=arguments.run,
                 progress=progress,
             )
         if arguments.annotations is not None:

@@ -1,6 +1,6 @@
 ---
 name: symmetry-harness
-description: Run local few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to launch the local interface, fine-tune adapters on representative points, inspect confidence or entropy, or apply a saved .symmodel package to new images without re-training. Requires the local symmetry-harness runtime and the symmetry-learn Provider. Do not use for foundation-model training, silent weight installation, or unattended label selection.
+description: Run local few-shot symmetry analysis on single-channel scientific or microscopy images. Use when a user wants to launch the local interface, fine-tune adapters on representative points, inspect confidence or entropy, apply a saved .symmodel package to new images without re-training, or check whether repeated k-shot runs are reproducible. Requires the local symmetry-harness runtime and the symmetry-learn Provider. Do not use for foundation-model training, silent weight installation, or unattended label selection.
 metadata:
   version: "0.3.1"
   product: "symmetry-harness"
@@ -191,6 +191,67 @@ symmetry report --session latest --notes-text "<sample and purpose; class meanin
 See [references/run-report.md](references/run-report.md) for the section list,
 the figure set, and the degradation rules.
 
+## Reproducibility Loops
+
+This is the second conversation flow, and it follows a report naturally. It
+answers one question: **if the same k-shot fine-tuning runs N times, does it give
+the same answer?** It is not active learning and it never improves the model.
+
+Trigger it when the user asks whether the result is stable or reproducible, or
+asks for repeated trials — "run this twenty times", "repeat the 5-shot
+experiment", "check reproducibility", or a report and repeated trials in one
+breath.
+
+1. Anchor on the run that was just finished. Do **not** ask which one: `--run
+   latest` is that run. Print its id and image name in one line so a wrong pick
+   is visible immediately, then continue.
+2. If the user also asked for a report, generate it first (it takes seconds) and
+   relay one line of it before starting the loop.
+3. Ask once, not per item: how many replicates, how many shots per class, and
+   whether a ground-truth raster exists. Defaults: 20 replicates, 5 shots. Then
+   start the loop in the background.
+4. Relay every `round i/N acc=... spread=... pool=...` line as it arrives. Four
+   minutes of silence is not an acceptable user experience.
+5. Finish with mean ± sd, pool sizes, draws per pool cell, and the list of any
+   round outside the band. State the measurement mode in the first sentence.
+
+```powershell
+symmetry repeat --run latest --rounds 20 --points-per-class 5 `
+  --no-keep-checkpoint --no-stop-on-alarm
+```
+
+- `--run` takes a run directory, a run id, or `latest`. It reuses that run's
+  annotation session as the anchor support set and its stored `input.npy` as the
+  image, and inherits the classifier patch, the symmetry patch and the epoch
+  count, so the loop cannot drift from its anchor. Add `--gt` for ground-truth
+  scoring.
+- **The data decides the mode, not preference.** With a label raster, pass
+  `--gt --mode stability`; the pool is then limited to anchor cells that agree
+  with the truth and clear the phase boundary. Without one there is nothing to
+  pool against: the loop is `user` mode, accuracy is `nan`, and the only honest
+  summary is drift from the anchor — say "agreement with the anchor, not
+  accuracy" and never present it as a correct rate.
+- Never lower `--tau` to make a small pool fit. A pool that cannot supply the
+  requested points means the first fine-tune was too weak: report that and ask
+  for a few more labels plus another fine-tune.
+- Do not re-draw a round that fell outside the band. Report its number and value.
+  Re-drawing makes the replicate count incomparable.
+- Default to `--no-keep-checkpoint` (about 8 MB per round instead of 45) and
+  `--no-stop-on-alarm` (the distribution is the point). Continue an interrupted
+  loop with `--resume <loop directory>`; never restart it from scratch.
+
+The interface's **Finish this run** button does the report half of this flow
+inside the page: it writes `report_summary.md`, a self-contained
+`report_view.html`, and `ui_handoff.json` into the run directory. When the user
+says "pick up the run I just finished", read that handoff instead of guessing —
+it records the run id, image, classes and a ready command. The button cannot
+notify the assistant; it only leaves the record. So when the conversation starts
+after a finished run, say what is available and offer the loop rather than
+waiting to be asked.
+
+See [references/repeat.md](references/repeat.md) for the pool definitions, the
+stop rules, the resume rules, and the artifact layout.
+
 ## Other Modes
 
 - When the user explicitly asks for traditional machine-learning validation — a
@@ -209,10 +270,8 @@ the figure set, and the degradation rules.
 - For a saved annotation session or completed-run reproduction, read
   [references/reproduction.md](references/reproduction.md).
 - When the user asks whether the fine-tuning pipeline is **stable across repeated
-  runs** — a reproducibility test on one or more labeled images, with a fixed
-  number of shots per round — read [references/repeat.md](references/repeat.md)
-  and use `symmetry repeat`. Do not confuse this with improving a model: every
-  round restarts from the backbone and the support set never accumulates.
+  runs** — a reproducibility test with a fixed number of shots per round — follow
+  the Reproducibility Loops flow above.
 - When the user asks for a report or summary of a completed run, read
   [references/run-report.md](references/run-report.md).
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -11,7 +12,9 @@ import pytest
 
 from symmetry_harness import repeat as repeat_module
 from symmetry_harness.analysis import DensePrediction
+from symmetry_harness.annotations import create_annotation_session, save_annotation_session
 from symmetry_harness.config import load_harness_config
+from symmetry_harness.image_io import file_sha256
 from symmetry_harness.repeat import (
     REPEAT_SCHEMA_VERSION,
     SIGMA_MIN_SAMPLES,
@@ -1122,3 +1125,121 @@ def test_round_sheet_skips_rounds_without_a_prediction(tmp_path: Path) -> None:
     )
     assert path is None
     assert not (tmp_path / "sheet.png").exists()
+
+
+# ---------------------------------------------------------------------------
+# Anchoring on a completed run
+# ---------------------------------------------------------------------------
+
+
+def _write_source_run(config, image_path: Path) -> Path:
+    """Build the minimum a completed run needs to be usable as an anchor."""
+    run_dir = config.output_root / "symmetry-20260101T000000Z-abcdef"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    image = np.load(image_path)
+    np.save(run_dir / "input.npy", image)
+    session = create_annotation_session(
+        image_path=str(run_dir / "input.npy"),
+        image_sha256=file_sha256(run_dir / "input.npy"),
+        image_shape=image.shape,
+        classifier_patch_size=64,
+        class_names=["Class A", "Class B"],
+        points_by_class=[
+            [(40, 40), (44, 44), (48, 40)],
+            [(90, 90), (94, 94), (90, 94)],
+        ],
+    )
+    save_annotation_session(run_dir / "annotation_session.json", session)
+    (run_dir / "run_record.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_dir.name,
+                "input": {"path": str(image_path)},
+                "configuration": {
+                    "model": {"classifier_patch_size": 64},
+                    "features": {"symmetry_patch_size": 51},
+                    "fine_tuning": {"epochs": 150},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_dir
+
+
+def test_run_repeat_anchors_on_a_completed_run(config, tmp_path, monkeypatch) -> None:
+    calls = _install_fake_provider(monkeypatch)
+    image_path, _ = _write_inputs(tmp_path)
+    run_dir = _write_source_run(config, image_path)
+
+    result = run_repeat(
+        config,
+        options=RepeatOptions(rounds=1, points_per_class=3, min_point_distance=0),
+        source_run="latest",
+    )
+
+    assert result["status"] == "completed"
+    # The anchor reuses the session's own points, not a fresh interior draw.
+    assert calls[0]["points"][0] == [(40, 40), (44, 44), (48, 40)]
+    assert calls[0]["points"][1] == [(90, 90), (94, 94), (90, 94)]
+    assert calls[0]["counts"] == [3, 3]
+
+    loop_dir = Path(result["loop_directory"])
+    manifest = json.loads((loop_dir / "loop_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["source_run"]["run_id"] == run_dir.name
+    assert manifest["source_run"]["image_name"] == image_path.name
+    assert manifest["input"]["sha256"] == file_sha256(run_dir / "input.npy")
+    # The patch geometry comes from the run, so the loop cannot drift from its
+    # anchor while still claiming to measure the same procedure.
+    assert manifest["run_options"]["classifier_patch_size"] == 64
+    summary = (loop_dir / "loop_summary.md").read_text(encoding="utf-8")
+    assert run_dir.name in summary
+
+
+def test_run_repeat_refuses_a_run_without_a_session(config, tmp_path) -> None:
+    image_path, _ = _write_inputs(tmp_path)
+    run_dir = _write_source_run(config, image_path)
+    (run_dir / "annotation_session.json").unlink()
+
+    with pytest.raises(RepeatError):
+        run_repeat(
+            config,
+            options=RepeatOptions(rounds=1, points_per_class=3),
+            source_run=run_dir,
+        )
+
+
+def test_run_repeat_rejects_two_anchors(config, tmp_path, monkeypatch) -> None:
+    _install_fake_provider(monkeypatch)
+    image_path, label_path = _write_inputs(tmp_path)
+    run_dir = _write_source_run(config, image_path)
+
+    with pytest.raises(RepeatError):
+        run_repeat(
+            config,
+            image_path=image_path,
+            label_path=label_path,
+            options=RepeatOptions(rounds=1, points_per_class=3),
+            source_run=run_dir,
+        )
+
+
+def test_run_repeat_reports_every_round(config, tmp_path, monkeypatch) -> None:
+    _install_fake_provider(monkeypatch)
+    image_path, _ = _write_inputs(tmp_path)
+    _write_source_run(config, image_path)
+    lines: list[str] = []
+
+    run_repeat(
+        config,
+        options=RepeatOptions(rounds=2, points_per_class=3, min_point_distance=0),
+        source_run="latest",
+        progress=lines.append,
+    )
+
+    rounds = [
+        line for line in lines if re.match(r"^round \d+/\d+ ", line)
+    ]
+    assert [line.split()[1] for line in rounds] == ["1/2", "2/2"]
+    assert all("acc=" in line and "pool=" in line for line in rounds)
+    assert any(line.startswith("anchored on run ") for line in lines)
