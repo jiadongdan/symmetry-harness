@@ -1557,6 +1557,58 @@ def test_launch_ui_blocks_until_the_server_stops(monkeypatch) -> None:
     ]
 
 
+def test_launch_ui_serves_the_run_directory(monkeypatch, tmp_path) -> None:
+    """Reports are written under the output root, which Gradio does not serve
+    by default; without it every gallery entry fails to reach the browser."""
+    config_path = tmp_path / "config.json"
+    payload = json.loads(
+        (REPOSITORY_ROOT / "configs" / "config.example.json").read_text(encoding="utf-8")
+    )
+    payload["project_root"] = str(tmp_path)
+    payload["output_root"] = "symmetry-runs"
+    (tmp_path / "symmetry-runs").mkdir()
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    config = load_harness_config(config_path)
+
+    seen: dict[str, object] = {}
+
+    class FakeApp:
+        def launch(self, **kwargs):
+            seen.update(kwargs)
+            return None, "http://127.0.0.1:54321", None
+
+        def block_thread(self):
+            return None
+
+    monkeypatch.setattr(ui_module, "build_app", lambda config, **kwargs: FakeApp())
+
+    ui_module.launch_ui(
+        config,
+        server_name="127.0.0.1",
+        server_port=0,
+        inbrowser=False,
+        capabilities=_capabilities(),
+    )
+
+    allowed = seen.get("allowed_paths")
+    assert allowed == [str((tmp_path / "symmetry-runs").resolve())]
+
+
+def test_served_directories_skips_missing_roots(tmp_path) -> None:
+    config_path = tmp_path / "config.json"
+    payload = json.loads(
+        (REPOSITORY_ROOT / "configs" / "config.example.json").read_text(encoding="utf-8")
+    )
+    payload["project_root"] = str(tmp_path)
+    payload["output_root"] = "not-created-yet"
+    config_path.write_text(json.dumps(payload), encoding="utf-8")
+    config = load_harness_config(config_path)
+
+    # A fresh install must still start; an absent directory is not a reason to
+    # refuse, and listing it would make Gradio warn at launch.
+    assert ui_module._served_directories(config) == []
+
+
 def test_launch_preflights_once_and_emits_ready_json(monkeypatch, capsys) -> None:
     config_path = REPOSITORY_ROOT / "configs" / "config.example.json"
     input_path = REPOSITORY_ROOT / "example.npy"

@@ -1566,7 +1566,11 @@ def launch_traditional_ui(
     on_ready: Callable[[str], None] | None = None,
 ) -> None:
     """Launch the local-only traditional validation page."""
-    from .ui import _protect_localhost_from_proxies, _resolve_server_port
+    from .ui import (
+        _protect_localhost_from_proxies,
+        _resolve_server_port,
+        _served_directories,
+    )
 
     if server_name not in {"127.0.0.1", "localhost"}:
         raise ValueError("The traditional validation page only binds to localhost.")
@@ -1595,6 +1599,7 @@ def launch_traditional_ui(
         prevent_thread_lock=True,
         quiet=on_ready is not None,
         css=APP_CSS,
+        allowed_paths=_served_directories(config) or None,
     )
     if on_ready is not None:
         on_ready(local_url)

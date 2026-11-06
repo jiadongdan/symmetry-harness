@@ -60,6 +60,27 @@ def _resolve_server_port(server_name: str, server_port: int | None) -> int | Non
         return int(listener.getsockname()[1])
 
 
+def _served_directories(config: HarnessConfig) -> list[str]:
+    """Directories outside the working tree that the page may hand to browsers.
+
+    A finished report lives inside its run directory, and every run lives under
+    the configured output root. Neither is the working directory nor the system
+    temp, so Gradio refuses to copy those files into its cache and the gallery
+    fails with "Cannot move ... to the gradio cache dir". Declaring the root at
+    launch is the supported fix; missing directories are skipped so a fresh
+    install still starts.
+    """
+    directories: list[str] = []
+    for candidate in (Path(config.output_root).expanduser(),):
+        try:
+            resolved = candidate.resolve()
+        except OSError:  # pragma: no cover - unresolvable path, nothing to serve
+            continue
+        if resolved.is_dir() and str(resolved) not in directories:
+            directories.append(str(resolved))
+    return directories
+
+
 def _protect_localhost_from_proxies() -> None:
     """Ensure Gradio startup checks connect directly to the local-only server."""
     required = ("127.0.0.1", "localhost")
@@ -156,6 +177,7 @@ def launch_ui(
         prevent_thread_lock=True,
         quiet=on_ready is not None,
         css=APP_CSS,
+        allowed_paths=_served_directories(config) or None,
     )
     if on_ready is not None:
         on_ready(local_url)
