@@ -184,3 +184,28 @@ def test_finish_is_idempotent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     assert first["report_html"] == second["report_html"]
     assert (run_dir / HANDOFF_NAME).is_file()
     assert not list(run_dir.glob("*.tmp"))
+
+
+def test_display_markdown_drops_local_image_references() -> None:
+    from symmetry_harness.finish import display_markdown
+
+    text = "\n".join(
+        [
+            "## 2. Main Visual Evidence",
+            "",
+            "![Results overview](figures/00_results_overview.png)",
+            "",
+            "![Support points](figures/02_support_points.png)",
+            "",
+            "The overlay is the main evidence.",
+        ]
+    )
+
+    rendered = display_markdown(text)
+
+    assert "figures/00_results_overview.png" not in rendered
+    assert "figures/02_support_points.png" not in rendered
+    # Captions survive so the reader still knows what was shown where.
+    assert "*Results overview*" in rendered
+    assert "*Support points*" in rendered
+    assert "The overlay is the main evidence." in rendered

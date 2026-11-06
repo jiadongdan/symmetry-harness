@@ -43,7 +43,7 @@ from .analysis import DensePrediction, dense_prediction_from_arrays
 from .annotations import create_annotation_session
 from .catalog import model_capability, model_weights, provider_models, weight_capability
 from .config import HarnessConfig, config_for_model_selection
-from .finish import finish_run
+from .finish import display_markdown, finish_run
 from .image_io import file_sha256, inspect_input
 from .numeric import require_whole_number
 from .provider import install_registered_weight, run_provider_features
@@ -2731,7 +2731,9 @@ def build_fine_tune_workspace(
                 gr.update(visible=False),
                 gr.update(visible=False),
             )
-        report_text = Path(outcome["report"]).read_text(encoding="utf-8")
+        report_text = display_markdown(
+            Path(outcome["report"]).read_text(encoding="utf-8")
+        )
         gallery = [
             (str(path), Path(path).stem.replace("_", " "))
             for path in outcome["figures"]

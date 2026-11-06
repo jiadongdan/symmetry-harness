@@ -84,6 +84,23 @@ def finish_run(
     }
 
 
+def display_markdown(text: str) -> str:
+    """Strip local image references for an in-page render.
+
+    A Markdown component cannot resolve a path relative to the run directory, so
+    every figure reference would render as a broken image. The page shows the
+    same figures in a gallery beside the text; the self-contained HTML keeps
+    them inline. Only the reference is dropped, and its caption survives as a
+    one-line note so the sequence of evidence stays readable.
+    """
+    return re.sub(
+        r"^!\[([^\]]*)\]\(([^)]+)\)\s*$",
+        lambda match: f"*{match.group(1)}*" if match.group(1).strip() else "",
+        text,
+        flags=re.MULTILINE,
+    )
+
+
 def suggested_repeat_command(
     directory: str | Path,
     *,
